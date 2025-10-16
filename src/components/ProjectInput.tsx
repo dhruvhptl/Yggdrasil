@@ -4,6 +4,7 @@ import React, { useState } from 'react';
 import { invoke } from "@tauri-apps/api/core";
 import { Project } from '../types';
 
+
 interface ProjectInputProps {
   onProjectCreated?: (project: Project) => void;
 }
