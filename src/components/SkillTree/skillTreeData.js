@@ -1,11 +1,6 @@
-import { Node, Edge } from 'reactflow';
+// src/components/SkillTree/skillTreeData.js
 
-interface SkillTree {
-  nodes: Node[];
-  edges: Edge[];
-}
-
-export const SkillTree = {
+export const tapeSkillTree = {
   name: 'TAPE Project',
   children: [
     {
@@ -24,7 +19,10 @@ export const SkillTree = {
               name: 'Hamiltonian Mechanics',
               attributes: { status: 'locked' },
               children: [
-                { name: 'Special Relativity', attributes: { status: 'locked' } }
+                { 
+                  name: 'Special Relativity', 
+                  attributes: { status: 'locked' } 
+                }
               ]
             }
           ]
@@ -43,13 +41,28 @@ export const SkillTree = {
               name: 'Numerical Methods',
               attributes: { status: 'locked' },
               children: [
-                { name: 'Build Physics Engine', attributes: { status: 'locked' } }
+                { 
+                  name: 'Build Physics Engine', 
+                  attributes: { status: 'locked' } 
+                }
               ]
             }
           ]
         },
-        { name: 'SciPy', attributes: { status: 'locked' } },
-        { name: 'Matplotlib', attributes: { status: 'locked' } }
+        { 
+          name: 'SciPy', 
+          attributes: { status: 'locked' },
+          children: [
+            {
+              name: 'Numerical Methods',
+              attributes: { status: 'locked' }
+            }
+          ]
+        },
+        { 
+          name: 'Matplotlib', 
+          attributes: { status: 'locked' } 
+        }
       ]
     },
     {
@@ -60,12 +73,23 @@ export const SkillTree = {
           name: 'Neural Networks',
           attributes: { status: 'locked' },
           children: [
-            { name: 'Time Series Prediction', attributes: { status: 'locked' } },
-            { name: 'Physics-Informed NNs', attributes: { status: 'locked' } }
+            { 
+              name: 'Time Series Prediction', 
+              attributes: { status: 'locked' } 
+            },
+            { 
+              name: 'Physics-Informed NNs', 
+              attributes: { status: 'locked' },
+              children: [
+                {
+                  name: 'Build Physics Engine',
+                  attributes: { status: 'locked' }
+                }
+              ]
+            }
           ]
         }
       ]
     }
   ]
 };
-
