@@ -1,11 +1,10 @@
-// src-tauri/src/commands.rs - Backend commands for handling data operations
+// src-tauri/src/commands.rs - Backend commands for handling data operations with persistent storage
 
 use tauri::State;
 use uuid::Uuid;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Mutex;
+use crate::database::Database;
 
 // Data structures matching our TypeScript types
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,11 +28,17 @@ pub struct Discipline {
     pub color: Option<String>,
 }
 
-// Simple in-memory storage for MVP (we'll upgrade to SQLite later)
-#[derive(Debug, Default)]
-pub struct AppState {
-    pub projects: Mutex<HashMap<String, Project>>,
-    pub disciplines: Mutex<HashMap<String, Discipline>>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Skill {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub discipline_id: String,
+    pub proficiency_level: String,
+    pub progress: u8,
+    pub is_unlocked: bool,
+    pub prerequisites: Vec<String>,
+    pub project_ids: Vec<String>,
 }
 
 // Create a new project
@@ -42,7 +47,7 @@ pub async fn create_project(
     name: String,
     description: String,
     discipline: String,
-    state: State<'_, AppState>
+    database: State<'_, Database>
 ) -> Result<Project, String> {
     // Validate input
     if name.trim().is_empty() {
@@ -54,7 +59,8 @@ pub async fn create_project(
     }
 
     // Create or get discipline
-    let discipline_id = create_or_get_discipline(&discipline, &state).await?;
+    let discipline_id = create_or_get_discipline(&discipline, &database).await
+        .map_err(|e| format!("Failed to create discipline: {}", e))?;
 
     // Generate unique ID
     let project_id = Uuid::new_v4().to_string();
@@ -71,32 +77,28 @@ pub async fn create_project(
         progress: 0,
     };
 
-    // Store in memory
-    let mut projects = state.projects.lock().unwrap();
-    projects.insert(project_id, project.clone());
+    // Store in database
+    database.create_project(&project).await
+        .map_err(|e| format!("Failed to save project: {}", e))?;
 
     Ok(project)
 }
 
 // Get all projects
 #[tauri::command]
-pub async fn get_projects(state: State<'_, AppState>) -> Result<Vec<Project>, String> {
-    let projects = state.projects.lock().unwrap();
-    Ok(projects.values().cloned().collect())
+pub async fn get_projects(database: State<'_, Database>) -> Result<Vec<Project>, String> {
+    database.get_projects().await
+        .map_err(|e| format!("Failed to load projects: {}", e))
 }
 
 // Helper function to create or get discipline
 async fn create_or_get_discipline(
     name: &str,
-    state: &State<'_, AppState>
-) -> Result<String, String> {
-    let mut disciplines = state.disciplines.lock().unwrap();
-    
+    database: &State<'_, Database>
+) -> Result<String, Box<dyn std::error::Error>> {
     // Check if discipline already exists
-    for (id, discipline) in disciplines.iter() {
-        if discipline.name.to_lowercase() == name.trim().to_lowercase() {
-            return Ok(id.clone());
-        }
+    if let Some(existing) = database.get_discipline_by_name(name).await? {
+        return Ok(existing.id);
     }
     
     // Create new discipline
@@ -108,13 +110,36 @@ async fn create_or_get_discipline(
         color: None,
     };
     
-    disciplines.insert(discipline_id.clone(), discipline);
+    database.create_discipline(&discipline).await?;
     Ok(discipline_id)
 }
 
 // Get all disciplines
 #[tauri::command]
-pub async fn get_disciplines(state: State<'_, AppState>) -> Result<Vec<Discipline>, String> {
-    let disciplines = state.disciplines.lock().unwrap();
-    Ok(disciplines.values().cloned().collect())
+pub async fn get_disciplines(database: State<'_, Database>) -> Result<Vec<Discipline>, String> {
+    database.get_disciplines().await
+        .map_err(|e| format!("Failed to load disciplines: {}", e))
+}
+
+// Update project progress (new command for better functionality)
+#[tauri::command]
+pub async fn update_project_progress(
+    project_id: String,
+    progress: u8,
+    database: State<'_, Database>
+) -> Result<(), String> {
+    // This would require adding an update method to the database module
+    // For now, return a placeholder
+    Ok(())
+}
+
+// Delete project (new command)
+#[tauri::command]
+pub async fn delete_project(
+    project_id: String,
+    database: State<'_, Database>
+) -> Result<(), String> {
+    // This would require adding a delete method to the database module
+    // For now, return a placeholder
+    Ok(())
 }
