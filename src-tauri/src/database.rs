@@ -1,6 +1,6 @@
 // src-tauri/src/database.rs - Database operations for persistent storage
 
-use sqlx::{migrate::MigrateDatabase, Sqlite, SqlitePool, Row};
+use sqlx::{migrate::MigrateDatabase, Sqlite, SqlitePool};
 use tauri::AppHandle;
 use std::fs;
 use crate::commands::{Project, Discipline};
@@ -11,8 +11,7 @@ pub struct Database {
 
 impl Database {
     pub async fn new(app_handle: &AppHandle) -> Result<Self, Box<dyn std::error::Error>> {
-        let app_dir = app_handle.path_resolver()
-            .app_data_dir()
+        let app_dir = app_handle.path().app_data_dir()
             .expect("Failed to get app data directory");
         
         // Create app data directory if it doesn't exist
