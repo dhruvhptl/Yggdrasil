@@ -124,9 +124,9 @@ pub async fn get_disciplines(database: State<'_, Database>) -> Result<Vec<Discip
 // Update project progress (new command for better functionality)
 #[tauri::command]
 pub async fn update_project_progress(
-    project_id: String,
-    progress: u8,
-    database: State<'_, Database>
+    _project_id: String,
+    _progress: u8,
+    _database: State<'_, Database>
 ) -> Result<(), String> {
     // This would require adding an update method to the database module
     // For now, return a placeholder
@@ -136,8 +136,8 @@ pub async fn update_project_progress(
 // Delete project (new command)
 #[tauri::command]
 pub async fn delete_project(
-    project_id: String,
-    database: State<'_, Database>
+    _project_id: String,
+    _database: State<'_, Database>
 ) -> Result<(), String> {
     // This would require adding a delete method to the database module
     // For now, return a placeholder
