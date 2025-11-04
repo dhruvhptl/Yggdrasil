@@ -1,7 +1,7 @@
 // src-tauri/src/database.rs - Database operations for persistent storage
 
 use sqlx::{migrate::MigrateDatabase, Sqlite, SqlitePool};
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 use std::fs;
 use crate::commands::{Project, Discipline};
 
@@ -35,6 +35,10 @@ impl Database {
     
     // Project operations
     pub async fn create_project(&self, project: &Project) -> Result<(), sqlx::Error> {
+        // Create longer-lived String bindings to avoid lifetime issues
+        let discipline_ids_json = serde_json::to_string(&project.discipline_ids).unwrap();
+        let skill_ids_json = serde_json::to_string(&project.skill_ids).unwrap();
+        
         sqlx::query!(
             r#"
             INSERT INTO projects (id, name, description, discipline_ids, skill_ids, status, created_at, progress)
@@ -43,8 +47,8 @@ impl Database {
             project.id,
             project.name,
             project.description,
-            serde_json::to_string(&project.discipline_ids).unwrap(),
-            serde_json::to_string(&project.skill_ids).unwrap(),
+            discipline_ids_json,
+            skill_ids_json,
             project.status,
             project.created_at,
             project.progress
