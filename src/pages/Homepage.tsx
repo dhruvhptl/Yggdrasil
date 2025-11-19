@@ -51,7 +51,7 @@ export default function HomePage() {
               <div 
                 key={project.id} 
                 className="border rounded-lg p-4 bg-white shadow cursor-pointer hover:bg-gray-50 transition-colors"
-                onClick={() => navigate(`/project/${project.name}`)}
+                onClick={() => navigate(`/project/${project.id}`)}
               >
                 <h3 className="text-xl font-semibold">{project.name}</h3>
                 <p className="text-gray-600 mt-1">{project.description}</p>

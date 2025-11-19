@@ -18,7 +18,8 @@ impl Database {
         fs::create_dir_all(&app_dir)?;
         
         let database_path = app_dir.join("yggdrasil.db");
-        let database_url = format!("sqlite:{}", database_path.to_string_lossy());
+        println!("📁 Database location: {:?}", database_path);  // ADD THIS LINE
+        let database_url = format!("sqlite://{}", database_path.to_string_lossy());
         
         // Create database if it doesn't exist
         if !Sqlite::database_exists(&database_url).await.unwrap_or(false) {

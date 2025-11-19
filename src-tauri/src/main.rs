@@ -3,16 +3,21 @@ mod database;
 mod tree_commands;
 
 use database::Database;
+use tauri::Manager;
 
-#[tokio::main]
-async fn main() {
-    let app = tauri::Builder::default()
+fn main() {  // Remove #[tokio::main] and async
+    tauri::Builder::default()
         .setup(|app| {
-            let app_handle = app.handle();
-            tauri::async_runtime::spawn(async move {
-                let database = Database::new(&app_handle).await.expect("Failed to initialize database");
+            let app_handle = app.handle().clone();  // Clone the handle
+            
+            // Use block_on instead of spawn
+            tauri::async_runtime::block_on(async move {
+                let database = Database::new(&app_handle)
+                    .await
+                    .expect("Failed to initialize database");
                 app_handle.manage(database);
             });
+            
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -26,12 +31,9 @@ async fn main() {
             tree_commands::create_tree_node,
             tree_commands::update_tree_node,
             tree_commands::create_tree_edge,
+            tree_commands::delete_tree_node,
             tree_commands::get_tree_with_contents
         ])
-        .build(tauri::generate_context!())
+        .run(tauri::generate_context!())
         .expect("error while running tauri application");
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-    app.run(|_, _| {});
 }

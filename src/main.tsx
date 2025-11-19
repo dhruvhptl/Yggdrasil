@@ -10,7 +10,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
     <BrowserRouter>
       <Routes>
         <Route path="/" element={<HomePage />} />
-        <Route path="/project/:projectName" element={<ProjectTreePage />} />
+        <Route path="/project/:projectId" element={<ProjectTreePage />} />
       </Routes>
     </BrowserRouter>
   </React.StrictMode>
