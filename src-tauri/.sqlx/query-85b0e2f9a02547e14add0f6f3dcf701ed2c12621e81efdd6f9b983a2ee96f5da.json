@@ -1,0 +1,80 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT * FROM tree_nodes WHERE id = ?1",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "tree_id",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "parent_id",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "type",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "title",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "description",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "progress",
+        "ordinal": 6,
+        "type_info": "Int64"
+      },
+      {
+        "name": "tasks",
+        "ordinal": 7,
+        "type_info": "Text"
+      },
+      {
+        "name": "x",
+        "ordinal": 8,
+        "type_info": "Float"
+      },
+      {
+        "name": "y",
+        "ordinal": 9,
+        "type_info": "Float"
+      },
+      {
+        "name": "order_index",
+        "ordinal": 10,
+        "type_info": "Int64"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "85b0e2f9a02547e14add0f6f3dcf701ed2c12621e81efdd6f9b983a2ee96f5da"
+}

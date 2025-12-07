@@ -1,0 +1,19 @@
+* [33m4f7354a[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mfix-compilation-errors[m[33m, [m[1;31morigin/fix-compilation-errors[m[33m)[m feat: Add database persistence and resources feature
+* [33mca207a3[m Fix lifetime issues with SQLx query macro and add missing Manager trait import
+* [33m3259cb9[m Remove non-existent offline feature from SQLx dependency
+* [33me5c8a27[m Fix unused variable warnings by prefixing with underscore
+* [33m7a3f3d0[m Fix Tauri 2.0 path API usage - use app_handle.path().app_data_dir()
+* [33mc411a8e[m Add offline feature to SQLx dependency for better build support
+* [33m52c9147[m Add .env file with DATABASE_URL for SQLx compile-time checking
+* [33m4b6803d[m[33m ([m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m, [m[1;32mmain[m[33m)[m wire up tree commands in main.rs and register invoke handler
+* [33m81adac9[m feat(backend): add tree_commands for creating and managing trees
+* [33m9de5837[m feat(db): add tree, node, edge tables for user-created trees
+* [33mcfb5a77[m Update lib.rs to support database initialization
+* [33mc1b5d5d[m Update main.rs to initialize database on app startup
+* [33m4fff1d1[m Update commands.rs to use persistent database storage
+* [33m38112eb[m Add database migration for initial schema
+* [33me5e201e[m Add database module for SQLite operations
+* [33m08e55ec[m Add SQLite database dependency for data persistence
+* [33m9e9f971[m Skill tree labeled
+* [33m4a0ff23[m Added routing and skill tree visualization for Yggdrasil.
+* [33m77c6b2a[m Initial commit: Yggdrasil

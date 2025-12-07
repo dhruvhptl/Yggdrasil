@@ -13,10 +13,11 @@
     "@tauri-apps/api": "^2.8.0",
     "@tauri-apps/plugin-opener": "^2",
     "beautiful-skill-tree": "^1.7.1",
+    "lucide-react": "^0.555.0",
     "react": "^19.1.0",
     "react-d3-tree": "^3.6.6",
     "react-dom": "^19.1.0",
-    "react-router-dom": "^7.9.4",
+    "react-router-dom": "^7.10.1",
     "reactflow": "^11.11.4"
   },
   "devDependencies": {
