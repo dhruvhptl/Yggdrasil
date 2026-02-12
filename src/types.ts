@@ -1,65 +1,32 @@
-// src/types.ts - Data models for our skill tree app
+// Add to src/types.ts at the bottom
 
-export interface Discipline {
+// Brain-generated tree structure (Phases → Skills → Quests)
+export interface GeneratedTree {
+  project_id: string;
+  phases: Phase[];
+}
+
+export interface Phase {
   id: string;
   name: string;
   description: string;
-  color?: string;
+  order: number;
+  skills: BrainSkill[];
 }
 
-export interface Skill {
+export interface BrainSkill {
   id: string;
   name: string;
   description: string;
-  disciplineId: string;
-  proficiencyLevel: 'beginner' | 'intermediate' | 'advanced';
-  progress: number; // 0-100
-  isUnlocked: boolean;
-  prerequisites: string[]; // Array of skill IDs that must be completed first
-  projectIds: string[]; // Array of project IDs this skill belongs to
+  order: number;
+  quests: BrainQuest[];
 }
 
-export interface Project {
-  id: string;
-  name: string;
-  description: string;
-  disciplineIds: string[]; // Can span multiple disciplines
-  skillIds: string[]; // Required skills for this project
-  status: 'active' | 'completed' | 'paused';
-  createdAt: Date;
-  progress: number; // 0-100, calculated from skill progress
-}
-
-export interface Quest {
+export interface BrainQuest {
   id: string;
   title: string;
   description: string;
-  skillId: string;
-  projectId: string;
-  isCompleted: boolean;
-  createdAt: Date;
-  dueDate?: Date;
-  priority: 'low' | 'medium' | 'high';
-}
-
-export interface Resource {
-  id: string;
-  title: string;
-  description: string;
-  url: string;
-  type: 'article' | 'video' | 'course' | 'book' | 'other';
-  skillIds: string[];
-  projectIds: string[];
-  source?: 'notion' | 'manual';
-  notionId?: string;
-}
-
-// For Beautiful Skill Tree component
-export interface SkillTreeNode {
-  id: string;
-  title: string;
-  tooltip: {
-    content: string;
-  };
-  children: SkillTreeNode[];
+  estimated_hours: number;
+  difficulty: "easy" | "medium" | "hard";
+  order: number;
 }

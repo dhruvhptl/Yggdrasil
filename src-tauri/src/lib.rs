@@ -9,9 +9,12 @@ pub use database::Database;
 
 // Tauri configuration and setup
 use tauri::Manager;
+use dotenv;
+
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    dotenv::dotenv().ok();
     tauri::Builder::default()
         .setup(|app| {
             let app_handle = app.handle().clone();

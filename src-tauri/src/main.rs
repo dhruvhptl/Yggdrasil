@@ -1,6 +1,7 @@
 mod commands;
 mod database;
 mod tree_commands;
+mod brain;
 
 use database::Database;
 use tauri::Manager;
@@ -21,6 +22,7 @@ fn main() {  // Remove #[tokio::main] and async
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            brain::generate_skill_tree,
             commands::create_project,
             commands::get_projects,
             commands::get_disciplines,
@@ -32,7 +34,8 @@ fn main() {  // Remove #[tokio::main] and async
             tree_commands::update_tree_node,
             tree_commands::create_tree_edge,
             tree_commands::delete_tree_node,
-            tree_commands::get_tree_with_contents
+            tree_commands::get_tree_with_contents,
+            
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
