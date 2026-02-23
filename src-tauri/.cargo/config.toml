@@ -1,0 +1,6 @@
+# Tell sqlx to use the pre-built .sqlx/ offline query cache
+# instead of connecting to the database at compile time.
+# This fixes rust-analyzer IDE errors caused by missing DATABASE_URL
+# in the IDE's environment.
+[env]
+SQLX_OFFLINE = "true"

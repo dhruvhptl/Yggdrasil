@@ -1,7 +1,7 @@
 // src/layouts/MainLayout.tsx
 import { ReactNode } from "react";
 import { NavLink } from "react-router-dom";
-import { TreePine, Home, ListChecks } from "lucide-react";
+import { TreePine, Home, ListChecks, Library } from "lucide-react";
 
 interface MainLayoutProps {
   children: ReactNode;
@@ -28,6 +28,7 @@ export default function MainLayout({ children }: MainLayoutProps) {
           <SidebarLink to="/" icon={<Home className="w-4 h-4" />} label="Home" />
           <SidebarLink to="/trees" icon={<TreePine className="w-4 h-4" />} label="Trees" />
           <SidebarLink to="/quests" icon={<ListChecks className="w-4 h-4" />} label="Quests" />
+          <SidebarLink to="/resources" icon={<Library className="w-4 h-4" />} label="Library" />
         </nav>
 
         <div className="px-4 py-3 text-xs text-slate-600 border-t border-slate-800">

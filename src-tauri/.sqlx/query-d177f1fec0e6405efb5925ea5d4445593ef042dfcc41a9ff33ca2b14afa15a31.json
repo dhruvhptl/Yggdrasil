@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE tree_nodes SET title=$1, description=$2, progress=$3, tasks=$4, resources=$5, x=$6, y=$7 WHERE id=$8",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int4",
+        "Jsonb",
+        "Jsonb",
+        "Float8",
+        "Float8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d177f1fec0e6405efb5925ea5d4445593ef042dfcc41a9ff33ca2b14afa15a31"
+}

@@ -5,26 +5,30 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:mimir": "npm --prefix sidecar start",
+    "dev:all": "concurrently -k --names vite,mimir \"vite\" \"npm --prefix sidecar start\"",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "install:all": "npm install && npm --prefix sidecar install"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",
     "@tauri-apps/plugin-opener": "^2",
-    "beautiful-skill-tree": "^1.7.1",
     "lucide-react": "^0.555.0",
     "react": "^19.1.0",
     "react-d3-tree": "^3.6.6",
     "react-dom": "^19.1.0",
-    "react-router-dom": "^7.10.1",
-    "reactflow": "^11.11.4"
+    "react-router-dom": "^7.10.1"
   },
   "devDependencies": {
+    "@tailwindcss/vite": "^4.2.0",
     "@tauri-apps/cli": "^2",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
+    "concurrently": "^9.0.0",
+    "tailwindcss": "^4.2.0",
     "typescript": "~5.8.3",
     "vite": "^7.0.4"
   }

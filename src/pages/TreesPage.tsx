@@ -2,57 +2,98 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
-
-interface Project {
-  id: string;
-  name: string;
-  created_at: string;
-  status: string;
-}
+import { TreePine } from "lucide-react";
+import { Project } from "../types";
 
 export default function TreesPage() {
   const [projects, setProjects] = useState<Project[]>([]);
+  const [loading, setLoading] = useState(true);
   const navigate = useNavigate();
 
   useEffect(() => {
-    invoke<Project[]>("get_projects").then(setProjects);
+    invoke<Project[]>("get_projects")
+      .then(setProjects)
+      .catch((err) => console.error("Failed to load projects:", err))
+      .finally(() => setLoading(false));
   }, []);
 
-  const handleOpenProject = (id: string) => {
-    navigate(`/project/${id}`);
-  };
-
   return (
-    <div style={{ padding: "20px" }}>
-      <h1>Your Trees</h1>
-
-      {projects.length === 0 && (
-        <p>No trees yet. Create one from the Home page.</p>
-      )}
-
-      <div style={{ marginTop: "16px", display: "flex", gap: "12px", flexWrap: "wrap" }}>
-        {projects.map((project) => (
-          <div
-            key={project.id}
-            onClick={() => handleOpenProject(project.id)}
-            style={{
-              padding: "12px 16px",
-              borderRadius: "8px",
-              background: "white",
-              cursor: "pointer",
-              boxShadow: "0 1px 3px rgba(0,0,0,0.1)",
-            }}
-          >
-            <div style={{ fontWeight: 600 }}>{project.name}</div>
-            <div style={{ fontSize: "12px", color: "#666" }}>
-              Created: {project.created_at}
-            </div>
-            <div style={{ fontSize: "12px", marginTop: "4px" }}>
-              Status: {project.status}
-            </div>
-          </div>
-        ))}
+    <div className="p-6 max-w-2xl mx-auto flex flex-col gap-6">
+      <div>
+        <h1 className="text-xl font-semibold text-slate-100">Trees</h1>
+        <p className="text-sm text-slate-400 mt-1">
+          Navigate to your project skill trees.
+        </p>
       </div>
+
+      {loading ? (
+        <p className="text-sm text-slate-500">Loading...</p>
+      ) : projects.length === 0 ? (
+        <p className="text-sm text-slate-500">
+          No trees yet. Create a project from the Home page.
+        </p>
+      ) : (
+        <>
+          <p className="text-xs font-medium text-slate-500 uppercase tracking-wider -mb-4">
+            {projects.length} {projects.length === 1 ? "project" : "projects"}
+          </p>
+          <div className="flex flex-col gap-2">
+            {projects.map((project) => (
+              <div
+                key={project.id}
+                onClick={() => navigate(`/project/${project.id}`)}
+                className="group bg-slate-900 border border-slate-800 hover:border-emerald-800/60 rounded-lg p-4 cursor-pointer transition-all flex items-center gap-4"
+              >
+                {/* Tree icon */}
+                <div className="w-10 h-10 rounded-lg bg-emerald-950 border border-emerald-900/60 flex items-center justify-center flex-shrink-0">
+                  <TreePine className="w-5 h-5 text-emerald-400" />
+                </div>
+
+                {/* Info */}
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-semibold text-slate-100 group-hover:text-emerald-300 transition-colors">
+                    {project.name}
+                  </p>
+                  {project.description && (
+                    <p className="text-xs text-slate-500 mt-0.5 truncate">
+                      {project.description}
+                    </p>
+                  )}
+                  <div className="flex items-center gap-2 mt-1.5">
+                    <span className="text-xs px-1.5 py-0.5 rounded bg-slate-800 text-slate-500 border border-slate-700/50">
+                      {project.status}
+                    </span>
+                    <span className="text-xs text-slate-600">
+                      {project.createdAt && !isNaN(Date.parse(project.createdAt))
+                        ? new Date(project.createdAt).toLocaleDateString()
+                        : ""}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Progress */}
+                {project.progress > 0 && (
+                  <div className="flex items-center gap-2 flex-shrink-0">
+                    <div className="w-16 h-1 bg-slate-800 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-emerald-500 rounded-full transition-all"
+                        style={{ width: `${project.progress}%` }}
+                      />
+                    </div>
+                    <span className="text-xs text-slate-600">
+                      {project.progress}%
+                    </span>
+                  </div>
+                )}
+
+                <span className="text-slate-700 group-hover:text-emerald-600 transition-colors text-sm flex-shrink-0">
+                  →
+                </span>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
     </div>
   );
 }

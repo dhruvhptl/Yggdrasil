@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO projects (id, name, description, discipline_ids, skill_ids, status, created_at, progress)\n            VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Jsonb",
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d23f8c5ec4d54b4f9d9f897b85ed6db1df79ce072ff3d35c8e5c6ef209421f30"
+}
