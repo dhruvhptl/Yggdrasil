@@ -1,6 +1,6 @@
 # Yggdrasil — Product Requirements Document
-**Version:** 3.0  
-**Updated:** February 2026
+**Version:** 2.0  
+**Updated:** March 2026
 
 ---
 
@@ -8,7 +8,7 @@
 
 Yggdrasil is a personal learning OS that advocates **build first, learn after.**
 
-You build a project. Yggdrasil analyzes it, generates a skill tree of everything behind what you built, connects your existing resources to each quest automatically, and guides you through learning it. Your co-op experience, job targets, and learning progress all feed into one place — culminating in a Universal Skill Tree that is your living proof of expertise.
+You build a project. Yggdrasil analyzes it, generates a skill tree of every concept behind what you built, connects your existing resources to each quest automatically, and guides you through learning it. Co-op experience, job targets, and learning progress all feed into one place — culminating in a Universal Skill Tree that is your living proof of expertise.
 
 ---
 
@@ -27,7 +27,7 @@ Job tracker     →  Skill demand analysis  ────────────
                                                            Universal Tree grows
 ```
 
-It is built last — when all data sources are mature and feeding it properly. Every feature before it exists to make it meaningful.
+Built last — when all data sources are mature and feeding it properly. Every feature before it exists to make it meaningful.
 
 ---
 
@@ -35,7 +35,7 @@ It is built last — when all data sources are mature and feeding it properly. E
 
 Learning tools assume you start with a topic. Builders start with a project. The gap between building something and truly understanding it is enormous — and no tool bridges it.
 
-Separately: resources accumulate but go unused. Career progress is tracked across five different tools. Co-op experience lives in Notion. Job applications are a spreadsheet. Skills are nowhere.
+Separately: resources accumulate but go unused. Career progress is tracked across five different tools. Co-op experience lives in Notion. Job applications live in a spreadsheet. Skills are nowhere.
 
 Yggdrasil puts it all in one place.
 
@@ -57,113 +57,35 @@ Yggdrasil puts it all in one place.
 
 ---
 
-## What's Built (v1.0)
+## Current State (v1.0)
 
-### ✅ Trees
-A literal organic tree — trunk at bottom, branches growing upward, leaves at tips. Generated from a PRD or a GitHub repo URL via Groq (LLaMA 3.3-70b, ~$0.10/tree).
+### What's Built & Working
 
-- Trunk = project, branches = phases, leaves = quests
-- Node states: locked / unlocked / in-progress / complete / mastered
-- Quest completion cascades: quest % → skill % → phase % → tree %
-- Three viewing modes: Overview, Climb, Study
-- Study panel: resources, notes, completion, estimated time
+| Module | Status | Notes |
+|---|---|---|
+| Mimir Library — URL ingestion | ✅ Done | 5-tier scraper, YouTube transcripts, PDFs |
+| Mimir Library — YouTube playlists | ✅ Done | Parent-child grouping, 54-video batch ingest |
+| Mimir Library — Page type detection | ✅ Done | Auto-detects resource lists, triggers child modal |
+| Mimir Library — External links modal | ✅ Done | 54 links from datasciencehive ingested as children |
+| Mimir Chat — RAG | ✅ Done | pgvector cosine search, Groq LLaMA 3.3-70b synthesis |
+| Mimir Chat — Reranking | ✅ Done | llama-3.1-8b-instant reranker, top-3 selection |
+| Tree Generation — PRD | ✅ Done | Kimi-k2, concept graph, topo sort |
+| Tree Generation — GitHub repo | ✅ Done | GitHub API, source file analysis, concept graph |
+| Tree Rendering | ✅ Done | Custom SVG (YggdrasilTree.tsx), trunk/branch/leaf organic layout, node panel, quest completion |
+| Auto-matching quests to resources | ✅ Done | pgvector match on quest title + description |
+| Universal Skill Tree — Galaxy | ✅ Done | 58 skills, 97 gaps — needs visual rebuild |
+| Jobs Page | ✅ Done | 11/100+ jobs added, skill gap detection |
+| Resume Page | ✅ Done | Auto-parse, skill extraction |
+| Work Page | ✅ Done | Projects, skill extraction |
+| Quests Page | ✅ Done | Cross-tree quest view |
 
-### ✅ Quests
-Learning actions only — never implementation tasks. Each quest has title, description, difficulty, estimated hours, attached resources, completion state, and notes. Aggregated across all projects in the Quests page.
+### Known Issues
 
-### ✅ Mimir (Librarian V1)
-A Node.js sidecar that ingests your personal resource library and auto-matches content to quests via semantic search.
-
-- Ingests: URLs (scraped), PDFs (text-based), plain text
-- Embeddings: Transformers.js `all-MiniLM-L6-v2` (384 dimensions, free, local, ~60MB)
-- Vector search: pgvector on Neon
-- Auto-matches resources to quests on tree generation
-- Resource library view: browse, filter, manage
-
-### ✅ Work Page
-Co-op experience tracker with a D3 force galaxy visualization.
-
-- Co-ops → research topics → resources hierarchy in left panel
-- AI skill extraction via Groq (max 6 tags: specific method + broader domain)
-- Galaxy: skill nodes orbit co-op sun nodes, brightness scales with resource count
-- D3 force simulation with star field background — feels alive
-- Skills shared across co-ops shown with connections between clusters
-- Clicking a skill node shows backing resources
-
-### ✅ Jobs Page
-Job application tracker with JD analysis and skill demand analytics.
-
-- Kanban board: Saved / Applied / Interviewing / Offer / Rejected
-- Per-job ratings: location, alignment, salary, role (overall auto-calculated as average)
-- Full JD storage with AI skill extraction (required vs nice-to-have badges)
-- Analytics: skill demand chart weighted by job ratings, skills to prioritize
-- Follow-up tracker: overdue/due-soon indicators, one-click mark followed up
-- Season grouping for recruiting cycle comparison
-
----
-
-## What's Next
-
-### Phase 1 — Resume Page (`/resume`)
-Paste resume → AI extracts projects, skills, experience → pre-populates Universal Skill Tree starting point.
-
-- Resume text input or PDF upload
-- AI extracts: skills, projects (with tech stack), work experience, education
-- Skills pre-loaded into `universal_skills` table at appropriate starting levels
-- Projects shown as tree candidates: "Generate a tree for this project?"
-- Stored as structured profile in DB
-
-### Phase 2 — Ideas Page (`/ideas`)
-Simple scratchpad. One afternoon of work.
-
-- Text entries with timestamps
-- Tags: project idea / resource / random / learning
-- Pin important entries
-- "Turn into project" button → creates project from idea
-
-### Phase 3 — Mimir Chat
-RAG over your personal library.
-
-- Chat sidebar accessible from any view
-- Pipeline: embed query → pgvector search → retrieve chunks → Groq synthesizes
-- Context-aware: knows which tree you're viewing
-- Gap analysis: "what's missing from my library for this tree?"
-- Source attribution on every answer
-
-### Phase 4 — GitHub MCP (Read-Only)
-Replace current GitHub REST API calls with GitHub MCP for deeper code analysis.
-
-Current: fetches README, dependency files, directory listing.
-
-With MCP (read-only):
-- Read actual source files — understand how libraries are used, not just listed
-- Read issues/PRs — understand what problems were being solved
-- Commit history — understand how the project evolved
-- Result: trees that reflect what you actually built, not just what you imported
-
-Every tree generated after this will be significantly richer. Better trees → better Universal Skill Tree data.
-
-### Phase 5 — Universal Skill Tree (`/skills`)
-Built last. When all data sources are mature. Has to be perfect.
-
-**What feeds it:**
-- Resume page → starting skill levels
-- Completed project tree quests → level up with evidence
-- Work page skills → professional context
-- Job tracker demand analysis → gap highlighting
-
-**Skill levels:**
-- Level 1 — Aware: one quest mentioning this skill
-- Level 2 — Familiar: completed a full skill node
-- Level 3 — Proficient: completed in 2+ project contexts
-- Level 4 — Advanced: hard quests + multiple projects + work evidence
-- Level 5 — Expert: extensive cross-project evidence
-
-**Visualization:** D3 force galaxy — same visual language as Work page. Skill clusters group by domain. Brightness and size reflect level and recency. Skill dependency edges from tree branch structure show learning progression. Exportable as PDF/image (visual resume).
-
-**Job tracker overlay:** skills you need but don't have highlighted in amber directly on the galaxy.
-
-**Work page integration:** once built, Work page galaxy inherits skill dependency edges automatically — no manual input needed.
+- `parent_id` not propagating for external links modal children (datasciencehive 54 videos not grouped)
+- Mimir chat passes `null` for `treeId` and `nodeTitle` — not quest-aware
+- Tree nodes too cramped, labels truncate too early
+- 11 resources permanently unscrapable (paywalls, dead links, JS-only)
+- datasciencehive scrapes only 3 chunks without `force_dynamic`
 
 ---
 
@@ -177,18 +99,19 @@ Built last. When all data sources are mature. Has to be perfect.
 | Desktop | Tauri 2.0 | ✅ |
 | Main backend | Rust + Axum | ✅ |
 | Database | Postgres on Neon (pgvector enabled) | ✅ |
-| AI generation | Groq — LLaMA 3.3-70b-versatile | ✅ |
-| Tree visualization | Custom SVG organic renderer | ✅ |
+| AI generation | Kimi-k2 via OpenRouter | ✅ |
+| AI chat / extraction | Groq — LLaMA 3.3-70b-versatile | ✅ |
+| Tree visualization | ReactFlow | ✅ |
 | Work/Skills galaxy | D3 force simulation | ✅ |
 | Mimir sidecar | Node.js + TypeScript (port 3001) | ✅ |
 | Embeddings | Transformers.js all-MiniLM-L6-v2 (384d) | ✅ |
 | Vector search | pgvector on Neon | ✅ |
 | GitHub integration | REST API via reqwest | ✅ |
-| GitHub MCP | Read-only MCP server | 🔲 Phase 4 |
 
-**Running cost: ~$0/month.** Only real cost is Groq at ~$0.10/tree.
+**Running cost: ~$0/month.** Only real cost is tree generation at ~$0.10/tree.
 
 ### Architecture
+
 ```
 Tauri App (React frontend)
        ↓
@@ -203,9 +126,7 @@ Node.js Mimir sidecar (port 3001)  ──────────┘
 - All JSON stored as JSONB
 - All query placeholders use `$N` format
 
----
-
-## Pages
+### Pages
 
 | Route | Page | Status |
 |---|---|---|
@@ -213,23 +134,155 @@ Node.js Mimir sidecar (port 3001)  ──────────┘
 | `/trees` | All trees across projects | ✅ |
 | `/project/:id` | Tree canvas + PRD/GitHub input | ✅ |
 | `/quests` | All quests across projects | ✅ |
-| `/library` | Mimir resource library | ✅ |
+| `/resources` | Mimir resource library | ✅ |
 | `/work` | Co-op skill galaxy | ✅ |
 | `/jobs` | Job application tracker | ✅ |
-| `/resume` | Resume parser + profile | 🔲 Phase 1 |
-| `/ideas` | Scratchpad | 🔲 Phase 2 |
-| `/skills` | Universal Skill Tree | 🔲 Phase 5 |
+| `/resume` | Resume parser + profile | ✅ |
+| `/skills` | Universal Skill Tree galaxy (D3 force) | ✅ Done (V2: radial tree layout) |
+| `/ideas` | Scratchpad (ideas → projects) | ✅ Done |
 
 ---
 
-## Future: Monetization
+## Immediate Priorities (Now)
 
-Currently personal use only. Path to multi-user:
-- Auth: Clerk or Supabase Auth
-- Cloud deployment: Rust backend on Railway, frontend on Vercel
-- Per-user data isolation in Postgres
+### 1. Climb 4 Trees
 
-The core loop (build → tree → learn → Universal Tree) is the product. The job tracker + skill gap analysis is the hook. GitHub MCP is the differentiator.
+The app is built. Use it. Generate and climb trees for:
+
+- `github.com/dhruvhptl/pluto` — N-body physics simulator (Python + Julia)
+- `duely` — TBD repo
+- `bloch-sphere` — TBD repo
+- `yggdrasil` — this app itself
+
+Take notes in quest panels. Use Mimir chat while doing quests. Document every pain point encountered.
+
+### 2. Fix Parent-Child for External Links
+
+`handleIngestExternalLinks` in `ResourcesPage.tsx` is not passing `parent_id` to child ingests. Same bug as playlist fix — change `parentId` to `parent_id` in the invoke call.
+
+### 3. Dynamic Mimir Context
+
+Pass current quest node title and tree ID to Mimir chat so it knows what you're working on. `MimirChat.tsx` currently passes `null` for both. Read from current route/selected node state.
+
+### 4. Add Remaining Jobs
+
+Only 11/100+ jobs entered. Skill gap system needs more data to be meaningful. Target: 50+ jobs added before V2.
+
+---
+
+## V2 Features
+
+### 2.1 Scraper Upgrade
+
+The current 5-tier scraper works for most sites but has limitations. V2 goals:
+
+- Better `extract_text()` for div-heavy sites (currently misses content in non-semantic HTML)
+- Audio transcription via Whisper for YouTube videos with no captions
+- Video description + chapters as fallback when transcript unavailable
+- Fix the 11 permanently broken resources — replace with better URLs
+- Proper encoding handling — UTF-8 forced on Windows (`sys.stdout.reconfigure`)
+
+### 2.2 GitHub Repo Reader Upgrade
+
+Current `analyze_repo` in `brain.rs` does shallow fetching. V2 upgrade:
+
+- Tree-sitter Rust crate — parse source files into structured symbols (functions, classes, imports)
+- Call graph analysis — which functions call which
+- Import map — what each file imports from where
+- Richer LLM context — structured symbol map instead of raw file dumps
+- Result: quests reference specific patterns the author actually used, not just library names
+
+### 2.3 Universal Skill Tree — Visual Rebuild
+
+The current galaxy view needs to become a proper ever-growing tree:
+
+- Single root node (you), main branches emerge dynamically from skill data
+- Fully dynamic domain clustering — LLM classifies each skill into domains, creates new domains as needed
+- Completed quests from project trees automatically light up nodes
+- Job demand highlights — branches required by target JDs glow differently
+- Radial tree layout that expands outward as nodes are added
+- Eventually spans to represent your entire learning journey
+
+Data feeds into universal tree:
+- Project trees — completed quests unlock skills
+- Work page — job skills extracted from JDs
+- Future: courses, certifications, reading completions
+
+### 2.4 RAG Improvements
+
+- Dynamic context — Mimir chat knows which quest you're on, biases search toward matched resources
+- Chat history persistence — currently React state only, lost on refresh
+- Gap analysis — `GET /gaps/:treeId` — identify what's missing from library for a given tree
+- Better distance threshold tuning — currently 0.85, may need per-domain calibration
+
+---
+
+## V3 Features
+
+### 3.1 Mimir as Unified Agent
+
+Everything AI-powered consolidates under one agent (Mimir) with tool-calling:
+
+| Tool | Model | Purpose |
+|---|---|---|
+| `search_library(query)` | Claude Sonnet | RAG across all chunks |
+| `generate_tree(context)` | Kimi-k2 | Tree JSON generation |
+| `analyze_repo(url)` | Kimi-k2 | GitHub analysis + concept graph |
+| `scrape_url(url)` | Haiku / Gemini Flash | Scraper summarization |
+| `match_resources(node_id)` | MiniLM embeddings | Auto-match quests to library |
+| `rerank(chunks, query)` | llama-3.1-8b-instant | Fast relevance filtering |
+
+Mimir orchestrates everything. One conversation drives the full workflow: analyze repo → generate tree → match resources → answer questions while climbing.
+
+### 3.2 RAG + Library Before Quest Generation
+
+Before generating quests, RAG across Mimir library to find relevant resources the user already has. Quests reference specific resources: "Watch this video in your library" or "Read this chapter you already ingested." Requires library to be rich enough first.
+
+### 3.3 MCP Integration & Deployment
+
+Deploy scraper to Railway or Oracle Cloud. Expose Mimir tools via MCP server so external tools (Claude Code, other agents) can query your knowledge library. Build `/batch` endpoint for bulk operations.
+
+---
+
+## Ideas Backlog
+
+Not prioritized. Review after climbing the 4 trees.
+
+### Scraper
+- Auto-detect YouTube links on resource-list pages and offer playlist-style ingest
+- Better page type detection — wiki, forum, course platform-specific extractors
+- Re-scrape stale resources automatically when content changes
+
+### Tree
+- Tree spreading — more horizontal spacing, longer labels before truncation
+- Quest difficulty visual indicators on tree nodes
+- Estimated time remaining shown on branch/phase nodes
+- Tree comparison — how does your pluto tree compare to someone else's
+
+### Learning
+- Spaced repetition — resurface completed quests for review after N days
+- Quest notes export — compile all notes from a tree into a study document
+- Resource recommendations — "you're missing content on X, here are 3 sources"
+- Progress sharing — shareable skill tree snapshots
+
+### Universal Tree
+- Skill decay — skills fade if not practiced/reviewed
+- Skill prerequisites visualization — show what unlocks what
+- Learning velocity — how fast are you acquiring skills over time
+- Domain comparison vs job market — which domains are you over/under-indexed in
+
+---
+
+## Immediate Action Items
+
+In order:
+
+1. Fix `parent_id` for external links modal children
+2. Add dynamic context to Mimir chat (pass `nodeTitle` + `treeId`)
+3. Generate trees for: pluto, duely, bloch-sphere, yggdrasil
+4. Climb all 4 trees — take notes, use Mimir, document pain points
+5. Add 50+ jobs to jobs page
+6. Review pain points → prioritize V2 features
 
 ---
 
