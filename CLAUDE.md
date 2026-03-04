@@ -2,32 +2,34 @@
 
 ## What This App Is
 
-A personal learning OS. You build a project, paste the repo or PRD, and Yggdrasil generates a **literal growing tree** of everything you need to learn. Quests unlock skills, skills unlock phases, the tree comes alive as you learn. Over time it becomes your living resume.
+A personal learning OS. Build a project, paste the repo, Yggdrasil generates a skill tree of everything behind what you built. Co-op experience, job applications, and learning progress all feed into a Universal Skill Tree — your living proof of expertise.
 
 Read `PRD.md` for the full vision. This file is your technical bible.
 
 ---
 
-## Current State
+## Current State (v1.0)
 
-**Working:**
-- Project creation and listing
-- AI tree generation via Groq API (brain.rs)
-- Manual tree editor (EditableSkillTree.tsx, react-d3-tree)
-- SQLite persistence with SQLx
-- Node CRUD (create, update, delete, resources)
+**Fully working:**
+- Project creation, listing, edit, delete
+- AI tree generation from PRD text (brain.rs → Groq)
+- AI tree generation from GitHub repo URL (brain.rs → GitHub API → Groq)
+- Custom SVG organic tree renderer (trunk at bottom, branches up, leaves at tips)
+- Quest tracking with completion, notes, progress cascade
+- Mimir sidecar: URL scraping, PDF ingestion, text chunking, embeddings, pgvector storage
+- Auto-matching resources to quest nodes on tree generation
+- Resource library page
+- Work page: co-op tracker + D3 force galaxy visualization + AI skill extraction
+- Jobs page: kanban board + JD analysis + skill demand analytics + follow-up tracker
+- Postgres on Neon with pgvector
+- All migrations run automatically on startup
 
-**Broken / Stubbed:**
-- `update_project` and `delete_project` commands are stubs — not implemented
-- Quest completion checkboxes exist in UI but don't write to database
-- `QuestsPage.tsx` is an empty placeholder
-- Progress on project cards doesn't update
-
-**To Delete:**
-- `src/components/SkillTreeView.tsx` — unused ReactFlow component, never rendered
-
-**Security:**
-- `src-tauri/.env` was accidentally committed — run `git rm --cached src-tauri/.env`
+**Not yet built:**
+- Resume page (`/resume`) — Phase 1
+- Ideas page (`/ideas`) — Phase 2
+- Mimir chat/RAG — Phase 3
+- GitHub MCP integration — Phase 4
+- Universal Skill Tree (`/skills`) — Phase 5
 
 ---
 
@@ -36,28 +38,35 @@ Read `PRD.md` for the full vision. This file is your technical bible.
 ```
 ├── src/
 │   ├── components/
-│   │   ├── EditableSkillTree.tsx   # Main tree editor (react-d3-tree) — KEEP
-│   │   ├── ProjectInput.tsx        # Project creation form
-│   │   └── SkillTreeView.tsx       # DELETE — unused ReactFlow component
+│   │   ├── EditableSkillTree.tsx   # Legacy tree editor — may still be referenced
+│   │   └── ProjectInput.tsx        # Project creation form
 │   ├── pages/
-│   │   ├── Homepage.tsx            # Project list
-│   │   ├── ProjectTreePage.tsx     # Tree view + AI generation
+│   │   ├── Homepage.tsx            # Project list + creation
+│   │   ├── ProjectTreePage.tsx     # Tree canvas + PRD/GitHub generation
 │   │   ├── TreesPage.tsx           # All trees list
-│   │   └── QuestsPage.tsx          # EMPTY PLACEHOLDER — needs building
+│   │   ├── QuestsPage.tsx          # All quests across projects
+│   │   ├── LibraryPage.tsx         # Mimir resource library
+│   │   ├── WorkPage.tsx            # Co-op galaxy
+│   │   └── JobsPage.tsx            # Job tracker
 │   ├── layouts/
 │   │   └── MainLayout.tsx          # Sidebar navigation
 │   └── types.ts
 ├── src-tauri/
 │   ├── src/
-│   │   ├── main.rs                 # Command registration
-│   │   ├── commands.rs             # Project CRUD (update/delete are stubs)
-│   │   ├── tree_commands.rs        # Tree/node CRUD — fully working
-│   │   ├── brain.rs                # Groq AI generation — fully working
-│   │   └── database.rs             # DB connection + init
-│   ├── migrations/
-│   │   ├── 001_initial.sql
-│   │   └── 002_tree_schema.sql
-│   └── .env                        # GROQ_API_KEY (do not commit)
+│   │   ├── main.rs                 # Command registration — register ALL new commands here
+│   │   ├── commands.rs             # Project CRUD
+│   │   ├── tree_commands.rs        # Tree/node CRUD + quest completion
+│   │   ├── brain.rs                # Groq AI generation + GitHub repo analysis
+│   │   ├── work_commands.rs        # Co-op/topic/resource/skill commands
+│   │   ├── job_commands.rs         # Job application commands
+│   │   └── database.rs             # PgPool connection + migrations
+│   ├── migrations/                 # Auto-run on startup, sequential
+│   └── .env                        # DATABASE_URL + GROQ_API_KEY (never commit)
+├── sidecar/                        # Node.js Mimir service
+│   ├── src/
+│   │   └── routes/
+│   │       └── ingest.ts           # URL/PDF/text ingestion + embeddings
+│   └── package.json
 ```
 
 ---
@@ -69,217 +78,59 @@ Read `PRD.md` for the full vision. This file is your technical bible.
 | Frontend | React 19 + TypeScript + Vite + Tailwind |
 | Desktop | Tauri 2.0 |
 | Main backend | Rust + Axum |
-| Database | **Postgres on Neon** (migrating from SQLite — see Phase 0) |
+| Database | Postgres on Neon (pgvector enabled) |
 | AI generation | Groq API — LLaMA 3.3-70b-versatile |
-| Tree visualization | Custom SVG renderer (replacing react-d3-tree) |
-| Mimir sidecar | Node.js + TypeScript (future — Phase 3) |
-| Embeddings | Transformers.js all-MiniLM-L6-v2 (future — Phase 3) |
-| Vector search | pgvector on Neon (future — Phase 3) |
+| Tree renderer | Custom SVG (organic tree shape) |
+| Work/Skills galaxy | D3 force simulation |
+| Mimir sidecar | Node.js + TypeScript (port 3001) |
+| Embeddings | Transformers.js all-MiniLM-L6-v2 (384 dimensions) |
+| Vector search | pgvector on Neon |
+| GitHub | REST API via reqwest (upgrading to MCP in Phase 4) |
 
 ---
 
-## Phase 0: SQLite → Postgres Migration (DO THIS FIRST)
+## Database Schema
 
-Everything else depends on this. Do not start Phase 1 until the app is running on Neon.
-
-### Steps
-
-**1. Cargo.toml** — swap sqlx feature:
-```toml
-# Remove:
-sqlx = { version = "0.7", features = ["sqlite", "runtime-tokio-native-tls"] }
-# Add:
-sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-native-tls"] }
-```
-
-**2. database.rs** — swap pool type:
-```rust
-// Remove: SqlitePool, SqlitePoolOptions
-// Add: PgPool, PgPoolOptions
-// Read DATABASE_URL from env (not hardcoded)
-let pool = PgPoolOptions::new()
-    .connect(&std::env::var("DATABASE_URL").expect("DATABASE_URL must be set"))
-    .await?;
-```
-
-**3. .env** — add Neon connection string:
-```
-DATABASE_URL=postgresql://user:pass@host.neon.tech/neondb?sslmode=require
-GROQ_API_KEY=your_key_here
-```
-
-**4. All migrations** — two changes throughout:
-- `?1, ?2, ?3` → `$1, $2, $3`
-- `TEXT NOT NULL DEFAULT '[]'` → `JSONB NOT NULL DEFAULT '[]'`
-- `TEXT DEFAULT NULL` → `JSONB DEFAULT NULL`
-- `BOOLEAN` stays as-is (Postgres supports it natively)
-- `TEXT NOT NULL` for timestamps → `TIMESTAMPTZ NOT NULL DEFAULT NOW()`
-
-**5. All queries in .rs files** — same placeholder change: `?1` → `$1` etc.
-
-**6. New migration** — add Mimir tables (create these now so schema is ready):
+### Core tables
 ```sql
--- 003_postgres_and_mimir.sql
-
--- Update existing columns to JSONB (handled in migration)
-ALTER TABLE projects ALTER COLUMN discipline_ids TYPE JSONB USING discipline_ids::jsonb;
-ALTER TABLE projects ALTER COLUMN skill_ids TYPE JSONB USING skill_ids::jsonb;
-ALTER TABLE tree_nodes ALTER COLUMN tasks TYPE JSONB USING COALESCE(tasks, '[]')::jsonb;
-ALTER TABLE tree_nodes ALTER COLUMN resources TYPE JSONB USING COALESCE(resources, '[]')::jsonb;
-
--- Mimir tables
-CREATE TABLE IF NOT EXISTS mimir_resources (
-    id TEXT PRIMARY KEY,
-    title TEXT NOT NULL,
-    url TEXT,
-    type TEXT NOT NULL DEFAULT 'other',
-    status TEXT NOT NULL DEFAULT 'unread',
-    user_notes TEXT,
-    content_hash TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS mimir_chunks (
-    id TEXT PRIMARY KEY,
-    resource_id TEXT NOT NULL REFERENCES mimir_resources(id) ON DELETE CASCADE,
-    content TEXT NOT NULL,
-    chunk_index INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS mimir_embeddings (
-    id TEXT PRIMARY KEY,
-    chunk_id TEXT NOT NULL REFERENCES mimir_chunks(id) ON DELETE CASCADE,
-    embedding vector(384)
-);
-
-CREATE TABLE IF NOT EXISTS mimir_node_links (
-    id TEXT PRIMARY KEY,
-    resource_id TEXT NOT NULL REFERENCES mimir_resources(id) ON DELETE CASCADE,
-    node_id TEXT NOT NULL REFERENCES tree_nodes(id) ON DELETE CASCADE,
-    relevance_score REAL,
-    UNIQUE(resource_id, node_id)
-);
-
-CREATE TABLE IF NOT EXISTS universal_skills (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    domain TEXT,
-    level INTEGER NOT NULL DEFAULT 1 CHECK(level BETWEEN 1 AND 5),
-    evidence JSONB NOT NULL DEFAULT '[]',
-    last_updated TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
+projects          -- id, name, description, discipline_ids JSONB, status, progress, created_at
+trees             -- id, project_id FK, name, created_at
+tree_nodes        -- id, tree_id FK, parent_id FK, type (trunk/branch/leaf),
+                  -- title, description, progress, tasks JSONB, resources JSONB,
+                  -- x, y, order_index
+tree_edges        -- id, tree_id FK, source_node_id FK, target_node_id FK
+disciplines       -- id, name, description, color
 ```
 
-### Database Rules (Always Follow)
-- Always read `DATABASE_URL` from environment — never hardcode
-- Use standard Postgres + pgvector only — no Neon-specific features
-- All JSON → JSONB
-- All query placeholders → `$N` format
-
----
-
-## Phase 1: Core Tree (After Postgres Migration)
-
-The literal organic tree renderer. This replaces react-d3-tree entirely.
-
-### Visual Requirements
-- Trunk at the **bottom**, branches grow **upward**
-- Organic, slightly irregular angles — not symmetric
-- Leaves at branch tips (quests)
-- Canvas is infinite — pan and zoom
-- Node states drive appearance:
-
-| State | Visual |
-|---|---|
-| Locked | Bare branch, grey, no leaves |
-| Unlocked | Branch with dark/muted leaves |
-| In Progress | Leaves fill with color proportionally |
-| Complete | Fully colored, subtle glow |
-| Mastered | Golden shimmer |
-
-### Unlock Logic
-- Completing ALL quests in a skill → unlocks next skill on that branch
-- First skill of each branch unlocks when tree is generated
-- Progress cascades: quest completion → skill % → phase % → tree %
-- Cross-branch dependencies shown visually but non-blocking
-
-### Quest Completion Wiring (currently broken)
-```typescript
-// When checkbox ticked:
-// 1. Update tasks JSONB in tree_nodes
-// 2. Recalculate node progress (completed / total * 100)
-// 3. Check if all quests done → unlock next skill
-// 4. Propagate progress up the tree
-await invoke('complete_quest', { nodeId, questId });
+### Mimir tables
+```sql
+mimir_resources   -- id, title, url, type, status, user_notes, content_hash, created_at
+mimir_chunks      -- id, resource_id FK, content, chunk_index
+mimir_embeddings  -- id, chunk_id FK, embedding vector(384)
+mimir_node_links  -- id, resource_id FK, node_id FK, relevance_score
 ```
 
-### Three Viewing Modes
-- **Overview** — zoomed out, full tree, understand scope
-- **Climb** — focused on current position, next quest highlighted
-- **Study** — inside a quest, full panel (resources, notes, completion)
-
-### Implement Stub Commands
-```rust
-// commands.rs — these are stubs, implement them:
-pub async fn update_project(project_id: String, name: Option<String>, description: Option<String>, ...)
-pub async fn delete_project(project_id: String, ...) // cascade: project → trees → nodes → edges
-pub async fn update_project_progress(project_id: String, ...) // aggregate from tree nodes
+### Work tables
+```sql
+coop_terms           -- id, company, role, start_date, end_date, color
+research_topics      -- id, coop_id FK, name
+work_resources       -- id, topic_id FK, title, url, notes, completed
+work_resource_skills -- id, resource_id FK, skill_name, tree_id FK (nullable)
 ```
 
----
-
-## Phase 2: AI Generation Improvements
-
-### What Already Works
-- `brain.rs` → Groq API → JSON → tree_nodes in DB
-- PRD text → tree generation (~$0.10, 5-10s)
-
-### What to Add
-- **Repo analyzer**: accept GitHub URL → fetch key files → extract tech stack → generate tree of "concepts behind what you built"
-- **Quest quality validator**: system prompt must reject implementation tasks, enforce learning actions only
-- **Tree regeneration**: re-run AI on same project without destroying manual edits
-
-### Quest Quality Rules (enforce in system prompt)
-```
-ALLOWED: "Read Chapter X", "Watch lecture on Y", "Work through exercises Z"
-FORBIDDEN: "Implement X", "Build Y", "Create Z", "Code W"
+### Jobs tables
+```sql
+job_applications  -- id, company, position, location, source, status,
+                  -- date_applied, date_follow_up, job_description, link, notes,
+                  -- rating_location, rating_alignment, rating_salary, rating_role,
+                  -- season, created_at
+job_skills        -- id, job_id FK, skill_name, is_required
 ```
 
----
-
-## Phase 3: Mimir Sidecar
-
-A separate Node.js + TypeScript service. Tauri bundles and manages it.
-
-### Sidecar Architecture
+### Universal skills (ready, not yet used)
+```sql
+universal_skills  -- id, name, domain, level (1-5), evidence JSONB, last_updated
 ```
-Rust (port 3000) ←→ Node sidecar (port 3001) ←→ Neon Postgres
-```
-
-Rust proxies Mimir API calls to the sidecar. Both services share the same `DATABASE_URL`.
-
-### Sidecar Responsibilities
-- URL scraping (cheerio + node-fetch)
-- PDF parsing (pdf-parse)
-- YouTube transcripts (youtube-transcript)
-- Text chunking (~500 tokens)
-- Embeddings (Transformers.js — `all-MiniLM-L6-v2`, 384 dimensions, ~60MB download on first use)
-- pgvector read/write
-
-### Auto-Matching Flow
-On tree generation:
-1. For each new quest node, embed the title + description
-2. Search `mimir_embeddings` for similar chunks
-3. Write matches to `mimir_node_links` with relevance score
-4. Return linked resources to frontend with tree
-
-### Mimir Chat (RAG)
-1. User sends message
-2. Embed the query
-3. Search pgvector for top-k similar chunks
-4. Build context from chunk content
-5. Send to Groq: system prompt + context + user message
-6. Return answer
 
 ---
 
@@ -287,16 +138,16 @@ On tree generation:
 
 ### Rust
 ```rust
-// Queries use $N placeholders (Postgres)
+// Always $N placeholders — never ?N
 sqlx::query!("SELECT * FROM projects WHERE id = $1", id)
-
-// Always propagate errors with ?
-let result = some_async_op().await?;
 
 // Commands return Result<T, String>
 pub async fn my_command(...) -> Result<MyType, String> {
     op().await.map_err(|e| e.to_string())
 }
+
+// Always propagate errors with ?
+let result = some_async_op().await?;
 ```
 
 ### TypeScript / React
@@ -304,20 +155,22 @@ pub async fn my_command(...) -> Result<MyType, String> {
 // Always type invoke returns
 const result = await invoke<MyType>('command_name', { params });
 
-// Parse JSONB fields safely
-const tasks = Array.isArray(node.tasks) ? node.tasks : JSON.parse(node.tasks ?? '[]');
+// JSONB fields come back as objects — handle both cases
+const tasks = Array.isArray(node.tasks) 
+  ? node.tasks 
+  : JSON.parse(node.tasks ?? '[]');
 
-// Loading states on all async ops
+// Loading states on all async operations
 const [loading, setLoading] = useState(false);
 ```
 
 ### Never Do
 - Never hardcode `DATABASE_URL`
 - Never commit `.env` files
-- Never use `?N` query placeholders (Postgres uses `$N`)
-- Never store JSON as TEXT (use JSONB)
-- Never generate quests that are implementation tasks
-- Never use SkillTreeView.tsx (delete it)
+- Never use `?N` placeholders (Postgres uses `$N`)
+- Never store JSON as TEXT (always JSONB)
+- Never generate quests that are implementation tasks ("Build X", "Implement Y")
+- Never add Neon-specific SQL features (keep it portable)
 
 ---
 
@@ -326,16 +179,21 @@ const [loading, setLoading] = useState(false);
 ### Call Rust from React
 ```typescript
 import { invoke } from '@tauri-apps/api/core';
-const tree = await invoke<Tree>('get_tree_with_contents', { treeId });
+const result = await invoke<ReturnType>('command_name', { paramName: value });
 ```
 
 ### Add a New Tauri Command
-1. Write function in `commands.rs` or `tree_commands.rs` with `#[tauri::command]`
+1. Write function in appropriate `*_commands.rs` with `#[tauri::command]`
 2. Register in `main.rs` invoke_handler
 3. Call from frontend with `invoke('command_name', { params })`
 
 ### Add a Migration
-Create `src-tauri/migrations/00N_description.sql` — runs automatically on startup.
+Create `src-tauri/migrations/00N_description.sql` — runs automatically on startup. Never modify existing migrations.
+
+### Add a New Page
+1. Create `src/pages/NewPage.tsx`
+2. Add route in `App.tsx`
+3. Add nav link with lucide-react icon in `MainLayout.tsx`
 
 ### Run the App
 ```bash
@@ -350,23 +208,103 @@ npm run tauri dev
 # src-tauri/.env
 DATABASE_URL=postgresql://...neon.tech/neondb?sslmode=require
 GROQ_API_KEY=gsk_...
-```
+GITHUB_TOKEN=ghp_... (optional — increases rate limit, required for private repos)
 
-When Mimir sidecar is added:
-```bash
+# sidecar reads same DATABASE_URL
 MIMIR_PORT=3001
-MIMIR_URL=http://localhost:3001
 ```
 
 ---
 
-## Build Order (Do Not Skip Steps)
+## AI Generation Rules
 
-1. **Phase 0** — Postgres migration. App must build and connect to Neon before anything else.
-2. **Phase 1** — Literal tree renderer + quest completion wiring + stub commands.
-3. **Phase 2** — Improve AI generation (repo analysis, quest quality).
-4. **Phase 3** — Mimir sidecar (ingestion + embeddings + auto-matching).
-5. **Phase 4** — Mimir chat panel (RAG).
-6. **Phase 5** — Universal Skill Tree.
+### Tree generation (brain.rs) — Two-Phase Approach
+Tree generation uses a two-phase pipeline:
 
-Each phase must be fully working before starting the next.
+**Phase 1: Concept Graph Extraction**
+- First AI call extracts 8-20 concepts with prerequisite relationships from the project context
+- Concepts are topologically sorted using Kahn's algorithm (foundational first, advanced last)
+- If extraction fails, falls back to single-phase generation gracefully
+
+**Phase 2: Tree Generation with Graph Context**
+- The sorted concept dependency order is prepended to the user prompt
+- The tree generation LLM uses this to determine phase ordering, skill sequencing, and quest progression
+- Every quest should connect back to a concept in the dependency graph
+
+**Rules:**
+- Quests must be learning actions ONLY
+- ALLOWED: "Read Chapter X", "Watch lecture on Y", "Work through exercises Z"
+- FORBIDDEN: "Implement X", "Build Y", "Create Z", "Code W"
+- Structure: 3-5 phases → 2-4 skills each → 3 quests each
+- GitHub repo analysis: fetch README + dependency files + directory structure + key source files
+
+### Skill extraction (work_commands.rs + job_commands.rs)
+- Max 6 tags per resource (Work page)
+- Include specific method (e.g. "LDA") AND broader domain (e.g. "Topic Modelling")
+- Return ONLY JSON array — no preamble
+- For JDs: separate required vs nice-to-have, max 10 required + 5 nice-to-have
+
+---
+
+## Mimir Sidecar
+
+Runs on port 3001. Tauri manages lifecycle. Reads `DATABASE_URL` from environment.
+
+### Endpoints
+- `POST /ingest/url` — scrape URL, chunk, embed, store
+- `POST /ingest/pdf` — parse PDF (text-based only), chunk, embed, store
+- `POST /ingest/text` — chunk text directly, embed, store
+- `POST /match/:nodeId` — find top 5 matching resources for a quest node
+- `GET /resources` — list all ingested resources
+- `DELETE /resources/:id` — remove resource + chunks + embeddings
+
+### Known limitations
+- Scanned/image-based PDFs fail (no OCR) — user must paste text instead
+- Body size limit: 50MB (configured in Express setup)
+- Null bytes stripped from PDF text before storage
+
+---
+
+## Build Order for New Features
+
+Always:
+1. DB migration first (if new tables needed)
+2. Rust commands second
+3. Register in main.rs
+4. Frontend last
+
+Never start frontend before backend commands exist.
+
+---
+
+## Next Features (in order)
+
+### Phase 1: Resume Page
+- New migration: `resume_profile` table (skills, projects, experience, education as JSONB)
+- New `resume_commands.rs`: `parse_resume(text) → ResumeProfile`, `get_resume() → ResumeProfile`
+- AI extracts structured data from resume text via Groq
+- Pre-populates `universal_skills` table with starting levels
+- Frontend: `/resume` page, paste input or PDF upload, parsed profile display, "Generate tree" buttons on projects
+
+### Phase 2: Ideas Page
+- New migration: `ideas` table (id, content, tag, pinned, created_at)
+- New commands: `create_idea`, `get_ideas`, `update_idea`, `delete_idea`, `idea_to_project`
+- Frontend: `/ideas` page, simple card list, tag filter, pin, "Turn into project" action
+
+### Phase 3: Mimir Chat
+- New sidecar endpoint: `POST /chat` — embed query, pgvector search, build context, Groq RAG
+- Frontend: collapsible chat sidebar in MainLayout, context passes current page/tree
+- Gap analysis endpoint: `GET /gaps/:treeId`
+
+### Phase 4: GitHub MCP
+- Replace GitHub REST calls in `brain.rs` with MCP client
+- Read-only only — no writes ever
+- Deeper analysis: actual source files, issues, PR history
+
+### Phase 5: Universal Skill Tree
+- New migration: `skill_dependencies` table
+- New `skill_commands.rs`: sync from trees, sync from work page, calculate levels
+- Sync triggers: on quest completion, on work resource skill extraction
+- Frontend: `/skills` page, D3 force galaxy (reuse Work page galaxy component)
+- Job tracker overlay: highlight skill gaps in amber
+- Export: PDF/image of full galaxy

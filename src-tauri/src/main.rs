@@ -3,6 +3,11 @@ mod database;
 mod tree_commands;
 mod brain;
 mod mimir;
+mod work_commands;
+mod job_commands;
+mod idea_commands;
+mod resume_commands;
+mod skill_commands;
 
 use database::Database;
 use tauri::Manager;
@@ -46,6 +51,49 @@ fn main() {
             mimir::delete_mimir_resource,
             mimir::match_node_to_resources,
             mimir::link_resource_to_node,
+            mimir::extract_pdf_text,
+            mimir::mimir_chat,
+            mimir::discover_links,
+            mimir::fetch_playlist,
+            mimir::rescrape_resource,
+            mimir::rescrape_all,
+            mimir::get_chunk_counts,
+            work_commands::create_coop,
+            work_commands::get_coops,
+            work_commands::create_topic,
+            work_commands::add_resource,
+            work_commands::toggle_resource_completed,
+            work_commands::extract_skills,
+            work_commands::get_full_work_graph,
+            job_commands::create_job,
+            job_commands::get_jobs,
+            job_commands::update_job,
+            job_commands::delete_job,
+            job_commands::save_job_description,
+            job_commands::extract_job_skills,
+            job_commands::get_job_skills,
+            job_commands::get_skill_demand,
+            job_commands::mark_followed_up,
+            job_commands::reextract_all_skills,
+            idea_commands::create_idea,
+            idea_commands::get_ideas,
+            idea_commands::update_idea,
+            idea_commands::delete_idea,
+            idea_commands::idea_to_project,
+            resume_commands::parse_resume,
+            resume_commands::get_resume,
+            resume_commands::link_resume_project,
+            resume_commands::unlink_resume_project,
+            resume_commands::delete_resume,
+            skill_commands::sync_skills_from_resume,
+            skill_commands::sync_skills_from_trees,
+            skill_commands::sync_skills_from_work,
+            skill_commands::sync_all_skills,
+            skill_commands::recalculate_skill_levels,
+            skill_commands::get_universal_skills,
+            skill_commands::get_skill_dependencies,
+            skill_commands::get_skill_gaps,
+            skill_commands::infer_skill_dependencies,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

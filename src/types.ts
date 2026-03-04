@@ -77,4 +77,47 @@ export interface MimirResource {
   userNotes: string | null;
   createdAt: string;
   relevanceScore?: number | null;
+  parentId?: string | null;
+}
+
+// Universal Skill Tree types
+
+export interface SkillEvidence {
+  type: 'resume' | 'tree_quest' | 'work_resource' | 'job_demand';
+  detail?: string;
+  projectName?: string;
+  treeName?: string;
+  nodeTitle?: string;
+  nodeId?: string;
+  progress?: number;
+  company?: string;
+  resourceTitle?: string;
+  resourceId?: string;
+  count?: number;
+  frequency?: number;
+  demandScore?: number;
+}
+
+export interface UniversalSkill {
+  id: string;
+  name: string;
+  domain: string | null;
+  level: number;
+  evidence: SkillEvidence[];
+  lastUpdated: string;
+}
+
+export interface SkillGap {
+  skillName: string;
+  demandCount: number;
+  frequency: number;
+  demandScore: number;
+  currentLevel: number;
+}
+
+export interface SkillDependency {
+  id: string;
+  sourceSkillId: string;
+  targetSkillId: string;
+  relationship: string;
 }

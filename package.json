@@ -6,15 +6,21 @@
   "scripts": {
     "dev": "vite",
     "dev:mimir": "npm --prefix sidecar start",
-    "dev:all": "concurrently -k --names vite,mimir \"vite\" \"npm --prefix sidecar start\"",
+    "dev:scraper": "python scraper/main.py",
+    "dev:all": "concurrently --names vite,mimir,scraper \"vite\" \"npm --prefix sidecar start\" \"python scraper/main.py\"",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
     "install:all": "npm install && npm --prefix sidecar install"
   },
   "dependencies": {
+    "@dagrejs/dagre": "^2.0.4",
+    "@hello-pangea/dnd": "^18.0.1",
     "@tauri-apps/api": "^2.8.0",
     "@tauri-apps/plugin-opener": "^2",
+    "@types/d3": "^7.4.3",
+    "@xyflow/react": "^12.10.1",
+    "d3": "^7.9.0",
     "lucide-react": "^0.555.0",
     "react": "^19.1.0",
     "react-d3-tree": "^3.6.6",

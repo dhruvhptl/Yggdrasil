@@ -8,7 +8,7 @@ export const resourcesRouter = Router();
 resourcesRouter.get('/', async (_req: Request, res: Response) => {
   try {
     const result = await db.query(
-      'SELECT id, title, url, type, status, user_notes, created_at FROM mimir_resources ORDER BY created_at DESC',
+      'SELECT id, title, url, type, status, user_notes, created_at, parent_id FROM mimir_resources ORDER BY created_at DESC',
     );
     res.json(result.rows);
   } catch (err) {

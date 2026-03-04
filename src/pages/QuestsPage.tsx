@@ -58,6 +58,8 @@ export default function QuestsPage() {
       // Propagate progress up through the tree, then update the project card
       await invoke("recalculate_tree_progress", { treeId: quest.treeId });
       await invoke("update_project_progress", { projectId: quest.projectId });
+      // Sync tree skills to universal skills (fire-and-forget)
+      invoke("sync_skills_from_trees").then(() => invoke("recalculate_skill_levels")).catch(console.warn);
 
       setQuests((prev) =>
         prev.map((q) =>
