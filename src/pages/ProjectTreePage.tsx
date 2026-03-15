@@ -3,6 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import YggdrasilTree from '../components/YggdrasilTree';
 import React, { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { exportTreeAsZip } from '../utils/exportTree';
 
 type InputMode = 'prd' | 'github';
 
@@ -16,6 +17,8 @@ export default function ProjectTreePage() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [treeKey, setTreeKey] = useState(0);
   const [prdOpen, setPrdOpen] = useState(true);
+  const [hasTree, setHasTree] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
 
   useEffect(() => {
     if (projectId) {
@@ -23,10 +26,26 @@ export default function ProjectTreePage() {
         const project = projects.find(p => p.id === projectId);
         if (project) setProjectName(project.name);
       });
+      invoke<any[]>('get_trees', { projectId }).then(trees => {
+        setHasTree(trees.length > 0);
+      });
     }
-  }, [projectId]);
+  }, [projectId, treeKey]);
 
   const canSubmit = inputMode === 'prd' ? prdText.trim().length > 0 : githubUrl.trim().length > 0;
+
+  const handleExport = async () => {
+    if (!projectId || isExporting) return;
+    setIsExporting(true);
+    try {
+      await exportTreeAsZip(projectId);
+      alert('Export downloaded!');
+    } catch (err) {
+      alert(`Export failed: ${err}`);
+    } finally {
+      setIsExporting(false);
+    }
+  };
 
   const handleGenerate = async () => {
     if (!projectId || !canSubmit) return;
@@ -81,14 +100,14 @@ export default function ProjectTreePage() {
   });
 
   return (
-    <div className="h-full flex">
+    <div style={{ height: '100%', display: 'flex' }}>
       {/* Left panel */}
       <aside style={{
         width: prdOpen ? 288 : 0,
         flexShrink: 0,
         overflow: 'hidden',
         transition: 'width 0.2s ease',
-        borderRight: '1px solid #1e293b',
+        borderRight: prdOpen ? '1px solid #1e293b' : 'none',
         background: 'rgba(15, 23, 42, 0.35)',
       }}>
         <div style={{ width: 288, height: '100%', display: 'flex', flexDirection: 'column', gap: 12, padding: 16 }}>
@@ -178,7 +197,7 @@ export default function ProjectTreePage() {
       </aside>
 
       {/* Main area */}
-      <main className="flex-1 relative overflow-hidden bg-slate-950">
+      <main className="relative" style={{ flex: 1, minWidth: 0, height: '100%', overflow: 'hidden', background: '#010208' }}>
         {/* Floating top-left buttons */}
         <div style={{ position: 'absolute', top: 12, left: 12, zIndex: 30, display: 'flex', gap: 6 }}>
           <button
@@ -194,6 +213,15 @@ export default function ProjectTreePage() {
               onMouseEnter={e => { e.currentTarget.style.color = '#94a3b8'; e.currentTarget.style.borderColor = '#334155'; }}
               onMouseLeave={e => { e.currentTarget.style.color = '#64748b'; e.currentTarget.style.borderColor = '#1e293b'; }}
             >Edit PRD ↓</button>
+          )}
+          {hasTree && (
+            <button
+              onClick={handleExport}
+              disabled={isExporting}
+              style={{ ...floatBtn, opacity: isExporting ? 0.5 : 1 }}
+              onMouseEnter={e => { e.currentTarget.style.color = '#94a3b8'; e.currentTarget.style.borderColor = '#334155'; }}
+              onMouseLeave={e => { e.currentTarget.style.color = '#64748b'; e.currentTarget.style.borderColor = '#1e293b'; }}
+            >{isExporting ? 'Exporting…' : 'Export ↓'}</button>
           )}
         </div>
 

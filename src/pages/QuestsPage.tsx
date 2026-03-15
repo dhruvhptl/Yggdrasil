@@ -1,13 +1,23 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ChevronDown, NotebookPen } from "lucide-react";
-import type { QuestNode } from "../types";
+import type { QuestNode, CheckpointData } from "../types";
 
-const DIFFICULTY_STYLES: Record<string, string> = {
-  easy: "bg-emerald-900/60 text-emerald-300 border-emerald-700",
-  medium: "bg-yellow-900/60 text-yellow-300 border-yellow-700",
-  hard: "bg-red-900/60 text-red-300 border-red-700",
-};
+/** Extract checkpoint data from tasks field, handling both legacy array and new object shape */
+function getCheckpoint(quest: QuestNode): CheckpointData | null {
+  if (!quest.tasks) return null;
+  if (Array.isArray(quest.tasks)) {
+    const t = quest.tasks[0];
+    if (!t) return null;
+    return {
+      mastery_criteria: t.description ?? '',
+      exercises: [],
+      notes: t.notes ?? '',
+      completed: t.completed ?? false,
+    };
+  }
+  return quest.tasks as CheckpointData;
+}
 
 export default function QuestsPage() {
   const [quests, setQuests] = useState<QuestNode[]>([]);
@@ -15,7 +25,6 @@ export default function QuestsPage() {
   const [error, setError] = useState<string | null>(null);
   const [filterProject, setFilterProject] = useState("all");
   const [filterStatus, setFilterStatus] = useState("all");
-  const [filterDifficulty, setFilterDifficulty] = useState("all");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [toggling, setToggling] = useState<Set<string>>(new Set());
 
@@ -35,11 +44,11 @@ export default function QuestsPage() {
   }
 
   async function toggleQuest(quest: QuestNode) {
-    const task = quest.tasks[0] ?? null;
-    if (!task) return;
+    const cp = getCheckpoint(quest);
+    if (!cp) return;
 
-    const newCompleted = !task.completed;
-    const newTasks = [{ ...task, completed: newCompleted }];
+    const newCompleted = !cp.completed;
+    const newTasks = { ...cp, completed: newCompleted };
     const newProgress = newCompleted ? 100 : 0;
 
     setToggling((prev) => new Set(prev).add(quest.id));
@@ -55,10 +64,8 @@ export default function QuestsPage() {
         position: null,
       });
 
-      // Propagate progress up through the tree, then update the project card
       await invoke("recalculate_tree_progress", { treeId: quest.treeId });
       await invoke("update_project_progress", { projectId: quest.projectId });
-      // Sync tree skills to universal skills (fire-and-forget)
       invoke("sync_skills_from_trees").then(() => invoke("recalculate_skill_levels")).catch(console.warn);
 
       setQuests((prev) =>
@@ -69,7 +76,7 @@ export default function QuestsPage() {
         )
       );
     } catch (e) {
-      console.error("Failed to toggle quest:", e);
+      console.error("Failed to toggle checkpoint:", e);
     } finally {
       setToggling((prev) => {
         const next = new Set(prev);
@@ -88,47 +95,37 @@ export default function QuestsPage() {
     });
   }
 
-  // Unique project list for filter dropdown
   const projectOptions = useMemo(() => {
     const seen = new Map<string, string>();
     quests.forEach((q) => seen.set(q.projectId, q.projectName));
     return Array.from(seen.entries());
   }, [quests]);
 
-  // Filtered view
   const filtered = useMemo(() => {
     return quests.filter((q) => {
-      const task = q.tasks[0] ?? null;
       if (filterProject !== "all" && q.projectId !== filterProject) return false;
       if (filterStatus === "complete" && q.progress < 100) return false;
       if (filterStatus === "incomplete" && q.progress >= 100) return false;
-      if (filterDifficulty !== "all" && task?.difficulty !== filterDifficulty) return false;
       return true;
     });
-  }, [quests, filterProject, filterStatus, filterDifficulty]);
+  }, [quests, filterProject, filterStatus]);
 
-  // Stats
   const stats = useMemo(() => {
     const total = quests.length;
     const done = quests.filter((q) => q.progress >= 100).length;
-    const hoursRemaining = quests.reduce((sum, q) => {
-      if (q.progress >= 100) return sum;
-      const task = q.tasks[0] ?? null;
-      return sum + (task?.estimated_hours ?? 0);
-    }, 0);
-    return { total, done, hoursRemaining };
+    return { total, done };
   }, [quests]);
 
   if (loading) {
     return (
-      <div className="p-6 text-slate-400 text-sm">Loading quests...</div>
+      <div className="p-6 text-slate-400 text-sm">Loading checkpoints...</div>
     );
   }
 
   if (error) {
     return (
       <div className="p-6 text-red-400 text-sm">
-        Failed to load quests: {error}
+        Failed to load checkpoints: {error}
       </div>
     );
   }
@@ -137,9 +134,9 @@ export default function QuestsPage() {
     <div className="p-6 max-w-4xl mx-auto flex flex-col gap-6">
       {/* Header */}
       <div>
-        <h1 className="text-xl font-semibold text-slate-100">Quests</h1>
+        <h1 className="text-xl font-semibold text-slate-100">Checkpoints</h1>
         <p className="text-sm text-slate-400 mt-1">
-          All learning tasks across your projects.
+          All concept checkpoints across your projects.
         </p>
       </div>
 
@@ -148,10 +145,7 @@ export default function QuestsPage() {
         <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 flex flex-col gap-3">
           <div className="flex items-center justify-between text-sm">
             <span className="text-slate-300 font-medium">
-              {stats.done} / {stats.total} quests complete
-            </span>
-            <span className="text-slate-400">
-              ~{stats.hoursRemaining.toFixed(1)}h remaining
+              {stats.done} / {stats.total} checkpoints reached
             </span>
           </div>
           <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
@@ -186,19 +180,8 @@ export default function QuestsPage() {
           className="bg-slate-900 border border-slate-700 text-slate-300 text-sm rounded-md px-3 py-1.5 focus:outline-none focus:border-emerald-600"
         >
           <option value="all">All Status</option>
-          <option value="incomplete">Incomplete</option>
-          <option value="complete">Complete</option>
-        </select>
-
-        <select
-          value={filterDifficulty}
-          onChange={(e) => setFilterDifficulty(e.target.value)}
-          className="bg-slate-900 border border-slate-700 text-slate-300 text-sm rounded-md px-3 py-1.5 focus:outline-none focus:border-emerald-600"
-        >
-          <option value="all">All Difficulties</option>
-          <option value="easy">Easy</option>
-          <option value="medium">Medium</option>
-          <option value="hard">Hard</option>
+          <option value="incomplete">Not Reached</option>
+          <option value="complete">Reached</option>
         </select>
 
         {filtered.length !== quests.length && (
@@ -208,17 +191,17 @@ export default function QuestsPage() {
         )}
       </div>
 
-      {/* Quest list */}
+      {/* Checkpoint list */}
       {filtered.length === 0 ? (
         <div className="text-slate-500 text-sm">
           {quests.length === 0
-            ? "No quests found. Generate an AI tree to create quests."
-            : "No quests match the current filters."}
+            ? "No checkpoints found. Generate an AI tree to create checkpoints."
+            : "No checkpoints match the current filters."}
         </div>
       ) : (
         <div className="flex flex-col gap-2">
           {filtered.map((quest) => {
-            const task = quest.tasks[0] ?? null;
+            const cp = getCheckpoint(quest);
             const isComplete = quest.progress >= 100;
             const isExpanded = expanded.has(quest.id);
             const isToggling = toggling.has(quest.id);
@@ -239,7 +222,7 @@ export default function QuestsPage() {
                       ? "bg-emerald-600 border-emerald-600"
                       : "border-slate-600 hover:border-emerald-500"
                   } ${isToggling ? "opacity-50 cursor-wait" : "cursor-pointer"}`}
-                  aria-label={isComplete ? "Mark incomplete" : "Mark complete"}
+                  aria-label={isComplete ? "Mark not reached" : "Mark reached"}
                 >
                   {isComplete && (
                     <svg className="w-3 h-3 text-white" fill="none" viewBox="0 0 12 12">
@@ -267,26 +250,8 @@ export default function QuestsPage() {
                       >
                         {quest.title}
                       </span>
-                      {task?.notes?.trim() && (
+                      {cp?.notes?.trim() && (
                         <span title="Has notes"><NotebookPen className="w-3 h-3 text-slate-500 flex-shrink-0" /></span>
-                      )}
-                    </div>
-
-                    <div className="flex items-center gap-2 flex-shrink-0">
-                      {task?.difficulty && (
-                        <span
-                          className={`text-xs px-2 py-0.5 rounded border ${
-                            DIFFICULTY_STYLES[task.difficulty] ??
-                            DIFFICULTY_STYLES.medium
-                          }`}
-                        >
-                          {task.difficulty}
-                        </span>
-                      )}
-                      {task?.estimated_hours != null && (
-                        <span className="text-xs text-slate-500">
-                          {task.estimated_hours}h
-                        </span>
                       )}
                     </div>
                   </div>
@@ -296,12 +261,12 @@ export default function QuestsPage() {
                     {quest.projectName} › {quest.treeName}
                   </div>
 
-                  {/* Expandable description */}
-                  {quest.description && (
+                  {/* Expandable mastery criteria */}
+                  {(cp?.mastery_criteria || quest.description) && (
                     <div className="mt-1.5">
                       {isExpanded && (
                         <p className="text-xs text-slate-400 leading-relaxed mb-1">
-                          {quest.description}
+                          {cp?.mastery_criteria || quest.description}
                         </p>
                       )}
                       <button

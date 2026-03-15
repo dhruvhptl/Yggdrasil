@@ -9,16 +9,13 @@ export interface Project {
   progress: number;
 }
 
-// Quest tracking types
+// Checkpoint tracking types
 
-export interface QuestTask {
-  id: string;
-  title: string;
-  description: string;
-  estimated_hours: number;
-  difficulty: "easy" | "medium" | "hard";
+export interface CheckpointData {
+  mastery_criteria: string;
+  exercises: string[];
+  notes: string;
   completed: boolean;
-  notes?: string;
 }
 
 export interface QuestNode {
@@ -30,7 +27,7 @@ export interface QuestNode {
   title: string;
   description: string;
   progress: number;
-  tasks: QuestTask[];
+  tasks: CheckpointData;
   orderIndex: number;
 }
 
@@ -61,9 +58,8 @@ export interface BrainSkill {
 export interface BrainQuest {
   id: string;
   title: string;
-  description: string;
-  estimated_hours: number;
-  difficulty: "easy" | "medium" | "hard";
+  mastery_criteria: string;
+  exercises: string[];
   order: number;
 }
 

@@ -1,9 +1,12 @@
 // src/components/YggdrasilTree.tsx
-// Organic SVG skill tree: trunk at bottom, branches grow upward, leaves at tips.
+// Procedural L-system skill tree rendered on HTML Canvas.
+// Two rendering passes: (1) organic tree branches, (2) node ornaments at tips.
+// Dynamic coordinates — tree fills canvas naturally. No pan/zoom transform.
 
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { MimirResource } from '../types';
+import { useMimirContext } from '../contexts/MimirContext';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -15,7 +18,7 @@ interface TreeNode {
   title: string;
   description: string;
   progress: number; // 0–100
-  tasks: any[];
+  tasks: any;
   resources: any[] | null;
   x: number | null;
   y: number | null;
@@ -30,104 +33,749 @@ interface TreeEdge {
   target_node_id: string;
 }
 
-interface NodePos {
-  x: number;
-  y: number;
-  angle: number;
-}
-
 interface YggdrasilTreeProps {
   projectId: string;
 }
 
-// ─── Layout helpers ───────────────────────────────────────────────────────────
+// ─── L-System types ──────────────────────────────────────────────────────────
 
-const DEG = Math.PI / 180;
+interface Branch {
+  x1: number; y1: number;
+  x2: number; y2: number;
+  cp1x: number; cp1y: number;
+  cp2x: number; cp2y: number;
+  thickness: number;
+  depth: number;
+}
 
-function computeLayout(nodes: TreeNode[]): Map<string, NodePos> {
-  const positions = new Map<string, NodePos>();
+interface Tip {
+  x: number;
+  y: number;
+  angle: number;
+  depth: number;
+}
+
+interface NodePlacement {
+  node: TreeNode;
+  x: number;
+  y: number;
+  angle: number;
+  branchAngle: number;
+  phaseIndex: number;
+  nodeType: 'checkpoint' | 'skill' | 'phase';
+}
+
+interface PlaceNodesResult {
+  placements: NodePlacement[];
+  unusedTips: Tip[];
+}
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+const PHASE_COLORS = [
+  '#c8a94a',  // amber
+  '#4a9eff',  // blue
+  '#a855f7',  // purple
+  '#ef4444',  // red
+  '#10b981',  // emerald
+];
+
+// Dynamic tree config — computed from canvas size so tree fills viewport naturally.
+// No pan/zoom transform needed: tree coordinates ARE screen coordinates.
+interface TreeConfig {
+  baseX: number;
+  baseY: number;
+  topY: number;
+  initialThickness: number;
+  thicknessScale: number;
+  branchLen: number;
+  lengthScale: number;
+  seed: number;
+}
+
+function makeTreeConfig(w: number, h: number): TreeConfig {
+  // Scale tree to fill the viewport — trunk takes ~35% of height,
+  // branches scale proportionally so the canopy fills the rest.
+  const trunkHeight = h * 0.35;
+  const scale = Math.min(w, h) / 900; // reference size 900px
+  return {
+    baseX: w / 2,
+    baseY: h * 0.95,
+    topY: h * 0.95 - trunkHeight,
+    initialThickness: 24 * scale,
+    thicknessScale: 0.64,
+    branchLen: 145 * scale,
+    lengthScale: 0.72,
+    seed: 113,
+  };
+}
+
+// ─── Seeded Random ───────────────────────────────────────────────────────────
+
+class SeededRandom {
+  private s: number;
+  constructor(seed: number) {
+    this.s = seed % 2147483647;
+    if (this.s <= 0) this.s += 2147483646;
+  }
+  next(): number {
+    this.s = (this.s * 16807) % 2147483647;
+    return (this.s - 1) / 2147483646;
+  }
+  range(min: number, max: number): number {
+    return min + this.next() * (max - min);
+  }
+}
+
+// ─── Tree generation — recursive L-system branching ─────────────────────────
+
+function generateTree(targetTips: number, seed: number, cfg: TreeConfig): { branches: Branch[]; tips: Tip[] } {
+  // Binary-search minThickness so tip count ≥ targetTips (never fewer)
+  let lo = 0.3, hi = 4.0;
+  let bestResult: { branches: Branch[]; tips: Tip[] } = { branches: [], tips: [] };
+  let bestDiff = Infinity;
+
+  for (let iter = 0; iter < 16; iter++) {
+    const mid = (lo + hi) / 2;
+    const result = growTree(mid, seed, cfg);
+    const tipCount = result.tips.length;
+
+    // Only accept results with enough tips; prefer smallest surplus
+    if (tipCount >= targetTips) {
+      const surplus = tipCount - targetTips;
+      if (surplus < bestDiff) {
+        bestDiff = surplus;
+        bestResult = result;
+      }
+      if (surplus <= 8) break; // close enough above target
+      lo = mid; // raise threshold → fewer tips
+    } else {
+      hi = mid; // lower threshold → more tips
+    }
+  }
+
+  // Fallback: if binary search never found enough, use last best
+  if (bestResult.tips.length === 0) {
+    bestResult = growTree(lo, seed, cfg);
+  }
+
+  return bestResult;
+}
+
+function growTree(minThickness: number, seed: number, cfg: TreeConfig): { branches: Branch[]; tips: Tip[] } {
+  const rng = new SeededRandom(seed);
+  const branches: Branch[] = [];
+  const tips: Tip[] = [];
+
+  function grow(
+    x: number, y: number,
+    angle: number,
+    thickness: number,
+    length: number,
+    depth: number,
+  ) {
+    if (thickness < minThickness) {
+      tips.push({ x, y, angle, depth });
+      return;
+    }
+
+    const numChildren = depth === 0
+      ? Math.round(rng.range(3, 5))
+      : Math.round(rng.range(2, 3));
+
+    const spreadDeg = depth === 0 ? 110
+      : depth === 1 ? 70
+      : depth === 2 ? 50
+      : 35;
+    const spreadRad = spreadDeg * (Math.PI / 180);
+
+    for (let i = 0; i < numChildren; i++) {
+      const t = numChildren === 1 ? 0.5 : i / (numChildren - 1);
+      const baseAngle = angle - spreadRad / 2 + t * spreadRad;
+      const wanderRad = rng.range(-0.12, 0.12);
+      let childAngle = baseAngle + wanderRad;
+
+      // Keep branches growing upward
+      childAngle = Math.max(-Math.PI * 0.97, Math.min(-Math.PI * 0.03, childAngle));
+
+      const childLength = length * cfg.lengthScale * rng.range(0.88, 1.12);
+      const endX = x + childLength * Math.cos(childAngle);
+      const endY = y + childLength * Math.sin(childAngle);
+
+      // Bezier control points with perpendicular wander
+      const perp = childAngle + Math.PI / 2;
+      const w1 = rng.range(-18, 18);
+      const w2 = rng.range(-12, 12);
+      const cp1x = x + childLength * 0.35 * Math.cos(childAngle) + w1 * Math.cos(perp);
+      const cp1y = y + childLength * 0.35 * Math.sin(childAngle) + w1 * Math.sin(perp);
+      const cp2x = endX - childLength * 0.25 * Math.cos(childAngle) + w2 * Math.cos(perp);
+      const cp2y = endY - childLength * 0.25 * Math.sin(childAngle) + w2 * Math.sin(perp);
+
+      const childThickness = thickness * cfg.thicknessScale;
+
+      branches.push({
+        x1: x, y1: y, x2: endX, y2: endY,
+        cp1x, cp1y, cp2x, cp2y,
+        thickness: childThickness,
+        depth,
+      });
+
+      grow(endX, endY, childAngle, childThickness, childLength, depth + 1);
+    }
+  }
+
+  // Trunk bezier
+  const trunkMidX = cfg.baseX + rng.range(-6, 6);
+  branches.push({
+    x1: cfg.baseX, y1: cfg.baseY,
+    x2: cfg.baseX, y2: cfg.topY,
+    cp1x: trunkMidX + 8, cp1y: cfg.baseY - 100,
+    cp2x: trunkMidX - 6, cp2y: cfg.topY + 90,
+    thickness: cfg.initialThickness,
+    depth: -1,
+  });
+
+  // Grow from trunk top
+  grow(
+    cfg.baseX,
+    cfg.topY,
+    -Math.PI / 2,
+    cfg.initialThickness * cfg.thicknessScale,
+    cfg.branchLen,
+    0,
+  );
+
+  // Sort tips: by depth then left-to-right
+  tips.sort((a, b) => a.depth - b.depth || a.x - b.x);
+
+  return { branches, tips };
+}
+
+// ─── Tip sorting — angular sweep from trunk top ─────────────────────────────
+
+function sortTips(tips: Tip[], cfg: TreeConfig): Tip[] {
+  const cx = cfg.baseX;
+  const cy = cfg.topY;
+  return [...tips].sort((a, b) => {
+    const angleA = Math.atan2(a.y - cy, a.x - cx);
+    const angleB = Math.atan2(b.y - cy, b.x - cx);
+    return angleA - angleB;
+  });
+}
+
+// ─── Bezier utilities ────────────────────────────────────────────────────────
+
+function bezierPoint(
+  x1: number, y1: number, cp1x: number, cp1y: number,
+  cp2x: number, cp2y: number, x2: number, y2: number, t: number,
+): { x: number; y: number } {
+  const u = 1 - t;
+  return {
+    x: u*u*u*x1 + 3*u*u*t*cp1x + 3*u*t*t*cp2x + t*t*t*x2,
+    y: u*u*u*y1 + 3*u*u*t*cp1y + 3*u*t*t*cp2y + t*t*t*y2,
+  };
+}
+
+function bezierAngle(
+  x1: number, y1: number, cp1x: number, cp1y: number,
+  cp2x: number, cp2y: number, x2: number, y2: number, t: number,
+): number {
+  const u = 1 - t;
+  const dx = 3*u*u*(cp1x - x1) + 6*u*t*(cp2x - cp1x) + 3*t*t*(x2 - cp2x);
+  const dy = 3*u*u*(cp1y - y1) + 6*u*t*(cp2y - cp1y) + 3*t*t*(y2 - cp2y);
+  return Math.atan2(dy, dx);
+}
+
+// ─── Checkpoint collection — phase → skill → checkpoint order ────────────────
+// Handles any tree depth: trunk → phases → skills → checkpoints
+// Also handles 2-level trees where phases have leaves directly
+
+function collectCheckpoints(nodes: TreeNode[]): {
+  checkpoint: TreeNode;
+  skillId: string | null;
+  skillIndex: number;
+  phaseIndex: number;
+}[] {
   const childrenOf = new Map<string | null, TreeNode[]>();
-
   nodes.forEach(n => {
     const key = n.parent_id ?? null;
     if (!childrenOf.has(key)) childrenOf.set(key, []);
     childrenOf.get(key)!.push(n);
   });
-
   childrenOf.forEach(arr => arr.sort((a, b) => a.order_index - b.order_index));
 
   const roots = childrenOf.get(null) ?? [];
+  if (roots.length === 0) return [];
 
-  function branchLength(type: string): number {
-    if (type === 'trunk') return 160;
-    if (type === 'branch') return 130;
-    return 90;
-  }
+  // DB schema (brain.rs): phases are type="trunk" with parent_id=NULL (multiple roots).
+  // Manual trees: single trunk root whose children are phases.
+  const phases = roots.length > 1 ? roots : (childrenOf.get(roots[0].id) ?? []);
+  const result: { checkpoint: TreeNode; skillId: string | null; skillIndex: number; phaseIndex: number }[] = [];
 
-  function place(node: TreeNode, x: number, y: number, angle: number) {
-    positions.set(node.id, { x, y, angle });
-    const children = childrenOf.get(node.id) ?? [];
-    if (children.length === 0) return;
-
-    const len = branchLength(node.type);
-    const maxSpread = node.type === 'trunk' ? 80 : 60;
-    const spread = Math.min(maxSpread, children.length * 25);
-    const start = angle - spread / 2;
-    const step = children.length > 1 ? spread / (children.length - 1) : 0;
-
-    children.forEach((child, i) => {
-      const childAngle = start + i * step;
-      const rad = childAngle * DEG;
-      place(child, x + len * Math.cos(rad), y + len * Math.sin(rad), childAngle);
+  // Recursively collect all leaf nodes under a given parent
+  function collectLeaves(parentId: string): TreeNode[] {
+    const children = childrenOf.get(parentId) ?? [];
+    if (children.length === 0) {
+      const node = nodes.find(n => n.id === parentId);
+      return node && node.type !== 'trunk' ? [node] : [];
+    }
+    const leaves: TreeNode[] = [];
+    children.forEach(child => {
+      const childLeaves = collectLeaves(child.id);
+      if (childLeaves.length > 0) {
+        leaves.push(...childLeaves);
+      }
     });
+    return leaves;
   }
 
-  if (roots.length === 1) {
-    place(roots[0], 500, 680, -90);
-  } else if (roots.length > 1) {
-    const spread = Math.min(100, roots.length * 28);
-    const startAngle = -90 - spread / 2;
-    const step = roots.length > 1 ? spread / (roots.length - 1) : 0;
+  phases.forEach((phase, phaseIdx) => {
+    const phaseChildren = childrenOf.get(phase.id) ?? [];
 
-    roots.forEach((root, i) => {
-      const angle = startAngle + i * step;
-      const rad = angle * DEG;
-      const x = 500 + 160 * Math.cos(rad);
-      const y = 760 + 160 * Math.sin(rad);
-      place(root, x, y, angle);
+    // Check if this phase has intermediate skill nodes or direct leaf children
+    const hasSkillLevel = phaseChildren.some(c => {
+      const grandchildren = childrenOf.get(c.id) ?? [];
+      return grandchildren.length > 0;
     });
+
+    if (hasSkillLevel) {
+      // 3-level: phase → skill → checkpoints
+      phaseChildren.forEach((skill, skillIdx) => {
+        const leaves = collectLeaves(skill.id);
+        leaves.forEach(cp => {
+          result.push({ checkpoint: cp, skillId: skill.id, skillIndex: skillIdx, phaseIndex: phaseIdx });
+        });
+      });
+    } else {
+      // 2-level: phase → checkpoints directly
+      phaseChildren.forEach((cp, cpIdx) => {
+        result.push({ checkpoint: cp, skillId: null, skillIndex: cpIdx, phaseIndex: phaseIdx });
+      });
+    }
+  });
+
+  return result;
+}
+
+// ─── Node placement — leaf distribution across canopy ────────────────────────
+
+const LEAF_CONFIG = {
+  innerDensity: 0.5,
+  minSpacing: 35,
+  repulsionIters: 15,
+  tetherStrength: 0.3,
+  depthSpread: 0.6,
+  leafAngleVar: 30,
+};
+
+function placeNodes(nodes: TreeNode[], tips: Tip[], branches: Branch[], cfg: TreeConfig): PlaceNodesResult {
+  const sortedTips = sortTips(tips, cfg);
+  const checkpoints = collectCheckpoints(nodes);
+  if (checkpoints.length === 0 || sortedTips.length === 0) return { placements: [], unusedTips: [] };
+
+  const cx = cfg.baseX;
+  const cy = cfg.topY;
+  const rng = new SeededRandom(cfg.seed + 777);
+
+  const relocRng = new SeededRandom(cfg.seed + 888);
+  const innerBranches = branches.filter(b => b.depth >= 0 && b.depth <= 2 && b.thickness > 1.5);
+
+  const allPoints = sortedTips.map(tip => {
+    if (LEAF_CONFIG.innerDensity <= 0 || innerBranches.length === 0 || relocRng.next() > LEAF_CONFIG.innerDensity) {
+      return { x: tip.x, y: tip.y, angle: tip.angle, depth: tip.depth };
+    }
+    const b = innerBranches[Math.floor(relocRng.range(0, innerBranches.length))];
+    const t = relocRng.range(0.25, 0.85);
+    const pt = bezierPoint(b.x1, b.y1, b.cp1x, b.cp1y, b.cp2x, b.cp2y, b.x2, b.y2, t);
+    const angle = bezierAngle(b.x1, b.y1, b.cp1x, b.cp1y, b.cp2x, b.cp2y, b.x2, b.y2, t);
+    const perpAngle = angle + (relocRng.next() > 0.5 ? Math.PI / 2 : -Math.PI / 2);
+    const offset = relocRng.range(4, 12);
+    return {
+      x: pt.x + Math.cos(perpAngle) * offset,
+      y: pt.y + Math.sin(perpAngle) * offset,
+      angle,
+      depth: b.depth,
+    };
+  });
+
+  const byDist = allPoints.map((pt, idx) => {
+    const dx = pt.x - cx, dy = pt.y - cy;
+    return { pt, idx, dist: Math.sqrt(dx * dx + dy * dy), depth: pt.depth, progressScore: 0 };
+  });
+  const ds = LEAF_CONFIG.depthSpread;
+  const maxDist = Math.max(...byDist.map(t => t.dist)) || 1;
+  const maxDepth = Math.max(...byDist.map(t => t.depth)) || 1;
+  byDist.forEach(t => {
+    t.progressScore = (1 - ds) * (t.depth / maxDepth) + ds * (t.dist / maxDist);
+  });
+  byDist.sort((a, b) => a.progressScore - b.progressScore);
+
+  const totalCPs = checkpoints.length;
+  const totalPts = byDist.length;
+  const stride = totalPts / totalCPs;
+
+  const placements: NodePlacement[] = [];
+  const leafPositions: { x: number; y: number; origX: number; origY: number; angle: number }[] = [];
+  const usedIndices = new Set<number>();
+
+  checkpoints.forEach((_cp, i) => {
+    const ptIdx = Math.min(totalPts - 1, Math.round(i * stride));
+    usedIndices.add(ptIdx);
+    const pt = byDist[ptIdx].pt;
+    const angleVar = LEAF_CONFIG.leafAngleVar * Math.PI / 180;
+    const leafAngle = pt.angle + rng.range(-angleVar, angleVar);
+    leafPositions.push({ x: pt.x, y: pt.y, origX: pt.x, origY: pt.y, angle: leafAngle });
+  });
+
+  for (let iter = 0; iter < LEAF_CONFIG.repulsionIters; iter++) {
+    for (let i = 0; i < leafPositions.length; i++) {
+      for (let j = i + 1; j < leafPositions.length; j++) {
+        const dx = leafPositions[j].x - leafPositions[i].x;
+        const dy = leafPositions[j].y - leafPositions[i].y;
+        const dist = Math.sqrt(dx * dx + dy * dy) || 0.1;
+        if (dist < LEAF_CONFIG.minSpacing) {
+          const force = (LEAF_CONFIG.minSpacing - dist) / 2 * 0.4;
+          for (const [leaf, sign] of [[leafPositions[i], -1], [leafPositions[j], 1]] as const) {
+            const rdx = leaf.x - cx, rdy = leaf.y - cy;
+            const rLen = Math.sqrt(rdx * rdx + rdy * rdy) || 1;
+            const tangentX = -rdy / rLen;
+            const tangentY = rdx / rLen;
+            const repDx = sign * dx / dist;
+            const repDy = sign * dy / dist;
+            const dot = repDx * tangentX + repDy * tangentY;
+            const dir = dot >= 0 ? 1 : -1;
+            leaf.x += dir * tangentX * force;
+            leaf.y += dir * tangentY * force;
+          }
+        }
+      }
+      if (LEAF_CONFIG.tetherStrength > 0) {
+        leafPositions[i].x += (leafPositions[i].origX - leafPositions[i].x) * LEAF_CONFIG.tetherStrength;
+        leafPositions[i].y += (leafPositions[i].origY - leafPositions[i].y) * LEAF_CONFIG.tetherStrength;
+      }
+    }
   }
 
-  return positions;
+  checkpoints.forEach(({ checkpoint, phaseIndex }, i) => {
+    const lp = leafPositions[i];
+    placements.push({
+      node: checkpoint, x: lp.x, y: lp.y,
+      angle: lp.angle, branchAngle: lp.angle,
+      phaseIndex, nodeType: 'checkpoint',
+    });
+  });
+
+  const unusedTips: Tip[] = byDist
+    .filter((_, idx) => !usedIndices.has(idx))
+    .map(entry => ({ x: entry.pt.x, y: entry.pt.y, angle: entry.pt.angle, depth: entry.pt.depth }));
+
+  return { placements, unusedTips };
 }
 
-function branchPath(x1: number, y1: number, x2: number, y2: number): string {
-  const midY = (y1 + y2) / 2;
-  const dx = x2 - x1;
-  const cp1x = x1 + dx * 0.15;
-  const cp2x = x2 - dx * 0.15;
-  return `M ${x1} ${y1} C ${cp1x} ${midY} ${cp2x} ${midY} ${x2} ${y2}`;
+// ─── Canvas rendering ───────────────────────────────────────────────────────
+
+function drawBackground(ctx: CanvasRenderingContext2D, w: number, h: number) {
+  // Deep night sky gradient — vertical, darkest at top
+  const skyGrad = ctx.createLinearGradient(0, 0, 0, h);
+  skyGrad.addColorStop(0, '#010208');
+  skyGrad.addColorStop(0.35, '#020406');
+  skyGrad.addColorStop(0.65, '#04080a');
+  skyGrad.addColorStop(1, '#060d08');
+  ctx.fillStyle = skyGrad;
+  ctx.fillRect(0, 0, w, h);
+
+  // Subtle radial glow behind the canopy — warm green, very faint
+  const canopyGlow = ctx.createRadialGradient(w * 0.5, h * 0.4, 0, w * 0.5, h * 0.4, w * 0.55);
+  canopyGlow.addColorStop(0, 'rgba(14, 30, 14, 0.35)');
+  canopyGlow.addColorStop(0.6, 'rgba(8, 16, 8, 0.15)');
+  canopyGlow.addColorStop(1, 'rgba(0, 0, 0, 0)');
+  ctx.fillStyle = canopyGlow;
+  ctx.fillRect(0, 0, w, h);
+
+  // Ground plane — soft gradient at the base
+  const groundY = h * 0.88;
+  const groundGrad = ctx.createLinearGradient(0, groundY, 0, h);
+  groundGrad.addColorStop(0, 'rgba(0, 0, 0, 0)');
+  groundGrad.addColorStop(0.3, 'rgba(8, 12, 6, 0.2)');
+  groundGrad.addColorStop(1, 'rgba(10, 16, 8, 0.35)');
+  ctx.fillStyle = groundGrad;
+  ctx.fillRect(0, groundY, w, h - groundY);
+
+  // Ground line — very subtle mossy horizon
+  ctx.beginPath();
+  ctx.moveTo(0, h * 0.93);
+  // Slightly wavy ground line
+  for (let x = 0; x <= w; x += 40) {
+    const yOff = Math.sin(x * 0.008) * 3 + Math.sin(x * 0.023) * 1.5;
+    ctx.lineTo(x, h * 0.93 + yOff);
+  }
+  ctx.lineTo(w, h);
+  ctx.lineTo(0, h);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(6, 14, 6, 0.25)';
+  ctx.fill();
+
+  // Scattered ambient particles — fireflies / spores
+  const particleRng = new SeededRandom(42);
+  const particleCount = Math.floor(w * h / 18000);
+  for (let i = 0; i < particleCount; i++) {
+    const px = particleRng.range(0, w);
+    const py = particleRng.range(h * 0.05, h * 0.85);
+    const pr = particleRng.range(0.3, 1.2);
+    const alpha = particleRng.range(0.08, 0.25);
+    // Warm tones for fireflies, cool tones for distant stars
+    const isWarm = py > h * 0.4;
+    const r = isWarm ? Math.round(particleRng.range(140, 200)) : Math.round(particleRng.range(120, 180));
+    const g = isWarm ? Math.round(particleRng.range(160, 220)) : Math.round(particleRng.range(140, 190));
+    const b = isWarm ? Math.round(particleRng.range(80, 120)) : Math.round(particleRng.range(170, 230));
+    ctx.beginPath();
+    ctx.arc(px, py, pr, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
+    ctx.fill();
+  }
 }
 
-function nodeColor(node: TreeNode): string {
-  if (node.progress === 100) return '#10b981';
-  if (node.progress > 0) return '#059669';
-  if (node.type === 'leaf') return '#374151';
-  return '#1d4027';
+function drawTree(ctx: CanvasRenderingContext2D, branches: Branch[]) {
+  const sorted = [...branches].sort((a, b) => b.thickness - a.thickness);
+
+  sorted.forEach(branch => {
+    const t = branch.thickness;
+    const darkness = Math.max(10, 35 - branch.depth * 3);
+    const r = darkness;
+    const g = Math.round(darkness * 0.65);
+    const bl = Math.round(darkness * 0.25);
+
+    ctx.beginPath();
+    ctx.moveTo(branch.x1, branch.y1);
+    ctx.bezierCurveTo(branch.cp1x, branch.cp1y, branch.cp2x, branch.cp2y, branch.x2, branch.y2);
+    ctx.strokeStyle = `rgb(${r},${g},${bl})`;
+    ctx.lineWidth = Math.max(0.5, t);
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.stroke();
+
+    // Bark texture for thick branches
+    if (t > 4) {
+      ctx.beginPath();
+      ctx.moveTo(branch.x1 + 1, branch.y1);
+      ctx.bezierCurveTo(
+        branch.cp1x + 2, branch.cp1y,
+        branch.cp2x - 1, branch.cp2y,
+        branch.x2 + 1, branch.y2,
+      );
+      ctx.strokeStyle = `rgba(${r + 8},${g + 5},${bl + 2},0.35)`;
+      ctx.lineWidth = Math.max(1, t * 0.4);
+      ctx.stroke();
+    }
+  });
 }
 
-function nodeRadius(type: string): number {
-  if (type === 'trunk') return 16;
-  if (type === 'branch') return 12;
-  return 8;
+// ─── Leaf shape constants ────────────────────────────────────────────────────
+
+const LEAF_SHAPE = {
+  size: 14,
+  width: 0.45,
+  pointiness: 0.3,
+  curve: 0.15,
+  glowRadius: 12,
+  lockedOpacity: 0.2,
+};
+
+// ─── Draw a single botanical leaf ────────────────────────────────────────────
+
+function drawLeaf(
+  ctx: CanvasRenderingContext2D,
+  x: number, y: number, angle: number,
+  size: number, color: string,
+  state: 'dormant' | 'budding' | 'growing' | 'bloomed',
+  isHovered: boolean, isSelected: boolean,
+) {
+  const w = size * LEAF_SHAPE.width;
+  const len = size;
+  const pointOff = len * LEAF_SHAPE.pointiness;
+  const curve = LEAF_SHAPE.curve * size;
+
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(angle);
+
+  let fillColor: string, strokeColor: string, alpha: number;
+  if (state === 'bloomed') {
+    fillColor = color; strokeColor = '#ffffffaa'; alpha = 1;
+  } else if (state === 'dormant') {
+    fillColor = '#111'; strokeColor = '#333'; alpha = LEAF_SHAPE.lockedOpacity;
+  } else if (state === 'growing') {
+    fillColor = color + '99'; strokeColor = color + 'cc'; alpha = 0.85;
+  } else {
+    fillColor = color + '55'; strokeColor = color + '88'; alpha = 0.7;
+  }
+
+  ctx.globalAlpha = alpha;
+
+  if (state === 'bloomed' && LEAF_SHAPE.glowRadius > 0) {
+    const glow = ctx.createRadialGradient(len * 0.4, 0, 2, len * 0.4, 0, LEAF_SHAPE.glowRadius + size);
+    glow.addColorStop(0, color + '44');
+    glow.addColorStop(1, color + '00');
+    ctx.beginPath();
+    ctx.arc(len * 0.4, 0, LEAF_SHAPE.glowRadius + size, 0, Math.PI * 2);
+    ctx.fillStyle = glow;
+    ctx.fill();
+  }
+
+  if (isHovered) {
+    const hg = ctx.createRadialGradient(len * 0.4, 0, 2, len * 0.4, 0, size * 2);
+    hg.addColorStop(0, color + '55');
+    hg.addColorStop(1, color + '00');
+    ctx.beginPath();
+    ctx.arc(len * 0.4, 0, size * 2, 0, Math.PI * 2);
+    ctx.fillStyle = hg;
+    ctx.fill();
+  }
+
+  if (isSelected) {
+    ctx.beginPath();
+    ctx.arc(len * 0.4, 0, size * 1.3, 0, Math.PI * 2);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.globalAlpha = 0.8;
+    ctx.stroke();
+    ctx.globalAlpha = alpha;
+  }
+
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.bezierCurveTo(pointOff * 0.3, -(w * 0.5 + curve), pointOff, -(w + curve * 0.5), len, 0);
+  ctx.bezierCurveTo(pointOff, (w + curve * 0.5), pointOff * 0.3, (w * 0.5 + curve), 0, 0);
+  ctx.closePath();
+  ctx.fillStyle = fillColor;
+  ctx.fill();
+  ctx.strokeStyle = strokeColor;
+  ctx.lineWidth = isHovered ? 1.8 : 1;
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.moveTo(1, 0);
+  ctx.lineTo(len * 0.85, 0);
+  ctx.strokeStyle = state === 'dormant' ? '#222' : (state === 'bloomed' ? '#ffffff44' : color + '55');
+  ctx.lineWidth = 0.6;
+  ctx.stroke();
+
+  const veinCount = Math.max(2, Math.floor(size / 5));
+  for (let v = 1; v <= veinCount; v++) {
+    const t = v / (veinCount + 1);
+    const vx = len * t * 0.85;
+    const vw = w * (1 - t * 0.6) * 0.6;
+    const veinStroke = state === 'dormant' ? '#1a1a1a' : (state === 'bloomed' ? '#ffffff22' : color + '33');
+    ctx.beginPath();
+    ctx.moveTo(vx, 0);
+    ctx.quadraticCurveTo(vx + len * 0.06, -vw * 0.6, vx + len * 0.12, -vw);
+    ctx.strokeStyle = veinStroke;
+    ctx.lineWidth = 0.4;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(vx, 0);
+    ctx.quadraticCurveTo(vx + len * 0.06, vw * 0.6, vx + len * 0.12, vw);
+    ctx.stroke();
+  }
+
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.lineTo(-size * 0.4, 0);
+  ctx.strokeStyle = '#1a1008';
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+
+  ctx.globalAlpha = 1;
+  ctx.restore();
 }
 
-function branchStroke(parentType: string): number {
-  return parentType === 'trunk' ? 5 : 3;
+// ─── Draw a decorative (non-interactive) leaf at unused tips ─────────────────
+
+function drawDecorativeLeaf(
+  ctx: CanvasRenderingContext2D,
+  x: number, y: number, angle: number,
+  size: number,
+) {
+  const scale = 0.6;
+  const len = size * scale;
+  const w = len * LEAF_SHAPE.width;
+  const pointOff = len * LEAF_SHAPE.pointiness;
+  const curve = LEAF_SHAPE.curve * len;
+
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(angle);
+  ctx.globalAlpha = 0.35;
+
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.bezierCurveTo(pointOff * 0.3, -(w * 0.5 + curve), pointOff, -(w + curve * 0.5), len, 0);
+  ctx.bezierCurveTo(pointOff, (w + curve * 0.5), pointOff * 0.3, (w * 0.5 + curve), 0, 0);
+  ctx.closePath();
+  ctx.fillStyle = '#1a1208';
+  ctx.fill();
+  ctx.strokeStyle = '#2a1e10';
+  ctx.lineWidth = 0.6;
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.moveTo(1, 0);
+  ctx.lineTo(len * 0.8, 0);
+  ctx.strokeStyle = '#221a0c';
+  ctx.lineWidth = 0.4;
+  ctx.stroke();
+
+  ctx.globalAlpha = 1;
+  ctx.restore();
 }
 
-function truncate(str: string, max: number): string {
-  return str.length > max ? str.slice(0, max) + '…' : str;
+// ─── Draw all leaves + phase/skill labels ────────────────────────────────────
+
+function drawLeaves(
+  ctx: CanvasRenderingContext2D,
+  placements: NodePlacement[],
+  unusedTips: Tip[],
+  selectedId: string | null,
+  hoveredId: string | null,
+  centerX: number,
+) {
+  // Draw decorative leaves at unused tips first (behind interactive leaves)
+  unusedTips.forEach(tip => {
+    drawDecorativeLeaf(ctx, tip.x, tip.y, tip.angle, LEAF_SHAPE.size);
+  });
+
+  // Draw interactive checkpoint leaves
+  placements.forEach(({ node, x, y, angle, phaseIndex }) => {
+    const color = PHASE_COLORS[phaseIndex % PHASE_COLORS.length];
+    const isLocked = node.is_locked ?? false;
+    const progress = node.progress ?? 0;
+    const isSelected = node.id === selectedId;
+    const isHovered = node.id === hoveredId;
+
+    const state: 'dormant' | 'budding' | 'growing' | 'bloomed' =
+      isLocked ? 'dormant'
+      : progress === 0 ? 'budding'
+      : progress < 100 ? 'growing'
+      : 'bloomed';
+
+    drawLeaf(ctx, x, y, angle, LEAF_SHAPE.size, color, state, isHovered, isSelected);
+
+    if (isHovered || isSelected) {
+      const label = node.title.length > 22 ? node.title.slice(0, 22) + '\u2026' : node.title;
+      ctx.font = '400 10px Inter, sans-serif';
+      ctx.fillStyle = '#ddd';
+      ctx.textBaseline = 'middle';
+      const labelOffset = LEAF_SHAPE.size + 10;
+      if (x > centerX) {
+        ctx.textAlign = 'left';
+        ctx.fillText(label, x + labelOffset, y);
+      } else {
+        ctx.textAlign = 'right';
+        ctx.fillText(label, x - labelOffset, y);
+      }
+      ctx.textAlign = 'left';
+    }
+  });
 }
 
 // ─── Node Panel ───────────────────────────────────────────────────────────────
@@ -149,27 +797,33 @@ function NodePanel({ node, skillLocked, onSave, onClose, onAddChild, onDelete }:
   );
   const [mimiResources, setMimiResources] = useState<MimirResource[]>([]);
   const [matching, setMatching] = useState(false);
-  const task = node.type === 'leaf' && Array.isArray(node.tasks) ? node.tasks[0] : null;
-  const [notesText, setNotesText] = useState(task?.notes ?? '');
+  const checkpoint = node.type === 'leaf'
+    ? (Array.isArray(node.tasks)
+        ? { mastery_criteria: node.tasks[0]?.description ?? '', exercises: [] as string[], notes: node.tasks[0]?.notes ?? '', completed: node.tasks[0]?.completed ?? false }
+        : (node.tasks as { mastery_criteria?: string; exercises?: string[]; notes?: string; completed?: boolean } | null))
+    : null;
+  const [notesText, setNotesText] = useState(checkpoint?.notes ?? '');
   const notesTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
-    const currentTask = node.type === 'leaf' && Array.isArray(node.tasks) ? node.tasks[0] : null;
+    const cp = node.type === 'leaf'
+      ? (Array.isArray(node.tasks)
+          ? { mastery_criteria: node.tasks[0]?.description ?? '', exercises: [] as string[], notes: node.tasks[0]?.notes ?? '', completed: node.tasks[0]?.completed ?? false }
+          : (node.tasks as { mastery_criteria?: string; exercises?: string[]; notes?: string; completed?: boolean } | null))
+      : null;
     setTitle(node.title);
     setDescription(node.description);
     setResources(
       Array.isArray(node.resources) ? node.resources.filter(r => typeof r === 'string') : []
     );
-    setNotesText(currentTask?.notes ?? '');
+    setNotesText(cp?.notes ?? '');
     if (notesTimerRef.current) clearTimeout(notesTimerRef.current);
-    // Load Mimir-linked resources for this node (best-effort)
     setMimiResources([]);
     invoke<MimirResource[]>('get_node_resources', { nodeId: node.id })
       .then(setMimiResources)
-      .catch(() => { /* sidecar not running — silently ignore */ });
+      .catch(() => {});
   }, [node.id]);
 
-  // Cleanup debounce on unmount
   useEffect(() => {
     return () => { if (notesTimerRef.current) clearTimeout(notesTimerRef.current); };
   }, []);
@@ -178,12 +832,12 @@ function NodePanel({ node, skillLocked, onSave, onClose, onAddChild, onDelete }:
     setNotesText(value);
     if (notesTimerRef.current) clearTimeout(notesTimerRef.current);
     notesTimerRef.current = setTimeout(async () => {
-      if (!task) return;
+      if (!checkpoint) return;
       try {
         await invoke('update_tree_node', {
           nodeId: node.id,
           title: null, description: null, progress: null,
-          tasks: [{ ...task, notes: value }],
+          tasks: { ...checkpoint, notes: value },
           resources: null, position: null,
         });
       } catch { /* silently ignore auto-save errors */ }
@@ -193,10 +847,10 @@ function NodePanel({ node, skillLocked, onSave, onClose, onAddChild, onDelete }:
   async function handleFindMatches() {
     setMatching(true);
     try {
-      const matched = await invoke<MimirResource[]>('match_node_to_resources', { nodeId: node.id });
-      if (matched.length > 0) setMimiResources(matched);
+      await invoke('match_node_to_resources', { nodeId: node.id });
+      const resources = await invoke<MimirResource[]>('get_node_resources', { nodeId: node.id });
+      setMimiResources(resources);
     } catch {
-      // sidecar not running — silently ignore
     } finally {
       setMatching(false);
     }
@@ -207,21 +861,14 @@ function NodePanel({ node, skillLocked, onSave, onClose, onAddChild, onDelete }:
   }
 
   function handleToggleComplete() {
-    if (!task) return;
-    const newCompleted = !task.completed;
+    if (!checkpoint) return;
+    const newCompleted = !checkpoint.completed;
     onSave({
       progress: newCompleted ? 100 : 0,
-      tasks: [{ ...task, completed: newCompleted }],
+      tasks: { ...checkpoint, completed: newCompleted },
     });
   }
 
-  const DIFF_COLOR: Record<string, string> = {
-    easy: '#6ee7b7',
-    medium: '#fde68a',
-    hard: '#fca5a5',
-  };
-
-  // Locked panel — all hooks already called above, safe to return early here
   if (skillLocked) {
     return (
       <div style={{
@@ -247,7 +894,7 @@ function NodePanel({ node, skillLocked, onSave, onClose, onAddChild, onDelete }:
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '24px', textAlign: 'center', gap: 12 }}>
           <span style={{ fontSize: 32 }}>🔒</span>
           <p style={{ fontSize: 13, color: '#475569', lineHeight: 1.6, margin: 0 }}>
-            Complete all quests in the previous skill to unlock this one.
+            Reach all checkpoints in the previous skill to unlock this one.
           </p>
         </div>
       </div>
@@ -325,34 +972,38 @@ function NodePanel({ node, skillLocked, onSave, onClose, onAddChild, onDelete }:
           />
         </div>
 
-        {/* Quest details — leaf nodes only */}
-        {node.type === 'leaf' && task && (
+        {/* Checkpoint details — leaf nodes only */}
+        {node.type === 'leaf' && checkpoint && (
           <div style={{
             marginBottom: 12, padding: 10,
             background: '#1e293b', borderRadius: 8, border: '1px solid #334155',
           }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-              <span style={{ fontSize: 10, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.07em' }}>Quest</span>
-              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                {task.difficulty && (
-                  <span style={{
-                    fontSize: 10, padding: '2px 6px', borderRadius: 4,
-                    background: (DIFF_COLOR[task.difficulty] || '#94a3b8') + '22',
-                    color: DIFF_COLOR[task.difficulty] || '#94a3b8',
-                    border: `1px solid ${(DIFF_COLOR[task.difficulty] || '#94a3b8')}44`,
-                  }}>
-                    {task.difficulty}
-                  </span>
-                )}
-                {task.estimated_hours != null && (
-                  <span style={{ fontSize: 10, color: '#64748b' }}>~{task.estimated_hours}h</span>
-                )}
-              </div>
+              <span style={{ fontSize: 10, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.07em' }}>Checkpoint</span>
             </div>
-            {task.description && (
-              <p style={{ fontSize: 12, color: '#94a3b8', lineHeight: 1.5, margin: '0 0 8px 0' }}>
-                {task.description}
-              </p>
+            {checkpoint.mastery_criteria && (
+              <>
+                <label style={{ display: 'block', fontSize: 9, color: '#475569', marginBottom: 3, textTransform: 'uppercase', letterSpacing: '0.07em' }}>
+                  Mastery Criteria
+                </label>
+                <p style={{ fontSize: 12, color: '#94a3b8', lineHeight: 1.5, margin: '0 0 10px 0' }}>
+                  {checkpoint.mastery_criteria}
+                </p>
+              </>
+            )}
+            {checkpoint.exercises && checkpoint.exercises.length > 0 && (
+              <>
+                <label style={{ display: 'block', fontSize: 9, color: '#475569', marginBottom: 3, textTransform: 'uppercase', letterSpacing: '0.07em' }}>
+                  Exercises
+                </label>
+                <ul style={{ margin: '0 0 10px 0', paddingLeft: 16 }}>
+                  {checkpoint.exercises.map((ex: string, i: number) => (
+                    <li key={i} style={{ fontSize: 11, color: '#94a3b8', lineHeight: 1.6, marginBottom: 2 }}>
+                      {ex}
+                    </li>
+                  ))}
+                </ul>
+              </>
             )}
             <button
               onClick={handleToggleComplete}
@@ -360,25 +1011,25 @@ function NodePanel({ node, skillLocked, onSave, onClose, onAddChild, onDelete }:
             >
               <div style={{
                 width: 16, height: 16, borderRadius: 4,
-                border: `2px solid ${task.completed ? '#10b981' : '#475569'}`,
-                background: task.completed ? '#10b981' : 'transparent',
+                border: `2px solid ${checkpoint.completed ? '#10b981' : '#475569'}`,
+                background: checkpoint.completed ? '#10b981' : 'transparent',
                 display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
               }}>
-                {task.completed && (
+                {checkpoint.completed && (
                   <svg width="9" height="9" viewBox="0 0 10 10" fill="none">
                     <path d="M1.5 5L4 7.5L8.5 2.5" stroke="white" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
                   </svg>
                 )}
               </div>
-              <span style={{ fontSize: 12, color: task.completed ? '#10b981' : '#94a3b8' }}>
-                {task.completed ? 'Completed' : 'Mark complete'}
+              <span style={{ fontSize: 12, color: checkpoint.completed ? '#10b981' : '#94a3b8' }}>
+                {checkpoint.completed ? 'Reached' : 'Mark as reached'}
               </span>
             </button>
           </div>
         )}
 
-        {/* Quest notes — leaf nodes only */}
-        {node.type === 'leaf' && task && (
+        {/* Checkpoint notes — leaf nodes only */}
+        {node.type === 'leaf' && checkpoint && (
           <div style={{ marginBottom: 12 }}>
             <label style={{ display: 'block', fontSize: 10, color: '#64748b', marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.07em' }}>
               My notes
@@ -570,85 +1221,131 @@ function NodePanel({ node, skillLocked, onSave, onClose, onAddChild, onDelete }:
 // ─── Main component ────────────────────────────────────────────────────────────
 
 export default function YggdrasilTree({ projectId }: YggdrasilTreeProps) {
-  // DOM refs
-  const svgRef = useRef<SVGSVGElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const { setMimirContext } = useMimirContext();
 
   // Data state
   const [treeId, setTreeId] = useState<string | null>(null);
   const [nodes, setNodes] = useState<TreeNode[]>([]);
-  const [edges, setEdges] = useState<TreeEdge[]>([]);
+  const [, setEdges] = useState<TreeEdge[]>([]);
   const [selectedNode, setSelectedNode] = useState<TreeNode | null>(null);
+  const [hoveredNode, setHoveredNode] = useState<string | null>(null);
+  const [size, setSize] = useState({ w: 1200, h: 900 });
 
-  // Pan / zoom state
-  const [isPanning, setIsPanning] = useState(false);
-  const [pan, setPan] = useState({ x: 0, y: 0 });
-  const [scale, setScale] = useState(1);
-  const panRef = useRef<{ active: boolean; startMouse: { x: number; y: number }; startPan: { x: number; y: number } }>({
-    active: false, startMouse: { x: 0, y: 0 }, startPan: { x: 0, y: 0 },
-  });
-  const initialFitDone = useRef(false);
+  // Pan/zoom via refs (no re-render on transform change — renderTick triggers redraw)
+  const transform = useRef({ x: 0, y: 0, scale: 1 });
+  const isDragging = useRef(false);
+  const lastMouse = useRef({ x: 0, y: 0 });
+  const dragMoved = useRef(false);
+  const [renderTick, setRenderTick] = useState(0);
+  const triggerRender = useCallback(() => setRenderTick(t => t + 1), []);
 
-  // Layout computed from nodes
-  const positions = useMemo(() => computeLayout(nodes), [nodes]);
+  // Dynamic tree config — recomputed when canvas size changes
+  const treeConfig = useMemo(() => makeTreeConfig(size.w, size.h), [size.w, size.h]);
 
-  // ── Native wheel listener (React passive listeners can't preventDefault) ──
+  // Count leaf nodes for tree generation (terminal nodes = no children)
+  const leafCount = useMemo(() => {
+    const hasChildren = new Set<string>();
+    nodes.forEach(n => { if (n.parent_id) hasChildren.add(n.parent_id); });
+    return nodes.filter(n => !hasChildren.has(n.id) && n.type !== 'trunk').length;
+  }, [nodes]);
+
+  // Generate procedural tree — deterministic from seed + leaf count + canvas size
+  const { branches, tips } = useMemo(
+    () => generateTree(Math.max(leafCount, 8), treeConfig.seed + leafCount, treeConfig),
+    [leafCount, treeConfig],
+  );
+
+  // Place data nodes onto branch tips
+  const { placements, unusedTips } = useMemo(
+    () => placeNodes(nodes, tips, branches, treeConfig),
+    [nodes, tips, branches, treeConfig],
+  );
+
+  // Sync selected node to Mimir context
   useEffect(() => {
-    const svg = svgRef.current;
-    if (!svg) return;
-    const onWheel = (e: WheelEvent) => {
-      e.preventDefault();
-      setScale(s => Math.min(3, Math.max(0.25, s - e.deltaY * 0.001)));
-    };
-    svg.addEventListener('wheel', onWheel, { passive: false });
-    return () => svg.removeEventListener('wheel', onWheel);
-  }, []);
+    setMimirContext({
+      treeId: selectedNode ? treeId : null,
+      nodeTitle: selectedNode?.title ?? null,
+    });
+  }, [selectedNode, treeId]);
 
-  // ── Load tree when project changes ───────────────────────────────────────
+  // Resize observer — re-run when nodes load (container mounts conditionally)
+  const hasNodes = nodes.length > 0;
   useEffect(() => {
-    initialFitDone.current = false;
+    const el = containerRef.current;
+    if (!el) return;
+    // Grab initial size synchronously so the first frame is correct
+    const { clientWidth, clientHeight } = el;
+    if (clientWidth > 0 && clientHeight > 0) {
+      setSize({ w: clientWidth, h: clientHeight });
+    }
+    const ro = new ResizeObserver(entries => {
+      const { width, height } = entries[0].contentRect;
+      if (width > 0 && height > 0) {
+        setSize({ w: Math.round(width), h: Math.round(height) });
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [hasNodes]);
+
+  // Load tree when project changes
+  useEffect(() => {
     setNodes([]);
     setEdges([]);
     setSelectedNode(null);
-    setPan({ x: 0, y: 0 });
-    setScale(1);
     loadTree();
   }, [projectId]);
 
-  // ── Fit to view after first node load ────────────────────────────────────
+  // ── Canvas render — with pan/zoom transform ─────────────────────────────────
   useEffect(() => {
-    if (nodes.length > 0 && !initialFitDone.current) {
-      initialFitDone.current = true;
-      // Positions are computed synchronously in useMemo, so they're ready here.
-      // Small timeout to let the DOM paint first so clientWidth/Height are correct.
-      setTimeout(() => fitView(), 50);
-    }
-  }, [nodes]);
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
 
-  // ── fitView: zoom/pan so all nodes are visible and centered ──────────────
-  function fitView() {
-    if (positions.size === 0 || !containerRef.current) return;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = size.w * dpr;
+    canvas.height = size.h * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-    positions.forEach(({ x, y }) => {
-      if (x < minX) minX = x;
-      if (x > maxX) maxX = x;
-      if (y < minY) minY = y;
-      if (y > maxY) maxY = y;
-    });
+    // Background fills the full canvas (not transformed)
+    drawBackground(ctx, size.w, size.h);
 
-    const pad = 80;
-    const treeW = maxX - minX + pad * 2;
-    const treeH = maxY - minY + pad * 2;
-    const { clientWidth: vw, clientHeight: vh } = containerRef.current;
+    // Tree + leaves drawn in world space via pan/zoom transform
+    const t = transform.current;
+    ctx.save();
+    ctx.translate(t.x, t.y);
+    ctx.scale(t.scale, t.scale);
+    drawTree(ctx, branches);
+    drawLeaves(ctx, placements, unusedTips, selectedNode?.id ?? null, hoveredNode, treeConfig.baseX);
+    ctx.restore();
 
-    const s = Math.min(1.5, Math.max(0.25, Math.min(vw / treeW, vh / treeH)));
-    const cx = (minX + maxX) / 2;
-    const cy = (minY + maxY) / 2;
+  }, [branches, placements, unusedTips, selectedNode, hoveredNode, size, treeConfig, renderTick]);
 
-    setScale(s);
-    setPan({ x: vw / 2 - cx * s, y: vh / 2 - cy * s });
-  }
+  // ── Wheel zoom (native listener for preventDefault) ────────────────────────
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const t = transform.current;
+      const rect = canvas.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      const delta = e.deltaY > 0 ? 0.92 : 1.08;
+      const newScale = Math.max(0.2, Math.min(5, t.scale * delta));
+      // Zoom toward cursor
+      t.x = mx - (mx - t.x) * (newScale / t.scale);
+      t.y = my - (my - t.y) * (newScale / t.scale);
+      t.scale = newScale;
+      triggerRender();
+    };
+    canvas.addEventListener('wheel', onWheel, { passive: false });
+    return () => canvas.removeEventListener('wheel', onWheel);
+  }, [triggerRender]);
 
   // ── Data loading ──────────────────────────────────────────────────────────
 
@@ -702,12 +1399,10 @@ export default function YggdrasilTree({ projectId }: YggdrasilTreeProps) {
         position: null,
       });
 
-      // When quest completion changes, propagate progress up the tree and to the project
       if (updates.progress !== undefined) {
         await invoke('recalculate_tree_progress', { treeId });
         await invoke('recalculate_unlocks', { treeId });
         await invoke('update_project_progress', { projectId });
-        // Sync tree skills to universal skills (fire-and-forget)
         invoke('sync_skills_from_trees').then(() => invoke('recalculate_skill_levels')).catch(console.warn);
       }
 
@@ -746,39 +1441,79 @@ export default function YggdrasilTree({ projectId }: YggdrasilTreeProps) {
     }
   }
 
-  // ── Pan handlers ──────────────────────────────────────────────────────────
+  // ── Canvas interaction — inverse transform hit detection + pan ──────────────
 
-  function handleBgMouseDown(e: React.MouseEvent) {
-    if ((e.target as SVGElement).getAttribute('data-node')) return;
-    setIsPanning(true);
-    panRef.current = { active: true, startMouse: { x: e.clientX, y: e.clientY }, startPan: { ...pan } };
+  /** Convert screen (CSS) coords to world coords via inverse transform */
+  function screenToWorld(sx: number, sy: number) {
+    const t = transform.current;
+    return { x: (sx - t.x) / t.scale, y: (sy - t.y) / t.scale };
+  }
+
+  /** Find the closest leaf node to a world-space point */
+  function findNode(wx: number, wy: number): TreeNode | null {
+    const hitRadius = LEAF_SHAPE.size * 1.5;
+    let closest: TreeNode | null = null;
+    let closestDist = Infinity;
+    placements.forEach(p => {
+      const dist = Math.hypot(p.x - wx, p.y - wy);
+      if (dist < hitRadius && dist < closestDist) {
+        closest = p.node;
+        closestDist = dist;
+      }
+    });
+    return closest;
+  }
+
+  function handleCanvasClick(e: React.MouseEvent) {
+    // If we just finished a drag, don't treat it as a click
+    if (dragMoved.current) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const world = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
+    setSelectedNode(findNode(world.x, world.y)); // null deselects
+  }
+
+  function handleMouseDown(e: React.MouseEvent) {
+    isDragging.current = true;
+    dragMoved.current = false;
+    lastMouse.current = { x: e.clientX, y: e.clientY };
   }
 
   function handleMouseMove(e: React.MouseEvent) {
-    if (!panRef.current.active) return;
-    setPan({
-      x: panRef.current.startPan.x + (e.clientX - panRef.current.startMouse.x),
-      y: panRef.current.startPan.y + (e.clientY - panRef.current.startMouse.y),
-    });
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    if (isDragging.current) {
+      const dx = e.clientX - lastMouse.current.x;
+      const dy = e.clientY - lastMouse.current.y;
+      if (Math.abs(dx) > 2 || Math.abs(dy) > 2) dragMoved.current = true;
+      transform.current.x += dx;
+      transform.current.y += dy;
+      lastMouse.current = { x: e.clientX, y: e.clientY };
+      triggerRender();
+      return;
+    }
+
+    // Hover detection
+    const rect = canvas.getBoundingClientRect();
+    const world = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
+    const node = findNode(world.x, world.y);
+    const newHovered = node?.id ?? null;
+    if (newHovered !== hoveredNode) {
+      setHoveredNode(newHovered);
+    }
   }
 
-  function stopPan() {
-    panRef.current.active = false;
-    setIsPanning(false);
-  }
-
-  // ── Node click ────────────────────────────────────────────────────────────
-
-  function handleNodeClick(e: React.MouseEvent, node: TreeNode) {
-    e.stopPropagation();
-    setSelectedNode(node);
+  function handleMouseUp() {
+    isDragging.current = false;
   }
 
   // ── Render ────────────────────────────────────────────────────────────────
 
   if (nodes.length === 0) {
     return (
-      <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#64748b', fontSize: 13, background: '#020817' }}>
+      <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#64748b', fontSize: 13, background: '#010208' }}>
         Loading tree…
       </div>
     );
@@ -787,134 +1522,19 @@ export default function YggdrasilTree({ projectId }: YggdrasilTreeProps) {
   const nodeById = new Map(nodes.map(n => [n.id, n]));
 
   return (
-    // position: absolute + inset: 0 guarantees we fill the parent exactly,
-    // regardless of the parent's overflow or height chain.
-    <div ref={containerRef} style={{ position: 'absolute', inset: 0, background: '#020817', overflow: 'hidden' }}>
-      <svg
-        ref={svgRef}
-        width="100%"
-        height="100%"
-        style={{ display: 'block', cursor: isPanning ? 'grabbing' : 'grab' }}
-        onMouseDown={handleBgMouseDown}
+    <div ref={containerRef} style={{ position: 'absolute', inset: 0, overflow: 'hidden', background: '#010208' }}>
+      <canvas
+        ref={canvasRef}
+        style={{
+          display: 'block', width: size.w + 'px', height: size.h + 'px',
+          cursor: isDragging.current ? 'grabbing' : hoveredNode ? 'pointer' : 'grab',
+        }}
+        onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
-        onMouseUp={stopPan}
-        onMouseLeave={stopPan}
-      >
-        {/* Transparent hit-area rect — pointer-events: all ensures it captures
-            mouse events even with no fill */}
-        <rect width="100%" height="100%" fill="none" style={{ pointerEvents: 'all' }} />
-
-        <g transform={`translate(${pan.x},${pan.y}) scale(${scale})`}>
-
-          {/* Thick trunk base lines for multi-root trees (AI-generated phases) */}
-          {(() => {
-            const roots = nodes.filter(n => n.parent_id === null);
-            if (roots.length <= 1) return null;
-            return roots.map(root => {
-              const pos = positions.get(root.id);
-              if (!pos) return null;
-              return (
-                <path
-                  key={`trunk-base-${root.id}`}
-                  d={branchPath(500, 800, pos.x, pos.y)}
-                  fill="none"
-                  stroke="#1d4027"
-                  strokeWidth={7}
-                  strokeLinecap="round"
-                />
-              );
-            });
-          })()}
-
-          {/* Branch paths (parent → child) */}
-          {edges.map(edge => {
-            const src = positions.get(edge.source_node_id);
-            const tgt = positions.get(edge.target_node_id);
-            const parentNode = nodeById.get(edge.source_node_id);
-            if (!src || !tgt || !parentNode) return null;
-            return (
-              <path
-                key={edge.id}
-                d={branchPath(src.x, src.y, tgt.x, tgt.y)}
-                fill="none"
-                stroke="#1d4027"
-                strokeWidth={branchStroke(parentNode.type)}
-                strokeLinecap="round"
-              />
-            );
-          })}
-
-          {/* Node circles */}
-          {nodes.map(node => {
-            const pos = positions.get(node.id);
-            if (!pos) return null;
-            const r = nodeRadius(node.type);
-            const isSelected = selectedNode?.id === node.id;
-            const parentNode = node.parent_id ? nodeById.get(node.parent_id) : undefined;
-            const effectiveLocked = node.is_locked || (parentNode?.is_locked ?? false);
-            return (
-              <circle
-                key={node.id}
-                cx={pos.x}
-                cy={pos.y}
-                r={r}
-                fill={effectiveLocked ? '#0f172a' : nodeColor(node)}
-                stroke={isSelected ? '#f0fdf4' : effectiveLocked ? '#334155' : '#0f172a'}
-                strokeWidth={isSelected ? 3 : 2}
-                strokeDasharray={effectiveLocked && !isSelected ? '4 3' : undefined}
-                opacity={effectiveLocked ? 0.55 : 1}
-                style={{ cursor: 'pointer', transition: 'fill 0.25s' }}
-                data-node="true"
-                onClick={e => handleNodeClick(e, node)}
-              />
-            );
-          })}
-
-          {/* Labels */}
-          {nodes.map(node => {
-            const pos = positions.get(node.id);
-            if (!pos) return null;
-            const r = nodeRadius(node.type);
-            const fontSize = node.type === 'leaf' ? 10 : 12;
-            const parentNode = node.parent_id ? nodeById.get(node.parent_id) : undefined;
-            const effectiveLocked = node.is_locked || (parentNode?.is_locked ?? false);
-            return (
-              <text
-                key={`lbl-${node.id}`}
-                x={pos.x}
-                y={pos.y + r + fontSize + 2}
-                textAnchor="middle"
-                fontSize={fontSize}
-                fill={effectiveLocked ? '#334155' : node.type === 'leaf' ? '#9ca3af' : '#d1d5db'}
-                style={{ pointerEvents: 'none', userSelect: 'none' }}
-              >
-                {truncate(node.title, 16)}
-              </text>
-            );
-          })}
-        </g>
-      </svg>
-
-      {/* Zoom / fit controls */}
-      <div style={{ position: 'absolute', bottom: 16, left: 16, display: 'flex', flexDirection: 'column', gap: 4, zIndex: 10 }}>
-        {[
-          { label: '+', action: () => setScale(s => Math.min(3, s + 0.15)) },
-          { label: '−', action: () => setScale(s => Math.max(0.25, s - 0.15)) },
-          { label: '⊡', action: fitView },
-        ].map(({ label, action }) => (
-          <button
-            key={label}
-            onClick={action}
-            style={{
-              width: 30, height: 30, background: '#1e293b', border: '1px solid #334155',
-              borderRadius: 6, color: '#94a3b8', fontSize: label === '⊡' ? 14 : 18,
-              cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
-            }}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
+        onMouseUp={handleMouseUp}
+        onClick={handleCanvasClick}
+        onMouseLeave={() => { isDragging.current = false; dragMoved.current = false; setHoveredNode(null); }}
+      />
 
       {/* Study / edit panel */}
       {selectedNode && (

@@ -44,7 +44,7 @@ matchRouter.post('/:nodeId', async (req: Request, res: Response) => {
          JOIN mimir_chunks mc ON mc.id = me.chunk_id
          GROUP BY mc.resource_id
          ORDER BY distance ASC
-         LIMIT 5`,
+         LIMIT 3`,
         [vectorStr],
       );
       similar = result.rows;
@@ -57,8 +57,8 @@ matchRouter.post('/:nodeId', async (req: Request, res: Response) => {
       throw err;
     }
 
-    // Only keep reasonably similar results (cosine distance < 0.8)
-    const matches = similar.filter((r) => r.distance < 0.8);
+    // Only keep genuinely similar results (cosine distance < 0.45)
+    const matches = similar.filter((r) => r.distance < 0.55);
 
     // 4. Upsert into mimir_node_links
     for (const match of matches) {

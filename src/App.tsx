@@ -1,5 +1,6 @@
 // src/App.tsx
 import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { MimirProvider } from "./contexts/MimirContext";
 import MainLayout from "./layouts/MainLayout";
 import HomePage from "./pages/Homepage";
 import TreesPage from "./pages/TreesPage";
@@ -15,6 +16,7 @@ import ProjectTreePage from "./pages/ProjectTreePage";
 export default function App() {
   return (
     <BrowserRouter>
+      <MimirProvider>
       <MainLayout>
         <Routes>
           <Route path="/" element={<HomePage />} />
@@ -29,6 +31,7 @@ export default function App() {
           <Route path="/project/:projectId" element={<ProjectTreePage />} />
         </Routes>
       </MainLayout>
+      </MimirProvider>
     </BrowserRouter>
   );
 }

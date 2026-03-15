@@ -45,7 +45,7 @@ export default function MainLayout({ children }: MainLayoutProps) {
       </aside>
 
       {/* Main content */}
-      <main className="flex-1 overflow-auto bg-slate-950">
+      <main className="flex-1 overflow-auto bg-slate-950" style={{ minHeight: 0 }}>
         {children}
       </main>
 

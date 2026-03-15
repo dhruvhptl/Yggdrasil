@@ -9,14 +9,17 @@ use crate::database::Database;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SkillTree {
+    #[serde(default)]
     pub project_id: String,
     pub phases: Vec<Phase>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Phase {
+    #[serde(default)]
     pub id: String,
     pub name: String,
+    #[serde(default)]
     pub description: String,
     #[serde(default)]
     pub order: i32,
@@ -25,29 +28,37 @@ pub struct Phase {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Skill {
+    #[serde(default)]
     pub id: String,
     pub name: String,
+    #[serde(default)]
     pub description: String,
     #[serde(default)]
     pub order: i32,
-    pub quests: Vec<Quest>,
+    /// Accept both "checkpoints" and legacy "quests" from LLM output
+    #[serde(alias = "quests", default)]
+    pub checkpoints: Vec<Checkpoint>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Quest {
+pub struct Checkpoint {
+    #[serde(default)]
     pub id: String,
     pub title: String,
-    pub description: String,
-    #[serde(default = "default_estimated_hours")]
-    pub estimated_hours: f32,
-    #[serde(default = "default_difficulty")]
-    pub difficulty: String,
+    #[serde(default)]
+    pub mastery_criteria: String,
+    #[serde(default)]
+    pub exercises: Vec<String>,
     #[serde(default)]
     pub order: i32,
+    /// Legacy fields — tolerated during deserialization but not used
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub estimated_hours: Option<f32>,
+    #[serde(default)]
+    pub difficulty: Option<String>,
 }
-
-fn default_estimated_hours() -> f32 { 2.0 }
-fn default_difficulty() -> String { "medium".to_string() }
 
 #[derive(Debug, Deserialize)]
 struct GroqResponse {
@@ -77,12 +88,16 @@ struct Concept {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct ConceptGraph {
     concepts: Vec<Concept>,
+    #[serde(default)]
+    relevant_files: Vec<String>,
 }
 
 // ─── Concept graph extraction ────────────────────────────────────────────────
 
 fn build_concept_graph_system_prompt() -> &'static str {
     r#"You are a knowledge graph architect. Extract the key concepts from this codebase/project and their prerequisite relationships.
+
+If the user prompt includes a FILE PATHS section, also select up to 10 file paths that are most relevant to the extracted concepts. These files will be fetched for deeper analysis. Pick files that contain the core logic, not tests or configs.
 
 Output ONLY valid JSON:
 {
@@ -93,7 +108,8 @@ Output ONLY valid JSON:
       "description": "One sentence — what this concept is and how it appears in this project",
       "prerequisites": ["id_of_prerequisite"]
     }
-  ]
+  ],
+  "relevant_files": ["src/main.rs", "src/lib.rs"]
 }
 
 Rules:
@@ -103,6 +119,8 @@ Rules:
 - No circular dependencies
 - Foundational concepts have empty prerequisites array
 - Every concept must be demonstrably present in the codebase
+- relevant_files: up to 10 paths from the provided file list, most relevant to the concepts
+- If no file paths are provided, omit relevant_files or return an empty array
 Respond with ONLY the JSON."#
 }
 
@@ -112,14 +130,23 @@ async fn extract_concept_graph(api_key: &str, context: &str) -> Result<ConceptGr
         context
     );
 
-    let graph_json = call_openrouter(
+    let concept_model = std::env::var("CONCEPT_GRAPH_MODEL")
+        .unwrap_or_else(|_| "llama-3.3-70b-versatile".to_string());
+    println!("🧠 Concept graph model: {}", concept_model);
+
+    let graph_json = call_llm(
+        "https://api.groq.com/openai/v1/chat/completions",
         api_key,
+        &concept_model,
         build_concept_graph_system_prompt(),
         &user_prompt,
     )
     .await?;
 
-    let graph: ConceptGraph = serde_json::from_str(&graph_json)
+    // Parse via Value first to tolerate LLM quirks like duplicate keys
+    let value: serde_json::Value = serde_json::from_str(&graph_json)
+        .map_err(|e| format!("Concept graph JSON is not valid JSON: {}", e))?;
+    let graph: ConceptGraph = serde_json::from_value(value)
         .map_err(|e| format!("Concept graph JSON doesn't match schema: {}", e))?;
 
     if graph.concepts.is_empty() {
@@ -308,33 +335,31 @@ async fn save_tree_to_database(
             order_counter += 1;
             println!("    🌿 Skill: {}", skill.name);
 
-            for quest in &skill.quests {
-                let quest_node_id = Uuid::new_v4().to_string();
-                let quest_tasks = serde_json::json!([{
-                    "id": quest.id,
-                    "title": quest.title,
-                    "description": quest.description,
-                    "estimated_hours": quest.estimated_hours,
-                    "difficulty": quest.difficulty,
+            for checkpoint in &skill.checkpoints {
+                let cp_node_id = Uuid::new_v4().to_string();
+                let cp_tasks = serde_json::json!({
+                    "mastery_criteria": checkpoint.mastery_criteria,
+                    "exercises": checkpoint.exercises,
+                    "notes": "",
                     "completed": false
-                }]);
+                });
 
                 sqlx::query(
                     "INSERT INTO tree_nodes (id, tree_id, parent_id, type, title, description, progress, tasks, resources, x, y, order_index) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"
                 )
-                .bind(&quest_node_id).bind(&tree_id).bind(&skill_node_id).bind("leaf")
-                .bind(&quest.title).bind(&quest.description).bind(0i32)
-                .bind(&quest_tasks).bind(None::<serde_json::Value>)
+                .bind(&cp_node_id).bind(&tree_id).bind(&skill_node_id).bind("leaf")
+                .bind(&checkpoint.title).bind(&checkpoint.mastery_criteria).bind(0i32)
+                .bind(&cp_tasks).bind(None::<serde_json::Value>)
                 .bind(None::<f64>).bind(None::<f64>).bind(order_counter)
                 .execute(&database.pool)
                 .await
-                .map_err(|e| format!("Failed to create quest node: {}", e))?;
+                .map_err(|e| format!("Failed to create checkpoint node: {}", e))?;
 
-                leaf_node_ids.push(quest_node_id.clone());
-                node_ids.push((quest_node_id.clone(), Some(skill_node_id.clone())));
+                leaf_node_ids.push(cp_node_id.clone());
+                node_ids.push((cp_node_id.clone(), Some(skill_node_id.clone())));
                 order_counter += 1;
-                println!("      🍃 Quest: {} ({:.1}h, {})", quest.title, quest.estimated_hours, quest.difficulty);
+                println!("      🍃 Checkpoint: {}", checkpoint.title);
             }
         }
     }
@@ -425,6 +450,15 @@ Given a PRD (Product Requirements Document), generate a learning skill tree — 
 
 You generate LEARNING trees, not implementation plans. The user already built or is building the project. They need to understand the concepts behind it at a deep level.
 
+## The Checkpoint Model
+
+Every leaf node is a **concept checkpoint** — a specific concept the learner must genuinely understand. Checkpoints are not tasks. They are concepts you reach, not chores you complete.
+
+Each checkpoint has:
+- **title**: A noun phrase naming the concept (e.g. "Velocity-Verlet Symplectic Integration")
+- **mastery_criteria**: What understanding this concept looks like — how you know you've reached it
+- **exercises**: 2-4 specific things to work through to confirm understanding
+
 ## Output Format
 
 Generate valid JSON matching this exact schema:
@@ -443,13 +477,16 @@ Generate valid JSON matching this exact schema:
           "name": "Skill name",
           "description": "What you'll learn and why it matters for this project",
           "order": 1,
-          "quests": [
+          "checkpoints": [
             {
-              "id": "quest_1_1_1",
-              "title": "Specific concept-focused quest title",
-              "description": "What to study and what understanding to gain",
-              "estimated_hours": 2.5,
-              "difficulty": "easy",
+              "id": "checkpoint_1_1_1",
+              "title": "Concept name as a noun phrase",
+              "mastery_criteria": "You understand this when you can explain...",
+              "exercises": [
+                "Work through X to see how...",
+                "Implement a minimal version of...",
+                "Compare X and Y to understand why..."
+              ],
               "order": 1
             }
           ]
@@ -459,90 +496,132 @@ Generate valid JSON matching this exact schema:
   ]
 }
 
-## Quest Quality Rules — ENFORCE STRICTLY
+## Checkpoint Title Rules — ENFORCE STRICTLY
 
-### BANNED quest title patterns (NEVER generate these):
-- ANY title starting with "Learn" — e.g. "Learn Python Basics", "Learn about X", "Learn X and Y"
-- "Explore X", "Introduction to X", "Overview of X"
-- "Watch X on YouTube", "Read X on Stack Overflow", "Study X on GitHub"
-- "Understanding X" as a complete title
-- "Understand the basics of X" — replace with the specific concept
-- Any title that names a website or platform instead of a concept
-- Titles that name two libraries without a specific concept
+### Titles must be CONCEPT NOUN PHRASES, not imperatives:
+- GOOD: "PostgreSQL MVCC Concurrency Model"
+- GOOD: "React Fiber Reconciliation Algorithm"
+- GOOD: "Velocity-Verlet Symplectic Integration"
+- GOOD: "pgvector HNSW Approximate Nearest Neighbor Search"
 
-### REQUIRED quest format:
-- Every quest title must describe a SPECIFIC concept, mechanism, or algorithm to understand
-- Every quest must answer: what will the learner understand or be able to do after completing it?
-- Reference the actual technology, algorithm, or pattern by name
-- Quests within a skill must form a PROGRESSION (each builds on the previous)
-- The title should be a complete thought: what to study AND what insight is gained
+### BANNED title patterns (NEVER generate these):
+- Imperative verbs: "Learn X", "Study X", "Understand X", "Explore X", "Read X", "Watch X"
+- "Introduction to X", "Overview of X", "Basics of X"
+- Platform names: "Watch X on YouTube", "Read X on Stack Overflow"
+- Two libraries without a concept: "NumPy and Matplotlib"
+- Generic filler: "Best Practices", "Code Quality", "Testing and Debugging"
 
-### Good quest title examples:
-- "Understand how Python classes use __init__ and self to encapsulate state"
-- "Study how NumPy's vectorized operations eliminate Python for-loops for performance"
-- "Work through the velocity-Verlet integration algorithm and why it conserves energy better than Euler"
-- "Understand Matplotlib's Figure/Axes architecture and the difference between pyplot and OOP interface"
-- "Study how React's reconciliation algorithm diffs virtual DOM trees to minimize repaints"
-- "Understand how PostgreSQL's query planner chooses between sequential and index scans"
+### Mastery criteria rules:
+- Describe what genuine understanding looks like in concrete terms
+- Use phrases like "You can explain why...", "You can predict what happens when...", "You can implement... from scratch"
+- Never use "You have learned..." or "You have read..."
 
-### Bad quest title examples (NEVER generate):
-- "Learn Python Basics" — starts with Learn, too vague
-- "Learn about NumPy arrays" — starts with Learn
-- "Explore NumPy and Matplotlib" — names two libraries with no concept
-- "Watch Python tutorials on YouTube" — names a platform, not a concept
-- "Introduction to Quantum Mechanics" — generic, no specific mechanism
-- "Understand the basics of X" — too vague, name the specific concept
+### Exercise rules:
+- 2-4 exercises per checkpoint
+- Must be specific, actionable activities
+- Good: "Implement a minimal Velocity-Verlet integrator and compare energy drift vs Euler over 1000 steps"
+- Good: "Write a SQL query that demonstrates MVCC behavior using two concurrent transactions"
+- Bad: "Read the documentation" — too vague
+- Bad: "Practice using X" — not specific
 
-## Quest Count: Exactly 3 per skill
+## Checkpoint Count: Exactly 3 per skill
 
-The three quests within each skill must form a progression. Write the titles as specific, complete statements of what the learner will understand.
+The three checkpoints within each skill must form a progression from foundational to advanced:
 
-**Quest 1 — A specific property (difficulty: "easy")**
-State one interesting, named property of this concept. The phrase "basics of" is ABSOLUTELY FORBIDDEN.
-- "Understand the basics of React" → BANNED. Replace with: "Understand how React's virtual DOM lets the reconciliation algorithm batch DOM writes into a single paint cycle"
-- "Understand the basics of PostgreSQL" → BANNED. Replace with: "Understand how PostgreSQL's MVCC model allows readers and writers to proceed concurrently without locking"
-- "Understand the basics of NumPy" → BANNED. Replace with: "Understand how NumPy arrays store data in contiguous memory blocks and why this enables vectorized operations"
+**Checkpoint 1 — Core property of this concept**
+Name a specific, interesting property. "Basics of X" is ABSOLUTELY FORBIDDEN.
 
-**Quest 2 — Internal mechanism (difficulty: "medium")**
-Describe the algorithm, data structure, or internal mechanism by name.
-CORRECT: "Study how React's reconciliation algorithm uses the fiber tree to diff component output and batch DOM updates"
-CORRECT: "Work through the velocity-Verlet integration algorithm and why it conserves energy better than Euler"
+**Checkpoint 2 — Internal mechanism**
+Name the algorithm, data structure, or mechanism that makes this work.
 
-**Quest 3 — This specific project (difficulty: "medium" or "hard")**
-Connect to a specific feature, design choice, or constraint from the PRD. "Apply X to a real-world problem" is BANNED.
-CORRECT: "Understand why Yggdrasil's skill tree uses pgvector cosine distance rather than exact search for semantic matching"
-WRONG: "Apply React to a real-world problem" — BANNED, generic
-WRONG: "Use X to solve a real-world problem" — BANNED, names nothing specific
+**Checkpoint 3 — Application in this project**
+Connect to a specific feature, design choice, or constraint from the PRD.
 
 ## Structure
 
-- 3-5 phases (Foundation → Core → Advanced)
+- 3-5 phases
 - 2-4 skills per phase
-- Exactly 3 quests per skill
+- Exactly 3 checkpoints per skill
 - Every phase must map to real concepts in the PRD — no filler phases
-- Never add generic "Best Practices", "Code Quality", or "Testing and Debugging" skills unless the PRD specifically requires them
 
 ## Phase Design
 
-- **Foundation**: Truly foundational concepts needed before anything else
-- **Core**: The main technical skills the project actually uses
-- **Advanced**: Deeper understanding of the hardest or most interesting parts
+**Phase 1 — Technology Foundations (MANDATORY, always first)**
 
-## Concept Dependency Graph
+This phase MUST exist in every tree. Its purpose is to teach the underlying technologies
+before any project-specific patterns. Every major library and framework from the dependency
+files (package.json, Cargo.toml, requirements.txt, etc.) gets covered here.
 
-You will receive a CONCEPT DEPENDENCY ORDER section in the user prompt. This is a topologically sorted list of concepts extracted from this project — foundational concepts first, advanced last.
+The developer vibe-coded this project — they used these technologies without understanding
+them. Phase 1 fixes that. It teaches what each technology IS and how it works internally,
+not how this specific project uses it.
 
-Use this graph to:
-- Determine phase ordering: earlier concepts belong in earlier phases
-- Determine skill sequencing within phases
-- Ensure no skill assumes knowledge of a concept listed after it
-- Generate quest progressions that follow the dependency order
+AI groups libraries into skills based on conceptual relatedness. Examples:
+- "Rust Ownership and Memory Model" — covers Rust's ownership, borrowing, lifetimes
+- "React Component Model and Hooks" — covers reconciliation, useState, useEffect
+- "PostgreSQL and SQLx" — covers relational model, connection pools, query execution
 
-The graph represents actual techniques and patterns present in this codebase. Every quest should connect back to a concept in this graph.
+Every library in the dependency files gets at least one checkpoint in Phase 1.
+Do not skip small libraries — even utility packages have concepts worth understanding.
 
-## Difficulty
+**Phases 2+ — Project Patterns**
 
-Must use exactly: "easy", "medium", or "hard"
+These phases cover how THIS project uses technologies. Skills are named after project
+concepts: "Yggdrasil's Tree Layout Algorithm", "Tauri IPC in this App", etc.
+
+**CHECKPOINT PATTERN — enforced in every skill across all phases:**
+
+Every skill must begin with at least one FOUNDATIONAL checkpoint before any
+PROJECT-SPECIFIC checkpoints.
+
+FOUNDATIONAL checkpoint = explains what the technology/concept IS, how it works
+internally, at a conceptual level. Does NOT reference any file, function, or
+behavior from this specific codebase.
+
+PROJECT-SPECIFIC checkpoint = names a real file, function, struct, or behavior
+from this codebase. The mastery_criteria references actual code.
+
+EXAMPLE — skill: "SQLx and the Database Layer"
+  ✅ FOUNDATIONAL: "How SQLx compile-time query checking works"
+     mastery_criteria: "You can explain how sqlx::query! macro sends SQL to a
+     real database at compile time to verify correctness, and why this catches
+     errors before runtime."
+  ✅ PROJECT-SPECIFIC: "Database::new() and connection pool setup in this app"
+     mastery_criteria: "You can trace how Database::new() in commands.rs reads
+     DATABASE_URL, creates a PgPoolOptions pool, and makes it available via
+     Tauri managed state."
+
+EXAMPLE — skill: "React Router in Tauri"
+  ✅ FOUNDATIONAL: "How React Router's BrowserRouter manages navigation state"
+     mastery_criteria: "You can explain how BrowserRouter uses the HTML5 History
+     API to track routes without a server, and why Tauri apps can use it without
+     a real URL."
+  ✅ PROJECT-SPECIFIC: "Route structure in App.tsx"
+     mastery_criteria: "You can trace all routes defined in App.tsx, identify
+     which use the MainLayout wrapper, and explain what renders at each path."
+
+WRONG — project-specific from checkpoint 1:
+  ❌ "Type-Safe API Contract Design" — this is a pattern, not a foundation
+  ❌ "Serde JSON Serialization Patterns" — assumes you know what Serde is
+  ❌ "Tauri IPC Command Registration" — assumes you know what Tauri is
+
+The number of foundational checkpoints per skill depends on complexity:
+- Simple/familiar tech (e.g. a utility library): 1 foundation → 1-2 project
+- Complex tech (e.g. Rust, Tauri, pgvector): 2-3 foundations → 1-2 project
+
+**Ordering rules — enforce strictly:**
+1. Phase 1 foundations always before any project-specific phases
+2. State and data flow before features that consume them
+3. IPC and communication layer before either side that uses it
+4. Core data structures before algorithms that operate on them
+5. Follow the CONCEPT DEPENDENCY ORDER graph — if concept A precedes B in the
+   graph, the skill covering A must be in an equal or earlier phase than B
+
+**Adapting to learner level (if LEARNER'S EXISTING SKILLS is provided):**
+- Level 2+ (Familiar): skip foundational checkpoints for that technology entirely
+- Level 1 (Aware): one brief refresher checkpoint, then project-specific
+- Not listed: full foundational coverage as normal
+Phase 1 may be shortened or skipped if the learner already knows all the tech.
 
 ## Response Format
 
@@ -560,23 +639,20 @@ Given rich information about a GitHub repository — README, dependency files, a
 Focus ENTIRELY on learning — what concepts does this codebase exemplify? What should the developer study to deeply understand what they built?
 
 Use the repository data as evidence:
-- **Dependency files** (requirements.txt, Cargo.toml, package.json, etc.): Every listed library is a skill candidate. What does it actually do? How does it work?
-- **Source files**: See exactly which patterns, algorithms, and APIs are used in practice — generate quests for these specific mechanisms, not just the library names
-- **README + Description**: Understand the project's purpose to make quests relevant to this specific context
-- **Commit history**: Understand where the developer spent effort — these areas need the deepest quests
-- **Open issues**: Known pain points and areas of complexity worth studying
-- **Merged PRs**: What problems were actively solved — these mechanics are worth a quest
+- **Dependency files**: Every listed library is a skill candidate
+- **Source files**: See exactly which patterns, algorithms, and APIs are used
+- **README + Description**: Understand the project's purpose
+- **Commit history**: Where the developer spent effort — these need the deepest checkpoints
+- **Open issues / Merged PRs**: Known pain points and solved problems worth studying
 
-## How to Generate Skills from Source Code
+## The Checkpoint Model
 
-Look at the actual code:
-- If the repo uses OOP heavily → add a skill on that OOP pattern
-- If it uses specific numerical methods → name the method explicitly in a quest
-- If it imports a visualization library and uses 3D plotting → generate quests for 3D projection mechanics
-- If it uses JIT compilation → generate quests for how JIT works
-- If it implements a specific algorithm explicitly → name the algorithm in the quest
+Every leaf node is a **concept checkpoint** — a specific concept the learner must genuinely understand. Checkpoints are not tasks. They are concepts you reach, not chores you complete.
 
-Do NOT add generic skill names. Every skill must name a specific technology, library, or concept from this actual codebase.
+Each checkpoint has:
+- **title**: A noun phrase naming the concept (e.g. "Velocity-Verlet Symplectic Integration")
+- **mastery_criteria**: What understanding this concept looks like — how you know you've reached it
+- **exercises**: 2-4 specific things to work through to confirm understanding
 
 ## Output Format
 
@@ -596,13 +672,16 @@ Generate valid JSON:
           "name": "Skill name — specific to this repo",
           "description": "What you'll learn and why it matters for understanding this codebase",
           "order": 1,
-          "quests": [
+          "checkpoints": [
             {
-              "id": "quest_1_1_1",
-              "title": "Specific concept-focused quest title",
-              "description": "What to study and what understanding to gain",
-              "estimated_hours": 2.5,
-              "difficulty": "easy",
+              "id": "checkpoint_1_1_1",
+              "title": "Concept name as a noun phrase",
+              "mastery_criteria": "You understand this when you can explain...",
+              "exercises": [
+                "Work through X to see how...",
+                "Implement a minimal version of...",
+                "Compare X and Y to understand why..."
+              ],
               "order": 1
             }
           ]
@@ -612,99 +691,138 @@ Generate valid JSON:
   ]
 }
 
-## Quest Quality Rules — ENFORCE STRICTLY
+## Checkpoint Title Rules — ENFORCE STRICTLY
 
-### BANNED quest title patterns (NEVER generate these):
-- ANY title starting with "Learn" — e.g. "Learn Python Basics", "Learn about NumPy", "Learn X and Y"
-- "Explore X", "Introduction to X", "Overview of X"
-- "Watch X on YouTube", "Read X on Stack Overflow", "Study X on GitHub"
-- "Understanding X" as a complete title (e.g. "Understanding NumPy")
-- "Understand the basics of X" — too vague, replace with the specific concept
-- "X and its applications" — too generic
-- Any title that names a website or platform instead of a concept
-- Titles that name two libraries without naming a specific concept: "Explore NumPy and Matplotlib"
+### Titles must be CONCEPT NOUN PHRASES derived from the actual codebase:
+- GOOD: "NumPy Contiguous Memory Layout and Vectorized Operations"
+- GOOD: "Numba JIT Compilation Pipeline"
+- GOOD: "Velocity-Verlet Symplectic Integration"
+- GOOD: "Julia Multiple Dispatch Method Resolution"
 
-### REQUIRED quest format:
-- Every quest title must describe a SPECIFIC concept, mechanism, or algorithm to understand
-- Every quest must answer: what will the learner understand or be able to do after completing it?
-- Reference the actual technology, algorithm, or data structure by name — use the exact names from the source code
-- Quests within a skill must form a PROGRESSION (each builds on the previous)
-- The title should be a complete thought: what to study AND what insight is gained
+### BANNED title patterns (NEVER generate these):
+- Imperative verbs: "Learn X", "Study X", "Understand X", "Explore X", "Read X", "Watch X"
+- "Introduction to X", "Overview of X", "Basics of X"
+- Platform names: "Watch X on YouTube", "Read X on Stack Overflow"
+- Two libraries without a concept: "NumPy and Matplotlib"
+- Generic filler: "Best Practices", "Code Quality", "Testing and Debugging" (unless repo has test files)
 
-### Good quest title examples:
-- "Understand how Python classes use __init__ and self to encapsulate state"
-- "Study how NumPy's vectorized operations eliminate Python for-loops for performance"
-- "Work through the velocity-Verlet integration algorithm and why it conserves energy better than Euler"
-- "Understand Matplotlib's Figure/Axes architecture and the difference between pyplot and OOP interface"
-- "Study how Numba's @jit decorator compiles Python to machine code at runtime"
-- "Understand 3D plotting with Matplotlib's Axes3D — projections, viewing angles, and camera transforms"
-- "Study how pgvector's HNSW index approximates nearest-neighbor search without scanning all vectors"
-- "Work through how Julia's multiple dispatch selects method implementations at compile time"
+### How to derive checkpoints from source code:
+- If the repo uses OOP heavily → checkpoint on that specific OOP pattern
+- If it uses numerical methods → name the method explicitly
+- If it imports a visualization library and uses 3D plotting → checkpoint for 3D projection mechanics
+- If it uses JIT compilation → checkpoint for how JIT works
+- If it implements an algorithm → name the algorithm
 
-### Bad quest title examples (NEVER generate):
-- "Learn Python Basics" — starts with Learn, too vague
-- "Learn about NumPy's array data structure" — starts with Learn
-- "Learn about the Velocity-Verlet integrator" — starts with Learn
-- "Explore NumPy and Matplotlib" — names two libraries with no concept
-- "Watch Python tutorials on YouTube" — names a platform, not a concept
-- "Introduction to Quantum Mechanics" — generic, no specific mechanism
-- "Understand the basics of N-body simulation" — "basics of" is too vague
-- "Best Practices for Code Quality" — generic filler skill
-- "Testing and Debugging" — generic unless the repo has actual test files
+### Mastery criteria rules:
+- Describe what genuine understanding looks like in concrete terms
+- Reference specific classes, functions, or files from THIS codebase
+- Good: "You can explain why the Body class in common.py stores position as a NumPy array instead of three separate floats"
+- Bad: "You have learned about NumPy" — too vague
 
-## Quest Count: Exactly 3 per skill
+### Exercise rules:
+- 2-4 exercises per checkpoint
+- Must be specific, actionable activities referencing this project's code
+- Good: "Modify the Body class to use a different integrator and compare energy conservation"
+- Bad: "Read the documentation" — too vague
 
-The three quests within each skill must form a progression. Write the titles as specific, complete statements of what the learner will understand.
+## Checkpoint Count: Exactly 3 per skill
 
-**Quest 1 — A specific property (difficulty: "easy")**
-State one interesting, named property of this concept. Template: "Understand how [SPECIFIC THING] works" or "Study why [SPECIFIC THING] matters".
-The phrase "basics of" is ABSOLUTELY FORBIDDEN in Quest 1. Replace it with the actual property.
-- "Understand the basics of Velocity-Verlet" → BANNED. Replace with: "Understand why Velocity-Verlet conserves time-reversal symmetry while Euler integration does not"
-- "Understand the basics of Julia" → BANNED. Replace with: "Understand how Julia's type inference lets the JIT compiler generate C-speed machine code without explicit type annotations"
-- "Understand the basics of Makie.jl" → BANNED. Replace with: "Understand how Makie.jl's Observable system allows animated plots to update reactively when data changes"
-- "Understand the basics of NumPy" → BANNED. Replace with: "Understand how NumPy arrays store data in contiguous memory blocks and why this enables vectorized operations"
+The three checkpoints within each skill must form a progression:
 
-**Quest 2 — Internal mechanism (difficulty: "medium")**
-Describe the algorithm, data structure, or internal mechanism by name.
-CORRECT: "Work through the velocity-Verlet integration algorithm and why it conserves energy better than Euler"
-CORRECT: "Study how Numba's @jit decorator compiles Python to machine code at runtime"
+**Checkpoint 1 — Core property**
+Name a specific, interesting property. "Basics of X" is ABSOLUTELY FORBIDDEN.
 
-**Quest 3 — This specific project (difficulty: "medium" or "hard")**
-Name a specific class, function, file, or behavior from THIS codebase. "Apply X to a real-world problem" and "Study how the project uses X" are BANNED — too generic.
-CORRECT: "Study how the Body class in common.py uses NumPy arrays to represent position and velocity vectors for each planet"
-CORRECT: "Understand why the benchmark in benchmark_python.py measures Numba's first-call JIT cost separately from subsequent calls"
-WRONG: "Apply NumPy to a real-world problem" — BANNED, generic
-WRONG: "Study how the project uses Numba to improve performance" — BANNED, says nothing specific
+**Checkpoint 2 — Internal mechanism**
+Name the algorithm, data structure, or mechanism that makes this work.
+
+**Checkpoint 3 — Application in this codebase**
+Name a specific class, function, file, or behavior from THIS codebase.
 
 ## Structure
 
-- 3-5 phases (Foundation → Core → Advanced)
+- 3-5 phases
 - 2-4 skills per phase
-- Exactly 3 quests per skill
+- Exactly 3 checkpoints per skill
 - Every skill must be derived from actual evidence in the repository data
-- Never add "Best Practices", "Code Quality", or "Testing and Debugging" unless the repo has test files
 
 ## Phase Design
 
-- **Foundation**: Language fundamentals and core data structures the codebase depends on
-- **Core**: The main libraries, algorithms, and patterns the project actively uses
-- **Advanced**: The deepest or most complex concepts — the things that make this project actually hard
+**Phase 1 — Technology Foundations (MANDATORY, always first)**
 
-## Concept Dependency Graph
+This phase MUST exist in every tree. Its purpose is to teach the underlying technologies
+before any project-specific patterns. Every major library and framework from the dependency
+files (package.json, Cargo.toml, requirements.txt, etc.) gets covered here.
 
-You will receive a CONCEPT DEPENDENCY ORDER section in the user prompt. This is a topologically sorted list of concepts extracted from this project — foundational concepts first, advanced last.
+The developer vibe-coded this project — they used these technologies without understanding
+them. Phase 1 fixes that. It teaches what each technology IS and how it works internally,
+not how this specific project uses it.
 
-Use this graph to:
-- Determine phase ordering: earlier concepts belong in earlier phases
-- Determine skill sequencing within phases
-- Ensure no skill assumes knowledge of a concept listed after it
-- Generate quest progressions that follow the dependency order
+AI groups libraries into skills based on conceptual relatedness. Examples:
+- "Rust Ownership and Memory Model" — covers Rust's ownership, borrowing, lifetimes
+- "React Component Model and Hooks" — covers reconciliation, useState, useEffect
+- "PostgreSQL and SQLx" — covers relational model, connection pools, query execution
 
-The graph represents actual techniques and patterns present in this codebase. Every quest should connect back to a concept in this graph.
+Every library in the dependency files gets at least one checkpoint in Phase 1.
+Do not skip small libraries — even utility packages have concepts worth understanding.
 
-## Difficulty
+**Phases 2+ — Project Patterns**
 
-Must use exactly: "easy", "medium", or "hard"
+These phases cover how THIS project uses technologies. Skills are named after project
+concepts: "Yggdrasil's Tree Layout Algorithm", "Tauri IPC in this App", etc.
+
+**CHECKPOINT PATTERN — enforced in every skill across all phases:**
+
+Every skill must begin with at least one FOUNDATIONAL checkpoint before any
+PROJECT-SPECIFIC checkpoints.
+
+FOUNDATIONAL checkpoint = explains what the technology/concept IS, how it works
+internally, at a conceptual level. Does NOT reference any file, function, or
+behavior from this specific codebase.
+
+PROJECT-SPECIFIC checkpoint = names a real file, function, struct, or behavior
+from this codebase. The mastery_criteria references actual code.
+
+EXAMPLE — skill: "SQLx and the Database Layer"
+  ✅ FOUNDATIONAL: "How SQLx compile-time query checking works"
+     mastery_criteria: "You can explain how sqlx::query! macro sends SQL to a
+     real database at compile time to verify correctness, and why this catches
+     errors before runtime."
+  ✅ PROJECT-SPECIFIC: "Database::new() and connection pool setup in this app"
+     mastery_criteria: "You can trace how Database::new() in commands.rs reads
+     DATABASE_URL, creates a PgPoolOptions pool, and makes it available via
+     Tauri managed state."
+
+EXAMPLE — skill: "React Router in Tauri"
+  ✅ FOUNDATIONAL: "How React Router's BrowserRouter manages navigation state"
+     mastery_criteria: "You can explain how BrowserRouter uses the HTML5 History
+     API to track routes without a server, and why Tauri apps can use it without
+     a real URL."
+  ✅ PROJECT-SPECIFIC: "Route structure in App.tsx"
+     mastery_criteria: "You can trace all routes defined in App.tsx, identify
+     which use the MainLayout wrapper, and explain what renders at each path."
+
+WRONG — project-specific from checkpoint 1:
+  ❌ "Type-Safe API Contract Design" — this is a pattern, not a foundation
+  ❌ "Serde JSON Serialization Patterns" — assumes you know what Serde is
+  ❌ "Tauri IPC Command Registration" — assumes you know what Tauri is
+
+The number of foundational checkpoints per skill depends on complexity:
+- Simple/familiar tech (e.g. a utility library): 1 foundation → 1-2 project
+- Complex tech (e.g. Rust, Tauri, pgvector): 2-3 foundations → 1-2 project
+
+**Ordering rules — enforce strictly:**
+1. Phase 1 foundations always before any project-specific phases
+2. State and data flow before features that consume them
+3. IPC and communication layer before either side that uses it
+4. Core data structures before algorithms that operate on them
+5. Follow the CONCEPT DEPENDENCY ORDER graph — if concept A precedes B in the
+   graph, the skill covering A must be in an equal or earlier phase than B
+
+**Adapting to learner level (if LEARNER'S EXISTING SKILLS is provided):**
+- Level 2+ (Familiar): skip foundational checkpoints for that technology entirely
+- Level 1 (Aware): one brief refresher checkpoint, then project-specific
+- Not listed: full foundational coverage as normal
+Phase 1 may be shortened or skipped if the learner already knows all the tech.
 
 ## Response Format
 
@@ -759,55 +877,227 @@ async fn fetch_github_file(
         return None;
     }
     Some(if content.len() > max_chars {
-        format!("{}…", &content[..max_chars])
+        let mut boundary = max_chars;
+        while !content.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        format!("{}…", &content[..boundary])
     } else {
         content
     })
 }
 
-// ─── OpenRouter call helper (tree generation only) ───────────────────────────
+// ─── Tiered repo analysis helpers ─────────────────────────────────────────────
 
-async fn call_openrouter(
+/// Fetch the full file tree from a GitHub repo using the Trees API (single API call).
+/// Filters out noise directories, lock files, and files over 100KB.
+async fn fetch_repo_tree(gh: &reqwest::Client, base: &str) -> Result<Vec<String>, String> {
+    let url = format!("{}/git/trees/HEAD?recursive=1", base);
+    let resp = gh
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("GitHub Trees API error: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("GitHub Trees API returned {}", resp.status()));
+    }
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse tree response: {}", e))?;
+
+    let skip_prefixes = ["node_modules/", "target/", ".git/", "dist/", "build/", ".sqlx/", "__pycache__/", ".venv/"];
+
+    let mut paths: Vec<String> = body["tree"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| {
+                    if entry["type"].as_str()? != "blob" {
+                        return None;
+                    }
+                    let path = entry["path"].as_str()?;
+                    // Skip noise directories
+                    if skip_prefixes.iter().any(|p| path.starts_with(p) || path.contains(&format!("/{}", p))) {
+                        return None;
+                    }
+                    // Skip lock files
+                    if path.ends_with(".lock") || path.ends_with("-lock.json") || path.ends_with("-lock.yaml") {
+                        return None;
+                    }
+                    // Skip files over 100KB
+                    if let Some(size) = entry["size"].as_u64() {
+                        if size > 100_000 {
+                            return None;
+                        }
+                    }
+                    Some(path.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    paths.sort();
+    Ok(paths)
+}
+
+/// Fetch a list of files from GitHub, respecting per-file and total char budgets.
+async fn fetch_relevant_files(
+    gh: &reqwest::Client,
+    base: &str,
+    file_paths: &[String],
+    max_per_file: usize,
+    total_budget: usize,
+) -> Vec<(String, String)> {
+    let mut results = Vec::new();
+    let mut total_chars = 0usize;
+
+    for path in file_paths {
+        if total_chars >= total_budget {
+            break;
+        }
+        let url = format!("{}/contents/{}", base, path);
+        if let Some(content) = fetch_github_file(gh, &url, max_per_file).await {
+            total_chars += content.len();
+            results.push((path.clone(), content));
+            println!("  📄 Fetched: {} ({} chars)", path, results.last().unwrap().1.len());
+        }
+    }
+    results
+}
+
+/// Fallback file selection when Phase 1 doesn't return relevant_files.
+/// Balanced across project layers: backend, sidecar, components, pages.
+fn select_fallback_files(all_paths: &[String], max: usize) -> Vec<String> {
+    // Layers with their path prefixes and allowed extensions
+    let layers: &[(&str, &[&str])] = &[
+        ("src-tauri/src/", &[".rs"]),
+        ("sidecar/src/", &[".ts"]),
+        ("src/components/", &[".tsx", ".ts"]),
+        ("src/pages/", &[".tsx", ".ts"]),
+    ];
+
+    let per_layer = 2usize;
+    let mut selected: Vec<String> = Vec::new();
+    let mut layer_counts: Vec<(&str, usize)> = Vec::new();
+
+    for (prefix, exts) in layers {
+        if selected.len() >= max {
+            break;
+        }
+        // Collect matching files, skip test/spec
+        let mut candidates: Vec<&String> = all_paths
+            .iter()
+            .filter(|p| {
+                let lower = p.to_lowercase();
+                lower.starts_with(prefix)
+                    && exts.iter().any(|ext| lower.ends_with(ext))
+                    && !lower.contains("test")
+                    && !lower.contains("spec")
+                    && !selected.contains(p)
+            })
+            .collect();
+        // Sort by path length descending (longer paths = deeper/more specific files)
+        candidates.sort_by(|a, b| b.len().cmp(&a.len()));
+        let take = per_layer.min(max - selected.len());
+        let picked: Vec<String> = candidates.into_iter().take(take).cloned().collect();
+        let count = picked.len();
+        selected.extend(picked);
+        layer_counts.push((prefix, count));
+    }
+
+    // Fill remaining budget with any source files not yet included
+    if selected.len() < max {
+        let general_exts = [".rs", ".ts", ".tsx", ".py", ".go", ".java", ".js", ".jsx"];
+        for path in all_paths {
+            if selected.len() >= max {
+                break;
+            }
+            let lower = path.to_lowercase();
+            if general_exts.iter().any(|ext| lower.ends_with(ext))
+                && !lower.contains("test")
+                && !lower.contains("spec")
+                && !selected.contains(path)
+            {
+                selected.push(path.clone());
+            }
+        }
+    }
+
+    // Log layer coverage
+    let coverage: Vec<String> = layer_counts
+        .iter()
+        .map(|(prefix, count)| {
+            let label = prefix.split('/').next().unwrap_or(prefix);
+            format!("{}={}", label, count)
+        })
+        .collect();
+    println!("  Fallback coverage: {}", coverage.join(", "));
+
+    selected
+}
+
+// ─── LLM call helper (OpenAI-compatible API) ────────────────────────────────
+
+async fn call_llm(
+    base_url: &str,
     api_key: &str,
+    model: &str,
     system_prompt: &str,
     user_prompt: &str,
 ) -> Result<String, String> {
     let client = reqwest::Client::new();
 
     let request_body = json!({
-        "model": "moonshotai/kimi-k2",
+        "model": model,
         "messages": [
             { "role": "system", "content": system_prompt },
             { "role": "user",   "content": user_prompt }
         ],
         "temperature": 0.7,
-        "max_tokens": 4096,
+        "max_tokens": 8192,
         "response_format": { "type": "json_object" }
     });
 
-    let response = client
-        .post("https://openrouter.ai/api/v1/chat/completions")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .header("HTTP-Referer", "http://localhost")
-        .header("X-Title", "Yggdrasil")
-        .json(&request_body)
-        .send()
-        .await
-        .map_err(|e| format!("HTTP request failed: {}", e))?;
+    let mut attempts = 0u32;
+    let max_retries = 3u32;
+    let (status, response_text) = loop {
+        attempts += 1;
+        let resp = client
+            .post(base_url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| format!("HTTP request failed: {}", e))?;
 
-    let status = response.status();
-    let response_text = response
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read response: {}", e))?;
+        let st = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| format!("Failed to read response: {}", e))?;
+
+        if st == 429 && attempts < max_retries {
+            let wait = attempts * 10;
+            println!(
+                "⏳ Rate limited (429), retrying in {}s (attempt {}/{})…",
+                wait, attempts, max_retries
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(wait as u64)).await;
+            continue;
+        }
+        break (st, text);
+    };
 
     if !status.is_success() {
-        return Err(format!("OpenRouter API returned {}: {}", status, response_text));
+        return Err(format!("LLM API returned {}: {}", status, response_text));
     }
 
     let parsed: GroqResponse = serde_json::from_str(&response_text)
-        .map_err(|e| format!("Failed to parse OpenRouter response: {}\nRaw: {}", e, &response_text[..response_text.len().min(500)]))?;
+        .map_err(|e| format!("Failed to parse LLM response: {}\nRaw: {}", e, &response_text[..response_text.len().min(500)]))?;
 
     Ok(parsed.choices[0].message.content.clone())
 }
@@ -827,11 +1117,11 @@ pub async fn generate_skill_tree(
     let env_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".env");
     dotenv::from_path(&env_path).ok();
     dotenv::dotenv().ok();
-    let api_key = std::env::var("OPENROUTER_API_KEY")
-        .map_err(|_| "OPENROUTER_API_KEY not found in .env file".to_string())?;
+    let groq_key = std::env::var("GROQ_API_KEY")
+        .map_err(|_| "GROQ_API_KEY not found in .env file".to_string())?;
 
     // Phase 1: Extract concept dependency graph
-    let graph_context = match extract_concept_graph(&api_key, &prd_text).await {
+    let graph_context = match extract_concept_graph(&groq_key, &prd_text).await {
         Ok(graph) => {
             println!(
                 "🧠 Concept graph extracted: {} concepts",
@@ -862,8 +1152,15 @@ pub async fn generate_skill_tree(
         )
     };
 
-    println!("Calling OpenRouter (kimi-k2)…");
-    let tree_json = call_openrouter(&api_key, &build_system_prompt(), &user_prompt).await?;
+    let tree_model = std::env::var("TREE_GEN_MODEL")
+        .unwrap_or_else(|_| "moonshotai/kimi-k2".to_string());
+    let tree_api_key = std::env::var("TREE_GEN_API_KEY")
+        .unwrap_or_else(|_| std::env::var("OPENROUTER_API_KEY").unwrap_or_default());
+    let tree_base_url = std::env::var("TREE_GEN_BASE_URL")
+        .unwrap_or_else(|_| "https://openrouter.ai/api/v1/chat/completions".to_string());
+
+    println!("🌲 Tree gen model: {}", tree_model);
+    let tree_json = call_llm(&tree_base_url, &tree_api_key, &tree_model, &build_system_prompt(), &user_prompt).await?;
 
     let mut skill_tree: SkillTree = serde_json::from_str(&tree_json)
         .map_err(|e| format!("Generated JSON doesn't match SkillTree schema: {}", e))?;
@@ -901,8 +1198,8 @@ pub async fn analyze_repo(
     let env_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".env");
     dotenv::from_path(&env_path).ok();
     dotenv::dotenv().ok();
-    let api_key = std::env::var("OPENROUTER_API_KEY")
-        .map_err(|_| "OPENROUTER_API_KEY not found in .env file".to_string())?;
+    let groq_key = std::env::var("GROQ_API_KEY")
+        .map_err(|_| "GROQ_API_KEY not found in .env file".to_string())?;
 
     // Build GitHub HTTP client
     let mut header_map = reqwest::header::HeaderMap::new();
@@ -957,25 +1254,21 @@ pub async fn analyze_repo(
 
     println!("  Language: {}, Topics: {:?}", primary_language, topics);
 
-    // 2. Root directory listing (needed for all subsequent fetches)
-    let root_files: Vec<String> = match gh
-        .get(format!("{}/contents/", base))
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => {
-            let arr: Vec<serde_json::Value> = r.json().await.unwrap_or_default();
-            arr.iter()
-                .filter_map(|f| f["name"].as_str().map(String::from))
-                .collect()
-        }
-        _ => vec![],
-    };
+    // 2. Fetch full file tree (single API call)
+    let all_paths = fetch_repo_tree(&gh, &base).await.unwrap_or_default();
+    println!("  File tree: {} files", all_paths.len());
+
+    // Root-level file names (for README + dep file detection)
+    let root_files: Vec<String> = all_paths
+        .iter()
+        .filter(|p| !p.contains('/'))
+        .cloned()
+        .collect();
     println!("  Root files: {:?}", root_files);
 
-    // 3. README — find it in root listing, fetch via /contents/{name}
+    // 3. README
     let readme_text = {
-        let readme_name = root_files.iter().find(|f| {
+        let readme_name = all_paths.iter().find(|f| {
             let lower = f.to_lowercase();
             lower == "readme.md"
                 || lower == "readme.rst"
@@ -984,14 +1277,14 @@ pub async fn analyze_repo(
         });
         if let Some(name) = readme_name {
             let url = format!("{}/contents/{}", base, name);
-            fetch_github_file(&gh, &url, 3000).await.unwrap_or_default()
+            fetch_github_file(&gh, &url, 1000).await.unwrap_or_default()
         } else {
             String::new()
         }
     };
     println!("  README: {} chars", readme_text.len());
 
-    // 4. Dependency files
+    // 4. Dependency files (lightweight for Phase 1: 500 chars each)
     let dep_candidates = [
         "package.json",
         "Cargo.toml",
@@ -1003,98 +1296,35 @@ pub async fn analyze_repo(
         "composer.json",
     ];
     let mut dep_contents: Vec<(String, String)> = Vec::new();
-
     for dep_file in &dep_candidates {
-        if root_files.iter().any(|f| f.as_str() == *dep_file) {
+        if all_paths.iter().any(|f| f.as_str() == *dep_file) {
             let url = format!("{}/contents/{}", base, dep_file);
-            if let Some(content) = fetch_github_file(&gh, &url, 2000).await {
+            if let Some(content) = fetch_github_file(&gh, &url, 300).await {
                 dep_contents.push((dep_file.to_string(), content));
                 println!("  Fetched: {}", dep_file);
             }
         }
     }
 
-    // 5. Key source files
-    let entry_point_candidates = [
-        "main.rs", "lib.rs", "main.py", "app.py", "server.py",
-        "index.ts", "index.js", "app.ts", "app.js", "main.ts",
-        "main.go", "app.go", "server.go",
-        "Main.java", "App.java",
-        "server.js", "server.ts",
-        "index.py",
-    ];
-    let mut source_files: Vec<(String, String)> = Vec::new();
+    // 5. Build Phase 1 context (lightweight: README + deps + file path list)
+    let mut phase1_context = format!("# Repository: {}/{}\n\n", owner, repo);
+    if !repo_description.is_empty() {
+        phase1_context.push_str(&format!("**Description:** {}\n", repo_description));
+    }
+    phase1_context.push_str(&format!("**Primary Language:** {}\n\n", primary_language));
 
-    for candidate in &entry_point_candidates {
-        if source_files.len() >= 3 { break; }
-        if root_files.iter().any(|f| f.as_str() == *candidate) {
-            let url = format!("{}/contents/{}", base, candidate);
-            if let Some(content) = fetch_github_file(&gh, &url, 1500).await {
-                source_files.push((candidate.to_string(), content));
-                println!("  Source: {}", candidate);
-            }
-        }
+    if !readme_text.is_empty() {
+        phase1_context.push_str(&format!("## README\n\n{}\n\n", readme_text));
     }
-
-    // Check common source subdirectories: src/, python/, julia/, lib/, core/, cmd/
-    let source_subdirs = ["src", "python", "julia", "lib", "core", "cmd"];
-    for subdir in &source_subdirs {
-        if source_files.len() >= 5 { break; }
-        if root_files.iter().any(|f| f.as_str() == *subdir) {
-            if let Ok(r) = gh.get(format!("{}/contents/{}", base, subdir)).send().await {
-                if r.status().is_success() {
-                    let dir_list: Vec<serde_json::Value> = r.json().await.unwrap_or_default();
-                    let interesting: Vec<String> = dir_list
-                        .iter()
-                        .filter_map(|f| {
-                            let name = f["name"].as_str()?;
-                            let ftype = f["type"].as_str().unwrap_or("");
-                            if ftype == "file"
-                                && !name.contains("test")
-                                && !name.contains("spec")
-                                && !name.ends_with(".lock")
-                            {
-                                Some(name.to_string())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    for src_file in interesting.iter().take(5 - source_files.len()) {
-                        let url = format!("{}/contents/{}/{}", base, subdir, src_file);
-                        if let Some(content) = fetch_github_file(&gh, &url, 1500).await {
-                            source_files.push((format!("{}/{}", subdir, src_file), content));
-                            println!("  Source: {}/{}", subdir, src_file);
-                        }
-                    }
-                }
-            }
-        }
+    for (filename, content) in &dep_contents {
+        phase1_context.push_str(&format!("## {}\n\n```\n{}\n```\n\n", filename, content));
     }
-    // Fallback: if no known entry points matched, pick source files from root by extension
-    if source_files.is_empty() {
-        let src_extensions = [".py", ".js", ".ts", ".rs", ".go", ".java", ".cpp", ".c", ".rb"];
-        let skip_prefixes = ["setup", "conftest", "manage", "wsgi", "asgi"];
-        let root_sources: Vec<String> = root_files
-            .iter()
-            .filter(|f| {
-                let lower = f.to_lowercase();
-                src_extensions.iter().any(|ext| lower.ends_with(ext))
-                    && !skip_prefixes.iter().any(|s| lower.starts_with(s))
-                    && !lower.contains("test")
-                    && !lower.contains("spec")
-            })
-            .cloned()
-            .collect();
-        for src_file in root_sources.iter().take(3) {
-            let url = format!("{}/contents/{}", base, src_file);
-            if let Some(content) = fetch_github_file(&gh, &url, 1500).await {
-                source_files.push((src_file.to_string(), content));
-                println!("  Source (fallback): {}", src_file);
-            }
-        }
+    // Include full file path list so LLM can pick relevant files
+    phase1_context.push_str("## FILE PATHS\n\n");
+    for path in &all_paths {
+        phase1_context.push_str(&format!("- {}\n", path));
     }
-    println!("  Source files fetched: {}", source_files.len());
+    println!("  Phase 1 context: {} chars", phase1_context.len());
 
     // 6. Recent commit history
     let recent_commits: Vec<String> = match gh
@@ -1110,7 +1340,13 @@ pub async fn analyze_repo(
                     let sha = c["sha"].as_str()?.chars().take(7).collect::<String>();
                     let message = c["commit"]["message"].as_str().unwrap_or("");
                     let first_line = message.lines().next().unwrap_or("");
-                    let msg = if first_line.len() > 80 { &first_line[..80] } else { first_line };
+                    let msg = if first_line.len() > 80 {
+                        let mut b = 80;
+                        while !first_line.is_char_boundary(b) { b -= 1; }
+                        &first_line[..b]
+                    } else {
+                        first_line
+                    };
                     let author = c["commit"]["author"]["name"].as_str().unwrap_or("unknown");
                     let date = c["commit"]["author"]["date"].as_str().unwrap_or("");
                     let date_short = &date[..date.len().min(10)];
@@ -1185,7 +1421,60 @@ pub async fn analyze_repo(
     };
     println!("  Merged PRs: {}", merged_prs.len());
 
-    // 9. Build context
+    // 9. Phase 1: Extract concept graph + relevant files (lightweight context)
+    let (graph_context, relevant_file_paths) = match extract_concept_graph(&groq_key, &phase1_context).await {
+        Ok(graph) => {
+            println!(
+                "🧠 Concept graph extracted: {} concepts, {} relevant files",
+                graph.concepts.len(),
+                graph.relevant_files.len()
+            );
+            let sorted = topological_sort(graph.concepts);
+            for (i, c) in sorted.iter().enumerate() {
+                println!("  {}. {} — {}", i + 1, c.name, c.description);
+            }
+            if !graph.relevant_files.is_empty() {
+                println!("  📂 Relevant files: {:?}", graph.relevant_files);
+            }
+            (Some(build_graph_context(&sorted)), graph.relevant_files)
+        }
+        Err(e) => {
+            println!("⚠️  Concept graph extraction failed: {} — falling back to single-phase generation", e);
+            (None, vec![])
+        }
+    };
+
+    // 10. Fetch targeted source files (Phase 1-driven or fallback)
+    let mut files_to_fetch: Vec<String> = if relevant_file_paths.is_empty() {
+        let fallback = select_fallback_files(&all_paths, 10);
+        println!("  Using fallback file selection: {} files", fallback.len());
+        fallback
+    } else {
+        // Validate that returned paths actually exist in the repo tree
+        relevant_file_paths
+            .into_iter()
+            .filter(|p| all_paths.contains(p))
+            .collect()
+    };
+
+    // Always include pinned files (core project files) if they exist in the repo
+    let pinned = vec![
+        "src-tauri/src/brain.rs",
+        "sidecar/src/routes/match.ts",
+        "sidecar/src/routes/ingest.ts",
+        "sidecar/src/index.ts",
+    ];
+    for p in &pinned {
+        let ps = p.to_string();
+        if all_paths.contains(&ps) && !files_to_fetch.contains(&ps) {
+            files_to_fetch.push(ps);
+        }
+    }
+
+    let source_files = fetch_relevant_files(&gh, &base, &files_to_fetch, 4000, 40000).await;
+    println!("  Source files fetched: {} files", source_files.len());
+
+    // 11. Build Phase 2 context (full: README + deps + source files + commits/issues/PRs)
     let mut context = format!("# Repository: {}/{}\n\n", owner, repo);
     if !repo_description.is_empty() {
         context.push_str(&format!("**Description:** {}\n", repo_description));
@@ -1194,24 +1483,14 @@ pub async fn analyze_repo(
     if !topics.is_empty() {
         context.push_str(&format!("**Topics:** {}\n", topics.join(", ")));
     }
-    context.push_str(&format!("**Root files:** {}\n\n", root_files.join(", ")));
+    context.push('\n');
 
     if !readme_text.is_empty() {
-        let preview = if readme_text.len() > 3000 {
-            format!("{}…", &readme_text[..3000])
-        } else {
-            readme_text.clone()
-        };
-        context.push_str(&format!("## README\n\n{}\n\n", preview));
+        context.push_str(&format!("## README\n\n{}\n\n", readme_text));
     }
 
     for (filename, content) in &dep_contents {
-        let preview = if content.len() > 2000 {
-            format!("{}…", &content[..2000])
-        } else {
-            content.clone()
-        };
-        context.push_str(&format!("## {}\n\n```\n{}\n```\n\n", filename, preview));
+        context.push_str(&format!("## {}\n\n```\n{}\n```\n\n", filename, content));
     }
 
     if !source_files.is_empty() {
@@ -1245,28 +1524,9 @@ pub async fn analyze_repo(
         context.push('\n');
     }
 
-    println!("  Context built: {} chars", context.len());
+    println!("📦 Phase 2 context: {} chars", context.len());
 
-    // 10. Phase 1: Extract concept dependency graph
-    let graph_context = match extract_concept_graph(&api_key, &context).await {
-        Ok(graph) => {
-            println!(
-                "🧠 Concept graph extracted: {} concepts",
-                graph.concepts.len()
-            );
-            let sorted = topological_sort(graph.concepts);
-            for (i, c) in sorted.iter().enumerate() {
-                println!("  {}. {} — {}", i + 1, c.name, c.description);
-            }
-            Some(build_graph_context(&sorted))
-        }
-        Err(e) => {
-            println!("⚠️  Concept graph extraction failed: {} — falling back to single-phase generation", e);
-            None
-        }
-    };
-
-    // 11. Phase 2: Generate tree (with or without graph context)
+    // 12. Generate tree (with or without graph context)
     let user_prompt = if let Some(ref gc) = graph_context {
         format!(
             "Project ID: {}\n\n{}\n\nRepository context:\n{}\n\nGenerate the learning skill tree JSON:",
@@ -1279,9 +1539,16 @@ pub async fn analyze_repo(
         )
     };
 
-    println!("Calling OpenRouter (kimi-k2) for repo analysis…");
+    let tree_model = std::env::var("TREE_GEN_MODEL")
+        .unwrap_or_else(|_| "moonshotai/kimi-k2".to_string());
+    let tree_api_key = std::env::var("TREE_GEN_API_KEY")
+        .unwrap_or_else(|_| std::env::var("OPENROUTER_API_KEY").unwrap_or_default());
+    let tree_base_url = std::env::var("TREE_GEN_BASE_URL")
+        .unwrap_or_else(|_| "https://openrouter.ai/api/v1/chat/completions".to_string());
+
+    println!("🌲 Tree gen model: {}", tree_model);
     let tree_json =
-        call_openrouter(&api_key, &build_repo_system_prompt(), &user_prompt).await?;
+        call_llm(&tree_base_url, &tree_api_key, &tree_model, &build_repo_system_prompt(), &user_prompt).await?;
 
     let mut skill_tree: SkillTree = serde_json::from_str(&tree_json)
         .map_err(|e| format!("Generated JSON doesn't match SkillTree schema: {}", e))?;

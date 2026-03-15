@@ -3,6 +3,7 @@ import { useState, useRef, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useLocation } from "react-router-dom";
 import { Send, X, Loader2, ExternalLink } from "lucide-react";
+import { useMimirContext } from "../contexts/MimirContext";
 
 interface Source {
   title: string;
@@ -30,6 +31,7 @@ export default function MimirChat({
   onToggle: () => void;
 }) {
   const location = useLocation();
+  const { treeId, nodeTitle } = useMimirContext();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -63,8 +65,8 @@ export default function MimirChat({
       const response = await invoke<MimirChatResponse>("mimir_chat", {
         message: msg,
         page,
-        treeId: null,
-        nodeTitle: null,
+        treeId,
+        nodeTitle,
       });
 
       setMessages((prev) => [

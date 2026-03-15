@@ -8,6 +8,7 @@ mod job_commands;
 mod idea_commands;
 mod resume_commands;
 mod skill_commands;
+mod export_commands;
 
 use database::Database;
 use tauri::Manager;
@@ -94,6 +95,7 @@ fn main() {
             skill_commands::get_skill_dependencies,
             skill_commands::get_skill_gaps,
             skill_commands::infer_skill_dependencies,
+            export_commands::export_tree,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

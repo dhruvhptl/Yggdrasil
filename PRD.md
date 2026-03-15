@@ -46,13 +46,14 @@ Yggdrasil puts it all in one place.
 ```
 1. Build a project (vibe-code it, ship it)
 2. Paste the GitHub repo → Yggdrasil analyzes the codebase
-3. Skill tree generated: all concepts behind what you built
-4. Mimir attaches your saved resources to each quest automatically
-5. Climb the tree: read, watch, practice → quests complete → skills unlock
-6. Skills feed the Universal Skill Tree
-7. Job tracker reads Universal Tree → "you need these skills for your target roles"
-8. Generate a tree for the gap → climb it → Universal Tree grows
-9. Repeat
+3. Skill tree generated: all concepts behind what you built, as checkpoints
+4. Mimir attaches your saved resources to each checkpoint automatically
+5. Climb the tree: reach each checkpoint → resources + exercises guide you there
+6. Mark a checkpoint complete when you genuinely understand the concept
+7. Skills feed the Universal Skill Tree
+8. Job tracker reads Universal Tree → "you need these skills for your target roles"
+9. Generate a tree for the gap → climb it → Universal Tree grows
+10. Repeat
 ```
 
 ---
@@ -71,8 +72,8 @@ Yggdrasil puts it all in one place.
 | Mimir Chat — Reranking | ✅ Done | llama-3.1-8b-instant reranker, top-3 selection |
 | Tree Generation — PRD | ✅ Done | Kimi-k2, concept graph, topo sort |
 | Tree Generation — GitHub repo | ✅ Done | GitHub API, source file analysis, concept graph |
-| Tree Rendering | ✅ Done | Custom SVG (YggdrasilTree.tsx), trunk/branch/leaf organic layout, node panel, quest completion |
-| Auto-matching quests to resources | ✅ Done | pgvector match on quest title + description |
+| Tree Rendering | ✅ Done | Custom SVG (YggdrasilTree.tsx), trunk/branch/leaf organic layout, node panel, checkpoint completion |
+| Auto-matching checkpoints to resources | ✅ Done | pgvector match on checkpoint title + description |
 | Universal Skill Tree — Galaxy | ✅ Done | 58 skills, 97 gaps — needs visual rebuild |
 | Jobs Page | ✅ Done | 11/100+ jobs added, skill gap detection |
 | Resume Page | ✅ Done | Auto-parse, skill extraction |
@@ -138,39 +139,88 @@ Node.js Mimir sidecar (port 3001)  ──────────┘
 | `/work` | Co-op skill galaxy | ✅ |
 | `/jobs` | Job application tracker | ✅ |
 | `/resume` | Resume parser + profile | ✅ |
-| `/skills` | Universal Skill Tree galaxy (D3 force) | ✅ Done (V2: radial tree layout) |
-| `/ideas` | Scratchpad (ideas → projects) | ✅ Done |
+| `/skills` | Universal Skill Tree | ✅ (V2: radial tree layout rebuild) |
+| `/ideas` | Scratchpad | ✅ |
 
 ---
 
 ## Immediate Priorities (Now)
 
-### 1. Climb 4 Trees
+### 1. Checkpoint Model Migration
 
-The app is built. Use it. Generate and climb trees for:
+Migrate the learning model from quests → checkpoints across the full stack:
+
+- **DB migration** — alter `tree_nodes` leaf nodes: repurpose `tasks` JSONB to `{ mastery_criteria: string, exercises: string[], notes: string }`, drop `difficulty` and `estimated_hours` from the schema
+- **Rust** — update `save_tree_to_database()` in `brain.rs` to write the new checkpoint shape
+- **System prompts** — rewrite `build_system_prompt()` and `build_repo_system_prompt()` to generate concept checkpoints with mastery criteria and exercises instead of tasks
+- **Frontend** — update `YggdrasilTree.tsx` node panel to show mastery criteria, exercises, resources, and notes. Remove task checklist.
+- **Migration script** — convert all existing leaf `tasks` arrays into the new checkpoint shape (best-effort: existing task title → mastery criteria, task description → first exercise)
+
+### 2. Climb 4 Trees
+
+Generate and climb trees for:
 
 - `github.com/dhruvhptl/pluto` — N-body physics simulator (Python + Julia)
 - `duely` — TBD repo
 - `bloch-sphere` — TBD repo
 - `yggdrasil` — this app itself
 
-Take notes in quest panels. Use Mimir chat while doing quests. Document every pain point encountered.
+Take notes in checkpoint panels. Use Mimir chat while climbing. Document every pain point.
 
-### 2. Fix Parent-Child for External Links
+### 3. Fix Parent-Child for External Links
 
-`handleIngestExternalLinks` in `ResourcesPage.tsx` is not passing `parent_id` to child ingests. Same bug as playlist fix — change `parentId` to `parent_id` in the invoke call.
+`handleIngestExternalLinks` in `ResourcesPage.tsx` is not passing `parent_id` to child ingests. Change `parentId` to `parent_id` in the invoke call.
 
-### 3. Dynamic Mimir Context
+### 4. Dynamic Mimir Context
 
-Pass current quest node title and tree ID to Mimir chat so it knows what you're working on. `MimirChat.tsx` currently passes `null` for both. Read from current route/selected node state.
+Pass current checkpoint node title and tree ID to Mimir chat. `MimirChat.tsx` currently passes `null` for both.
 
-### 4. Add Remaining Jobs
+### 5. Add Remaining Jobs
 
-Only 11/100+ jobs entered. Skill gap system needs more data to be meaningful. Target: 50+ jobs added before V2.
+Only 11/100+ jobs entered. Target: 50+ before V2.
 
 ---
 
-## V2 Features
+## The Checkpoint Model
+
+Leaf nodes in Yggdrasil are **concept checkpoints**, not tasks. The mental model shift:
+
+```
+Before:  leaf node = quest = "do this thing"
+After:   leaf node = checkpoint = "understand this concept"
+```
+
+A checkpoint represents a specific concept you need to genuinely understand. You reach it — you don't complete it like a chore.
+
+### What a checkpoint contains
+
+- **Concept name** — the specific thing to understand (e.g. "Velocity-Verlet Symplectic Integration")
+- **Mastery criteria** — AI-drafted description of what understanding this concept looks like. You refine it as you learn.
+- **Resources** — auto-matched from Mimir, the material that gets you there
+- **Exercises** — specific things to work through to confirm understanding
+- **Your notes** — written as you climb
+
+### What "complete" means
+
+A checkpoint is complete when you've satisfied the mastery criteria — a combination of working through the resources, completing the exercises, and your own judgment that you genuinely get it. You mark it done manually; there's no automatic completion.
+
+### Tree structure (unchanged)
+
+```
+Trunk (project)
+  └── Branch (phase/domain)
+        └── Leaf (concept checkpoint)
+```
+
+Checkpoints have no difficulty rating or estimated time. They're concepts — some take an afternoon, some take a week. You'll know when you're there.
+
+### Migration
+
+All existing leaf nodes (quests) are migrated to the checkpoint model. The `tasks` JSONB field on leaf nodes is repurposed: instead of a checklist of tasks, it holds `{ mastery_criteria, exercises, notes }`.
+
+---
+
+
 
 ### 2.1 Scraper Upgrade
 
@@ -190,7 +240,17 @@ Current `analyze_repo` in `brain.rs` does shallow fetching. V2 upgrade:
 - Call graph analysis — which functions call which
 - Import map — what each file imports from where
 - Richer LLM context — structured symbol map instead of raw file dumps
-- Result: quests reference specific patterns the author actually used, not just library names
+- Result: checkpoints reference specific patterns the author actually used, not just library names
+
+### 2.3 System Prompt Rewrite — Checkpoint Model
+
+Update `build_system_prompt()` and `build_repo_system_prompt()` in `brain.rs` to generate checkpoints instead of quests:
+
+- Each leaf node is a **concept**, not a task — title is a noun phrase, not an imperative
+- Output includes `mastery_criteria` (what understanding looks like), `exercises` (specific things to work through)
+- No `difficulty` or `estimated_hours` fields
+- Banned patterns updated: no "Learn X", "Read X", "Watch X" — titles must be concept names
+- Example good checkpoint: `"Velocity-Verlet Symplectic Integration"` not `"Learn how integrators work"`
 
 ### 2.3 Universal Skill Tree — Visual Rebuild
 
@@ -277,12 +337,13 @@ Not prioritized. Review after climbing the 4 trees.
 
 In order:
 
-1. Fix `parent_id` for external links modal children
-2. Add dynamic context to Mimir chat (pass `nodeTitle` + `treeId`)
-3. Generate trees for: pluto, duely, bloch-sphere, yggdrasil
-4. Climb all 4 trees — take notes, use Mimir, document pain points
-5. Add 50+ jobs to jobs page
-6. Review pain points → prioritize V2 features
+1. Checkpoint model migration (DB + Rust + system prompts + frontend)
+2. Fix `parent_id` for external links modal children
+3. Add dynamic context to Mimir chat (pass `nodeTitle` + `treeId`)
+4. Generate trees for: pluto, duely, bloch-sphere, yggdrasil
+5. Climb all 4 trees — take notes, use Mimir, document pain points
+6. Add 50+ jobs to jobs page
+7. Review pain points → prioritize V2 features
 
 ---
 
