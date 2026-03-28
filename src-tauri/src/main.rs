@@ -9,6 +9,7 @@ mod idea_commands;
 mod resume_commands;
 mod skill_commands;
 mod export_commands;
+mod daily_commands;
 
 use database::Database;
 use tauri::Manager;
@@ -44,6 +45,7 @@ fn main() {
             tree_commands::get_all_quests,
             tree_commands::recalculate_tree_progress,
             tree_commands::recalculate_unlocks,
+            tree_commands::get_tree_node_data,
             mimir::get_mimir_resources,
             mimir::get_node_resources,
             mimir::ingest_mimir_url,
@@ -59,6 +61,13 @@ fn main() {
             mimir::rescrape_resource,
             mimir::rescrape_all,
             mimir::get_chunk_counts,
+            mimir::get_distinct_tags,
+            mimir::update_resource_tags,
+            mimir::auto_tag_existing_resources,
+            mimir::rematch_all_nodes,
+            mimir::toggle_resource_completion,
+            mimir::on_resource_completed,
+            mimir::get_linked_node_titles,
             work_commands::create_coop,
             work_commands::get_coops,
             work_commands::create_topic,
@@ -96,6 +105,12 @@ fn main() {
             skill_commands::get_skill_gaps,
             skill_commands::infer_skill_dependencies,
             export_commands::export_tree,
+            daily_commands::get_daily_log,
+            daily_commands::upsert_daily_notes,
+            daily_commands::add_quest_to_day,
+            daily_commands::add_free_task_to_day,
+            daily_commands::move_to_quadrant,
+            daily_commands::remove_from_day,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

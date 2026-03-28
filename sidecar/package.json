@@ -18,7 +18,7 @@
     "node-fetch": "^3.3.0",
     "pdf-parse": "^1.1.1",
     "pg": "^8.11.0",
-    "univerisal-skill-tree": "file:..",
+    "universal-skill-tree": "file:..",
     "uuid": "^9.0.0"
   },
   "devDependencies": {

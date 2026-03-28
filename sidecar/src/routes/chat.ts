@@ -129,17 +129,72 @@ chatRouter.post('/', async (req: Request, res: Response) => {
         .join('\n\n');
     }
 
-    // 5. Build Groq system prompt
+    // 5. If treeId present, fetch tree structure + linked resources
+    let treeBlock = '';
+    if (context?.treeId) {
+      try {
+        const treeResult = await db.query<{
+          id: string;
+          title: string;
+          parent_id: string | null;
+          resource_title: string | null;
+          url: string | null;
+          type: string | null;
+        }>(
+          `SELECT tn.id, tn.title, tn.parent_id,
+                  mr.title as resource_title, mr.url, mr.type
+           FROM tree_nodes tn
+           LEFT JOIN mimir_node_links mnl ON mnl.node_id = tn.id
+           LEFT JOIN mimir_resources mr ON mr.id = mnl.resource_id
+           WHERE tn.tree_id = $1
+           ORDER BY tn.order_index ASC`,
+          [context.treeId],
+        );
+
+        if (treeResult.rows.length > 0) {
+          // Group resources by node
+          const nodeMap = new Map<string, { title: string; parentId: string | null; resources: string[] }>();
+          for (const row of treeResult.rows) {
+            if (!nodeMap.has(row.id)) {
+              nodeMap.set(row.id, { title: row.title, parentId: row.parent_id, resources: [] });
+            }
+            if (row.resource_title) {
+              const resLabel = `${row.resource_title}${row.type ? ` (${row.type})` : ''}${row.url ? ` — ${row.url}` : ''}`;
+              nodeMap.get(row.id)!.resources.push(resLabel);
+            }
+          }
+
+          const lines: string[] = [];
+          for (const [id, node] of nodeMap) {
+            const indent = node.parentId ? '  ' : '';
+            lines.push(`${indent}- ${node.title} [id=${id}]`);
+            for (const r of node.resources) {
+              lines.push(`${indent}    ↳ ${r}`);
+            }
+          }
+          treeBlock = `\n\nLearning Tree Structure:\n${lines.join('\n')}`;
+          console.log(`  ↳ injected tree structure: ${nodeMap.size} nodes`);
+        }
+      } catch (treeErr) {
+        console.warn('Failed to fetch tree structure:', treeErr);
+      }
+    }
+
+    // 6. Build Groq system prompt
     const systemPrompt = `You are Mimir, a learning assistant embedded in Yggdrasil skill tree app. Answer based on the provided context chunks. If the context doesn't contain enough information, say so clearly and suggest what kind of resource would help. Always cite which chunk(s) you used.${
       context?.nodeTitle
         ? ` The user is currently on quest node: "${context.nodeTitle}". Bias your answer toward how it relates to that specific quest.`
         : ''
-    }
+    }${
+      treeBlock
+        ? ` You have access to the user's learning tree and linked resources. When asked about sequencing, recommend order based on: prerequisite depth (shallower nodes first), resource type (short videos before dense docs), topological order of the tree.`
+        : ''
+    }${treeBlock}
 
 Context:
 ${contextBlocks || '(No relevant resources found in your library.)'}`;
 
-    // 6. Call Groq for synthesis
+    // 7. Call Groq for synthesis
     const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: {

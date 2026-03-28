@@ -459,3 +459,34 @@ pub async fn recalculate_unlocks(
 
     Ok(())
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TreeNodeData {
+    pub tasks: serde_json::Value,
+    pub tree_id: String,
+    pub project_id: String,
+}
+
+#[tauri::command]
+pub async fn get_tree_node_data(
+    node_id: String,
+    database: State<'_, Database>,
+) -> Result<TreeNodeData, String> {
+    let row = sqlx::query(
+        "SELECT tn.tasks, tn.tree_id, t.project_id \
+         FROM tree_nodes tn \
+         JOIN trees t ON t.id = tn.tree_id \
+         WHERE tn.id = $1"
+    )
+    .bind(&node_id)
+    .fetch_one(&database.pool)
+    .await
+    .map_err(|e| format!("Node not found: {}", e))?;
+
+    Ok(TreeNodeData {
+        tasks: row.try_get::<serde_json::Value, _>("tasks").unwrap_or(serde_json::json!(null)),
+        tree_id: row.try_get("tree_id").map_err(|e| e.to_string())?,
+        project_id: row.try_get("project_id").map_err(|e| e.to_string())?,
+    })
+}

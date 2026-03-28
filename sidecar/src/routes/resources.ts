@@ -8,7 +8,15 @@ export const resourcesRouter = Router();
 resourcesRouter.get('/', async (_req: Request, res: Response) => {
   try {
     const result = await db.query(
-      'SELECT id, title, url, type, status, user_notes, created_at, parent_id FROM mimir_resources ORDER BY created_at DESC',
+      `SELECT mr.id, mr.title, mr.url, mr.type, mr.status, mr.user_notes, mr.created_at, mr.parent_id, mr.tags, mr.is_completed,
+              COALESCE(nc.node_count, 0)::int AS node_count
+       FROM mimir_resources mr
+       LEFT JOIN (
+         SELECT resource_id, COUNT(DISTINCT node_id) AS node_count
+         FROM mimir_node_links
+         GROUP BY resource_id
+       ) nc ON nc.resource_id = mr.id
+       ORDER BY mr.created_at DESC`,
     );
     res.json(result.rows);
   } catch (err) {

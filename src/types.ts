@@ -74,6 +74,9 @@ export interface MimirResource {
   createdAt: string;
   relevanceScore?: number | null;
   parentId?: string | null;
+  tags: string[];
+  nodeCount: number;
+  isCompleted: boolean;
 }
 
 // Universal Skill Tree types
@@ -116,4 +119,25 @@ export interface SkillDependency {
   sourceSkillId: string;
   targetSkillId: string;
   relationship: string;
+}
+
+// Daily Eisenhower Matrix types
+
+export interface DailyQuestLink {
+  id: string;
+  date: string;
+  nodeId: string | null;
+  freeText: string | null;
+  quadrant: 'do' | 'schedule' | 'delegate' | 'eliminate';
+  sortOrder: number;
+  addedAt: string;
+  nodeTitle: string | null;
+  nodeProgress: number | null;
+  nodeIsLocked: boolean | null;
+}
+
+export interface DailyLog {
+  date: string;
+  notes: string | null;
+  links: DailyQuestLink[];
 }

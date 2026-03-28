@@ -3,6 +3,8 @@
 // Also includes direct-DB commands that don't need the sidecar.
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use sqlx::Row;
 use tauri::{Emitter, State};
 use crate::database::Database;
 
@@ -24,6 +26,12 @@ pub struct MimirResource {
     pub relevance_score: Option<f32>,
     #[serde(default)]
     pub parent_id: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub node_count: i32,
+    #[serde(default)]
+    pub is_completed: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -524,4 +532,348 @@ pub async fn link_resource_to_node(
     .map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+// ─── Tag commands ───────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn get_distinct_tags(
+    database: State<'_, Database>,
+) -> Result<Vec<String>, String> {
+    let rows = sqlx::query(
+        "SELECT DISTINCT unnest(tags) AS tag FROM mimir_resources ORDER BY tag"
+    )
+    .fetch_all(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let tags: Vec<String> = rows
+        .iter()
+        .map(|r| r.try_get::<String, _>("tag").unwrap_or_default())
+        .collect();
+    Ok(tags)
+}
+
+#[tauri::command]
+pub async fn update_resource_tags(
+    resource_id: String,
+    tags: Vec<String>,
+    database: State<'_, Database>,
+) -> Result<(), String> {
+    sqlx::query(
+        "UPDATE mimir_resources SET tags = $1 WHERE id = $2"
+    )
+    .bind(&tags)
+    .bind(&resource_id)
+    .execute(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn auto_tag_existing_resources(
+    database: State<'_, Database>,
+) -> Result<String, String> {
+    let env_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".env");
+    dotenv::from_path(&env_path).ok();
+    dotenv::dotenv().ok();
+
+    let model = std::env::var("TREE_GEN_MODEL")
+        .unwrap_or_else(|_| "llama-3.3-70b-versatile".to_string());
+    let base_url = std::env::var("TREE_GEN_BASE_URL")
+        .unwrap_or_else(|_| "https://api.groq.com/openai/v1/chat/completions".to_string());
+    let api_key = std::env::var("TREE_GEN_API_KEY")
+        .unwrap_or_else(|_| std::env::var("GROQ_API_KEY").unwrap_or_default());
+
+    let rows = sqlx::query(
+        "SELECT id, title FROM mimir_resources WHERE tags = '{}'"
+    )
+    .fetch_all(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let total = rows.len();
+    println!("🏷️  Auto-tagging {} untagged resources with model {}", total, model);
+
+    let client = reqwest::Client::new();
+    let mut tagged = 0u32;
+
+    for row in &rows {
+        let id: String = row.try_get("id").map_err(|e| e.to_string())?;
+        let title: String = row.try_get("title").map_err(|e| e.to_string())?;
+
+        let user_prompt = format!(
+            "Given this resource title: '{}', suggest 2-4 tags from these categories:\n\
+             Technology: rust, typescript, python, react, sql, julia, node, postgres, tauri, d3, numpy\n\
+             Type: tutorial, docs, video, article, reference\n\
+             Level: beginner, intermediate, advanced\n\
+             Return ONLY a JSON array of strings, e.g. [\"rust\", \"docs\"]",
+            title
+        );
+
+        let response = client
+            .post(&base_url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&json!({
+                "model": model,
+                "messages": [
+                    { "role": "system", "content": "You are a tag classifier. Return ONLY a JSON array of tag strings." },
+                    { "role": "user",   "content": user_prompt }
+                ],
+                "temperature": 0.2,
+                "max_tokens": 100
+            }))
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await;
+
+        let resp = match response {
+            Ok(r) => r,
+            Err(e) => {
+                println!("  ⚠️  Failed to tag '{}': {}", title, e);
+                continue;
+            }
+        };
+
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                println!("  ⚠️  Failed to parse response for '{}': {}", title, e);
+                continue;
+            }
+        };
+
+        let content = body["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("[]");
+
+        // Strip markdown fences if present
+        let clean = content
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+
+        let tags: Vec<String> = match serde_json::from_str(clean) {
+            Ok(t) => t,
+            Err(_) => {
+                println!("  ⚠️  Bad JSON for '{}': {}", title, clean);
+                continue;
+            }
+        };
+
+        sqlx::query("UPDATE mimir_resources SET tags = $1 WHERE id = $2")
+            .bind(&tags)
+            .bind(&id)
+            .execute(&database.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        tagged += 1;
+        println!("  ✅ [{}] {} → {:?}", tagged, title, tags);
+    }
+
+    let summary = format!("Tagged {} of {} resources", tagged, total);
+    println!("🏷️  {}", summary);
+    Ok(summary)
+}
+
+#[tauri::command]
+pub async fn rematch_all_nodes(
+    database: State<'_, Database>,
+) -> Result<String, String> {
+    let rows = sqlx::query(
+        "SELECT id FROM tree_nodes WHERE type = 'leaf'"
+    )
+    .fetch_all(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let node_ids: Vec<String> = rows
+        .iter()
+        .map(|r| r.try_get::<String, _>("id").unwrap_or_default())
+        .collect();
+
+    let total = node_ids.len();
+    println!("🔗 Re-matching {} leaf nodes to resources", total);
+
+    let client = reqwest::Client::new();
+
+    let alive = client
+        .get(format!("{}/health", MIMIR_URL))
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
+
+    if !alive {
+        return Err("Mimir sidecar not running".to_string());
+    }
+
+    let mut matched = 0u32;
+    for node_id in &node_ids {
+        match client
+            .post(format!("{}/match/{}", MIMIR_URL, node_id))
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => matched += 1,
+            Ok(r) => println!("  ⚠️  match returned {} for node {}", r.status(), node_id),
+            Err(e) => {
+                println!("  ⚠️  match error for {}: {}", node_id, e);
+                break;
+            }
+        }
+    }
+
+    let summary = format!("Matched {} of {} nodes", matched, total);
+    println!("🔗 {}", summary);
+    Ok(summary)
+}
+
+#[tauri::command]
+pub async fn toggle_resource_completion(
+    resource_id: String,
+    database: State<'_, Database>,
+) -> Result<bool, String> {
+    let row = sqlx::query(
+        "UPDATE mimir_resources SET is_completed = NOT is_completed WHERE id = $1 RETURNING is_completed"
+    )
+    .bind(&resource_id)
+    .fetch_one(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let new_val: bool = row.try_get("is_completed").map_err(|e| e.to_string())?;
+    Ok(new_val)
+}
+
+#[tauri::command]
+pub async fn on_resource_completed(
+    resource_id: String,
+    database: State<'_, Database>,
+) -> Result<(), String> {
+    // Find all tree nodes linked to this resource
+    let linked = sqlx::query(
+        "SELECT DISTINCT mnl.node_id, tn.tree_id
+         FROM mimir_node_links mnl
+         JOIN tree_nodes tn ON tn.id = mnl.node_id
+         WHERE mnl.resource_id = $1"
+    )
+    .bind(&resource_id)
+    .fetch_all(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if linked.is_empty() {
+        return Ok(());
+    }
+
+    // Increment progress by 20 (capped at 100) for each linked node
+    let mut affected_trees: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for row in &linked {
+        let node_id: String = row.try_get("node_id").map_err(|e| e.to_string())?;
+        let tree_id: String = row.try_get("tree_id").map_err(|e| e.to_string())?;
+
+        sqlx::query(
+            "UPDATE tree_nodes SET progress = LEAST(COALESCE(progress, 0) + 20, 100) WHERE id = $1"
+        )
+        .bind(&node_id)
+        .execute(&database.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        affected_trees.insert(tree_id);
+    }
+
+    // Recalculate progress for each affected tree (bottom-up cascade)
+    for tree_id in &affected_trees {
+        let rows = sqlx::query(
+            "SELECT id, parent_id, progress FROM tree_nodes WHERE tree_id = $1"
+        )
+        .bind(tree_id)
+        .fetch_all(&database.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let mut children_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        let mut progress_map: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
+        let mut roots: Vec<String> = Vec::new();
+
+        for row in &rows {
+            let id: String = row.try_get("id").map_err(|e| e.to_string())?;
+            let parent_id: Option<String> = row.try_get("parent_id").map_err(|e| e.to_string())?;
+            let progress: Option<i32> = row.try_get("progress").map_err(|e| e.to_string())?;
+
+            progress_map.insert(id.clone(), progress.unwrap_or(0));
+            match parent_id {
+                Some(pid) => children_map.entry(pid).or_default().push(id),
+                None => roots.push(id),
+            }
+        }
+
+        // DFS → reverse for post-order (leaves first)
+        let mut order: Vec<String> = Vec::new();
+        let mut stack = roots;
+        while let Some(id) = stack.pop() {
+            order.push(id.clone());
+            if let Some(kids) = children_map.get(&id) {
+                stack.extend(kids.iter().cloned());
+            }
+        }
+        order.reverse();
+
+        for id in &order {
+            if let Some(kids) = children_map.get(id) {
+                if !kids.is_empty() {
+                    let avg: i32 = kids.iter()
+                        .map(|kid| *progress_map.get(kid).unwrap_or(&0))
+                        .sum::<i32>() / kids.len() as i32;
+                    progress_map.insert(id.clone(), avg);
+                    sqlx::query("UPDATE tree_nodes SET progress = $1 WHERE id = $2")
+                        .bind(avg)
+                        .bind(id)
+                        .execute(&database.pool)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+
+        println!("🔄 Recalculated progress for tree {}", tree_id);
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LinkedNodeTitle {
+    pub title: String,
+}
+
+#[tauri::command]
+pub async fn get_linked_node_titles(
+    resource_id: String,
+    database: State<'_, Database>,
+) -> Result<Vec<LinkedNodeTitle>, String> {
+    let rows = sqlx::query(
+        "SELECT tn.title FROM mimir_node_links mnl JOIN tree_nodes tn ON tn.id = mnl.node_id WHERE mnl.resource_id = $1 ORDER BY tn.title"
+    )
+    .bind(&resource_id)
+    .fetch_all(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let titles: Vec<LinkedNodeTitle> = rows
+        .iter()
+        .map(|r| LinkedNodeTitle {
+            title: r.try_get::<String, _>("title").unwrap_or_default(),
+        })
+        .collect();
+    Ok(titles)
 }

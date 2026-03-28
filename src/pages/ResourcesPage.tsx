@@ -1,7 +1,7 @@
 // src/pages/ResourcesPage.tsx
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Trash2, Link, FileText, Globe, BookOpen, X, RefreshCw, CheckCircle2, Minus, XCircle, Filter, Search, ChevronDown, ChevronRight, Play } from 'lucide-react';
+import { Trash2, Link, FileText, Globe, BookOpen, X, RefreshCw, CheckCircle2, Minus, XCircle, Filter, Search, ChevronDown, ChevronRight, Play, Tag, Wand2, Check } from 'lucide-react';
 import { MimirResource } from '../types';
 
 type AddMode = 'url' | 'text' | 'pdf';
@@ -100,8 +100,24 @@ export default function ResourcesPage() {
   const [chunkCounts, setChunkCounts] = useState<Record<string, number>>({});
   const [chunksLoaded, setChunksLoaded] = useState(false);
 
-  // Filter
+  // Filter + search + sort
   const [showThin, setShowThin] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [typeFilter, setTypeFilter] = useState<string>('all');
+  const [selectedTags, setSelectedTags] = useState<string[]>([]);
+  const [sortBy, setSortBy] = useState<'newest' | 'oldest' | 'most_linked' | 'alpha'>('newest');
+
+  // Tags
+  const [allTags, setAllTags] = useState<string[]>([]);
+  const [editingTagsFor, setEditingTagsFor] = useState<string | null>(null);
+  const [tagInput, setTagInput] = useState('');
+  const [autoTagging, setAutoTagging] = useState(false);
+  const [autoTagResult, setAutoTagResult] = useState<string | null>(null);
+  const [rematching, setRematching] = useState(false);
+  const [rematchResult, setRematchResult] = useState<string | null>(null);
+  const [completionFilter, setCompletionFilter] = useState<'all' | 'completed' | 'incomplete'>('all');
+  const [nodePopoverFor, setNodePopoverFor] = useState<string | null>(null);
+  const [nodePopoverTitles, setNodePopoverTitles] = useState<string[]>([]);
 
   // Add form state
   const [addMode, setAddMode] = useState<AddMode>('url');
@@ -179,6 +195,102 @@ export default function ResourcesPage() {
     }
   }
 
+  async function loadTags() {
+    try {
+      const tags = await invoke<string[]>('get_distinct_tags');
+      setAllTags(tags);
+    } catch {
+      // tags are supplementary
+    }
+  }
+
+  async function handleAutoTag() {
+    if (autoTagging) return;
+    setAutoTagging(true);
+    setAutoTagResult(null);
+    try {
+      const result = await invoke<string>('auto_tag_existing_resources');
+      setAutoTagResult(result);
+      await loadResources();
+      await loadTags();
+      setTimeout(() => setAutoTagResult(null), 5000);
+    } catch (err) {
+      setAutoTagResult(`Failed: ${err}`);
+      setTimeout(() => setAutoTagResult(null), 5000);
+    } finally {
+      setAutoTagging(false);
+    }
+  }
+
+  async function handleRematchAll() {
+    if (rematching) return;
+    setRematching(true);
+    setRematchResult(null);
+    try {
+      const result = await invoke<string>('rematch_all_nodes');
+      setRematchResult(result);
+      await loadResources();
+      setTimeout(() => setRematchResult(null), 5000);
+    } catch (err) {
+      setRematchResult(`Failed: ${err}`);
+      setTimeout(() => setRematchResult(null), 5000);
+    } finally {
+      setRematching(false);
+    }
+  }
+
+  async function handleToggleCompletion(resourceId: string) {
+    try {
+      const newVal = await invoke<boolean>('toggle_resource_completion', { resourceId });
+      setResources(prev => prev.map(r => r.id === resourceId ? { ...r, isCompleted: newVal } : r));
+      if (newVal) {
+        await invoke('on_resource_completed', { resourceId });
+      }
+    } catch (err) {
+      console.error('Failed to toggle completion:', err);
+    }
+  }
+
+  async function handleShowLinkedNodes(resourceId: string) {
+    if (nodePopoverFor === resourceId) {
+      setNodePopoverFor(null);
+      return;
+    }
+    try {
+      const rows = await invoke<{ title: string }[]>('get_linked_node_titles', { resourceId });
+      setNodePopoverTitles(rows.map(r => r.title));
+      setNodePopoverFor(resourceId);
+    } catch {
+      setNodePopoverTitles([]);
+      setNodePopoverFor(resourceId);
+    }
+  }
+
+  async function handleUpdateTags(resourceId: string, tags: string[]) {
+    try {
+      await invoke('update_resource_tags', { resourceId, tags });
+      setResources(prev => prev.map(r => r.id === resourceId ? { ...r, tags } : r));
+      await loadTags();
+    } catch (err) {
+      console.error('Failed to update tags:', err);
+    }
+  }
+
+  function handleRemoveTag(resourceId: string, tag: string) {
+    const resource = resources.find(r => r.id === resourceId);
+    if (!resource) return;
+    handleUpdateTags(resourceId, resource.tags.filter(t => t !== tag));
+  }
+
+  function handleAddTag(resourceId: string, tag: string) {
+    const trimmed = tag.trim().toLowerCase();
+    if (!trimmed) return;
+    const resource = resources.find(r => r.id === resourceId);
+    if (!resource || resource.tags.includes(trimmed)) return;
+    handleUpdateTags(resourceId, [...resource.tags, trimmed]);
+    setTagInput('');
+  }
+
   const childrenByParent = useMemo(() =>
     resources.reduce((acc, r) => {
       if (r.parentId) acc[r.parentId] = [...(acc[r.parentId] || []), r];
@@ -201,6 +313,7 @@ export default function ResourcesPage() {
   useEffect(() => {
     loadResources();
     loadChunkCounts();
+    loadTags();
   }, []);
 
   useEffect(() => {
@@ -592,11 +705,69 @@ export default function ResourcesPage() {
 
   const urlResources = resources.filter(r => r.resourceType === 'webpage');
   const thinCount = chunksLoaded ? resources.filter(r => (chunkCounts[r.id] ?? 0) <= 3).length : 0;
-  const displayedResources = showThin
-    ? resources.filter(r => (chunkCounts[r.id] ?? 0) <= 3)
-    : resources;
+
+  const filteredResources = useMemo(() => {
+    let list = resources;
+
+    // Thin filter
+    if (showThin) {
+      list = list.filter(r => (chunkCounts[r.id] ?? 0) <= 3);
+    }
+
+    // Search
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase();
+      list = list.filter(r =>
+        r.title.toLowerCase().includes(q) ||
+        (r.url && r.url.toLowerCase().includes(q))
+      );
+    }
+
+    // Type filter
+    if (typeFilter !== 'all') {
+      list = list.filter(r => r.resourceType === typeFilter);
+    }
+
+    // Tag filter (any match)
+    if (selectedTags.length > 0) {
+      list = list.filter(r =>
+        r.tags && r.tags.some(t => selectedTags.includes(t))
+      );
+    }
+
+    // Completion filter
+    if (completionFilter === 'completed') {
+      list = list.filter(r => r.isCompleted);
+    } else if (completionFilter === 'incomplete') {
+      list = list.filter(r => !r.isCompleted);
+    }
+
+    // Sort
+    list = [...list].sort((a, b) => {
+      switch (sortBy) {
+        case 'oldest':
+          return (a.createdAt || '').localeCompare(b.createdAt || '');
+        case 'most_linked':
+          return (b.nodeCount || 0) - (a.nodeCount || 0);
+        case 'alpha':
+          return a.title.localeCompare(b.title);
+        case 'newest':
+        default:
+          return (b.createdAt || '').localeCompare(a.createdAt || '');
+      }
+    });
+
+    return list;
+  }, [resources, showThin, chunkCounts, searchQuery, typeFilter, selectedTags, completionFilter, sortBy]);
+
   const parentIdSet = new Set(resources.map(r => r.id));
-  const topLevelResources = resources.filter(r => !r.parentId || !parentIdSet.has(r.parentId));
+  const topLevelFiltered = filteredResources.filter(r => !r.parentId || !parentIdSet.has(r.parentId));
+
+  const tagSuggestions = useMemo(() => {
+    if (!tagInput.trim() || !editingTagsFor) return allTags;
+    const q = tagInput.toLowerCase();
+    return allTags.filter(t => t.includes(q));
+  }, [tagInput, allTags, editingTagsFor]);
 
   const canAdd = addMode === 'url' ? !!urlInput.trim()
     : addMode === 'text' ? !!textInput.trim()
@@ -757,22 +928,58 @@ export default function ResourcesPage() {
       ) : (
         <>
           {resources.length > 0 && (
-            <div className="flex items-center justify-between -mb-4">
-              {/* Left: count + thin filter */}
-              <div className="flex items-center gap-3">
-                <p className="text-xs font-medium text-slate-500 uppercase tracking-wider">
-                  {showThin
-                    ? `${displayedResources.length} thin resource${displayedResources.length !== 1 ? 's' : ''}`
-                    : `${resources.length} ${resources.length === 1 ? 'resource' : 'resources'}`
-                  }
-                </p>
+            <div className="flex flex-col gap-3 -mb-2">
+              {/* Search bar */}
+              <div className="relative">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-500" />
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={e => setSearchQuery(e.target.value)}
+                  placeholder="Search by title or URL…"
+                  className="w-full bg-slate-900 border border-slate-800 rounded-lg pl-9 pr-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-emerald-600 placeholder:text-slate-600"
+                />
+                {searchQuery && (
+                  <button onClick={() => setSearchQuery('')} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300">
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+
+              {/* Filter row */}
+              <div className="flex items-center gap-2 flex-wrap">
+                {/* Type filter */}
+                <select
+                  value={typeFilter}
+                  onChange={e => setTypeFilter(e.target.value)}
+                  className="bg-slate-900 border border-slate-800 rounded-md px-2 py-1 text-xs text-slate-300 focus:outline-none focus:border-emerald-600 cursor-pointer"
+                >
+                  <option value="all">All types</option>
+                  <option value="webpage">URL</option>
+                  <option value="pdf">PDF</option>
+                  <option value="text">Text</option>
+                </select>
+
+                {/* Sort */}
+                <select
+                  value={sortBy}
+                  onChange={e => setSortBy(e.target.value as typeof sortBy)}
+                  className="bg-slate-900 border border-slate-800 rounded-md px-2 py-1 text-xs text-slate-300 focus:outline-none focus:border-emerald-600 cursor-pointer"
+                >
+                  <option value="newest">Newest</option>
+                  <option value="oldest">Oldest</option>
+                  <option value="most_linked">Most linked</option>
+                  <option value="alpha">A → Z</option>
+                </select>
+
+                {/* Thin filter */}
                 {chunksLoaded && thinCount > 0 && (
                   <button
                     onClick={() => setShowThin(v => !v)}
-                    className={`flex items-center gap-1 text-xs px-2 py-0.5 rounded transition-colors ${
+                    className={`flex items-center gap-1 text-xs px-2 py-1 rounded transition-colors ${
                       showThin
                         ? 'bg-amber-900/50 text-amber-300 border border-amber-700/60'
-                        : 'text-amber-500 hover:text-amber-300 border border-transparent hover:border-amber-800/40'
+                        : 'text-amber-500 hover:text-amber-300 border border-slate-800 hover:border-amber-800/40'
                     }`}
                     title="Show only resources with ≤ 3 chunks — likely incomplete"
                   >
@@ -780,47 +987,203 @@ export default function ResourcesPage() {
                     {showThin ? 'Show all' : `${thinCount} thin`}
                   </button>
                 )}
+
+                {/* Spacer */}
+                <div className="flex-1" />
+
+                {/* Auto-tag button */}
+                <button
+                  onClick={handleAutoTag}
+                  disabled={autoTagging}
+                  className="flex items-center gap-1.5 text-xs text-slate-400 hover:text-emerald-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                  title="Use AI to auto-tag all untagged resources"
+                >
+                  <Wand2 className={`w-3.5 h-3.5 ${autoTagging ? 'animate-spin' : ''}`} />
+                  {autoTagging ? 'Tagging…' : 'Auto-tag'}
+                </button>
+
+                {/* Re-match all nodes */}
+                <button
+                  onClick={handleRematchAll}
+                  disabled={rematching || mimiDown}
+                  className="flex items-center gap-1.5 text-xs text-slate-400 hover:text-blue-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                  title="Re-match all leaf nodes to resources via embeddings"
+                >
+                  <Link className={`w-3.5 h-3.5 ${rematching ? 'animate-spin' : ''}`} />
+                  {rematching ? 'Matching…' : 'Re-match'}
+                </button>
+
+                {/* Re-scrape all */}
+                {urlResources.length > 0 && (
+                  <button
+                    onClick={handleRescrapeAll}
+                    disabled={bulkRunning || mimiDown}
+                    className="flex items-center gap-1.5 text-xs text-slate-400 hover:text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                    title={`Re-scrape ${urlResources.length} URL resource${urlResources.length !== 1 ? 's' : ''} with Scrapling`}
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${bulkRunning ? 'animate-spin' : ''}`} />
+                    Re-scrape All
+                  </button>
+                )}
               </div>
 
-              {/* Right: re-scrape all */}
-              {urlResources.length > 0 && (
-                <button
-                  onClick={handleRescrapeAll}
-                  disabled={bulkRunning || mimiDown}
-                  className="flex items-center gap-1.5 text-xs text-slate-400 hover:text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-                  title={`Re-scrape ${urlResources.length} URL resource${urlResources.length !== 1 ? 's' : ''} with Scrapling`}
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${bulkRunning ? 'animate-spin' : ''}`} />
-                  Re-scrape All URLs
-                </button>
+              {/* Tag filter chips */}
+              {allTags.length > 0 && (
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <Tag className="w-3 h-3 text-slate-600 flex-shrink-0" />
+                  {allTags.map(tag => (
+                    <button
+                      key={tag}
+                      onClick={() => setSelectedTags(prev =>
+                        prev.includes(tag) ? prev.filter(t => t !== tag) : [...prev, tag]
+                      )}
+                      className={`text-xs px-2 py-0.5 rounded-full transition-colors ${
+                        selectedTags.includes(tag)
+                          ? 'bg-emerald-900/60 text-emerald-300 border border-emerald-700/60'
+                          : 'bg-slate-800/60 text-slate-500 border border-slate-700/40 hover:text-slate-300 hover:border-slate-600'
+                      }`}
+                    >
+                      {tag}
+                    </button>
+                  ))}
+                  {selectedTags.length > 0 && (
+                    <button
+                      onClick={() => setSelectedTags([])}
+                      className="text-xs text-slate-600 hover:text-slate-300 ml-1"
+                    >
+                      clear
+                    </button>
+                  )}
+                </div>
               )}
+
+              {/* Completion filter */}
+              <div className="flex items-center gap-1.5">
+                <Check className="w-3 h-3 text-slate-600 flex-shrink-0" />
+                {(['all', 'completed', 'incomplete'] as const).map(v => (
+                  <button
+                    key={v}
+                    onClick={() => setCompletionFilter(v)}
+                    className={`text-xs px-2 py-0.5 rounded-full transition-colors ${
+                      completionFilter === v
+                        ? v === 'completed' ? 'bg-emerald-900/60 text-emerald-300 border border-emerald-700/60'
+                          : v === 'incomplete' ? 'bg-amber-900/50 text-amber-300 border border-amber-700/60'
+                          : 'bg-slate-700 text-slate-300 border border-slate-600'
+                        : 'bg-slate-800/60 text-slate-500 border border-slate-700/40 hover:text-slate-300 hover:border-slate-600'
+                    }`}
+                  >
+                    {v === 'all' ? 'All' : v === 'completed' ? 'Completed' : 'Incomplete'}
+                  </button>
+                ))}
+              </div>
+
+              {/* Result toasts */}
+              {autoTagResult && (
+                <div className={`text-xs px-3 py-1.5 rounded-md ${autoTagResult.startsWith('Failed') ? 'bg-red-950/40 text-red-400 border border-red-800/50' : 'bg-emerald-950/40 text-emerald-400 border border-emerald-800/50'}`}>
+                  {autoTagResult}
+                </div>
+              )}
+              {rematchResult && (
+                <div className={`text-xs px-3 py-1.5 rounded-md ${rematchResult.startsWith('Failed') ? 'bg-red-950/40 text-red-400 border border-red-800/50' : 'bg-blue-950/40 text-blue-400 border border-blue-800/50'}`}>
+                  {rematchResult}
+                </div>
+              )}
+
+              {/* Count */}
+              <p className="text-xs font-medium text-slate-500 uppercase tracking-wider">
+                {(() => {
+                  const shown = showThin ? filteredResources.length : topLevelFiltered.length;
+                  return shown === resources.length
+                    ? `${resources.length} ${resources.length === 1 ? 'resource' : 'resources'}`
+                    : `${shown} of ${resources.length} resources`;
+                })()}
+              </p>
             </div>
           )}
           <div className="flex flex-col gap-2">
             {showThin ? (
               // Thin filter: flat list
               <>
-                {displayedResources.map(resource => {
+                {filteredResources.map(resource => {
                   const state = cardState[resource.id] ?? 'idle';
                   const msg = cardMsg[resource.id] ?? '';
                   const isWebpage = resource.resourceType === 'webpage';
                   const chunkCount = chunkCounts[resource.id] ?? 0;
                   const badge = chunksLoaded ? getChunkBadgeProps(chunkCount) : null;
                   return (
-                    <div key={resource.id} className="group bg-slate-900 border border-slate-800 hover:border-slate-700 rounded-lg p-4 flex items-start gap-3 transition-colors">
-                      <div className="w-8 h-8 rounded-lg bg-slate-800 border border-slate-700/60 flex items-center justify-center flex-shrink-0 text-slate-400 mt-0.5">
-                        {getResourceIcon(resource)}
-                      </div>
+                    <div key={resource.id} className={`group bg-slate-900 border border-slate-800 hover:border-slate-700 rounded-lg p-4 flex items-start gap-3 transition-colors ${resource.isCompleted ? 'opacity-60' : ''}`}>
+                      <button
+                        onClick={() => handleToggleCompletion(resource.id)}
+                        className={`w-8 h-8 rounded-lg border flex items-center justify-center flex-shrink-0 mt-0.5 transition-colors ${
+                          resource.isCompleted
+                            ? 'bg-emerald-900/40 border-emerald-700/60 text-emerald-400'
+                            : 'bg-slate-800 border-slate-700/60 text-slate-400 hover:border-emerald-700 hover:text-emerald-400'
+                        }`}
+                        title={resource.isCompleted ? 'Mark incomplete' : 'Mark completed'}
+                      >
+                        {resource.isCompleted ? <Check className="w-4 h-4" /> : getResourceIcon(resource)}
+                      </button>
                       <div className="flex-1 min-w-0">
-                        <p className="text-sm font-medium text-slate-100 truncate">{resource.title}</p>
+                        <p className={`text-sm font-medium truncate ${resource.isCompleted ? 'text-slate-400 line-through' : 'text-slate-100'}`}>{resource.title}</p>
                         {resource.url && (
                           <a href={resource.url} target="_blank" rel="noopener noreferrer" className="text-xs text-blue-400 hover:text-blue-300 truncate block mt-0.5">{resource.url}</a>
                         )}
                         <div className="flex items-center gap-2 mt-1.5 flex-wrap">
                           <span className="text-xs px-1.5 py-0.5 rounded bg-slate-800 text-slate-500 border border-slate-700/50">{resource.resourceType}</span>
                           {badge && <span className={`text-xs px-1.5 py-0.5 rounded font-mono ${badge.className}`} title={badge.title}>{badge.label}</span>}
+                          {resource.nodeCount > 0 && (
+                            <span className="relative">
+                              <button
+                                onClick={() => handleShowLinkedNodes(resource.id)}
+                                className="text-xs px-1.5 py-0.5 rounded bg-blue-950/40 text-blue-400 border border-blue-800/40 hover:bg-blue-900/40 hover:text-blue-300 transition-colors cursor-pointer"
+                              >
+                                {resource.nodeCount} node{resource.nodeCount !== 1 ? 's' : ''}
+                              </button>
+                              {nodePopoverFor === resource.id && (
+                                <div className="absolute top-full left-0 mt-1 bg-slate-900 border border-slate-700 rounded-md shadow-xl z-20 min-w-[180px] max-w-[280px] max-h-40 overflow-y-auto p-1.5">
+                                  {nodePopoverTitles.length > 0 ? nodePopoverTitles.map((t, i) => (
+                                    <p key={i} className="text-xs text-slate-300 px-2 py-1 rounded hover:bg-slate-800 truncate">{t}</p>
+                                  )) : (
+                                    <p className="text-xs text-slate-500 px-2 py-1">No linked nodes</p>
+                                  )}
+                                </div>
+                              )}
+                            </span>
+                          )}
                           <span className="text-xs text-slate-600">{resource.createdAt && !isNaN(Date.parse(resource.createdAt)) ? new Date(resource.createdAt).toLocaleDateString() : ''}</span>
                           {state !== 'idle' && <span className={`text-xs font-medium ${state === 'loading' ? 'text-slate-500' : state === 'done' ? 'text-emerald-400' : state === 'unchanged' ? 'text-slate-500' : 'text-red-400'}`}>{state === 'loading' ? 'Re-scraping…' : msg}</span>}
+                        </div>
+                        {/* Tags */}
+                        <div className="flex items-center gap-1 mt-1.5 flex-wrap">
+                          {resource.tags?.map(tag => (
+                            <span key={tag} className="inline-flex items-center gap-0.5 text-xs px-1.5 py-0.5 rounded-full bg-slate-800 text-slate-400 border border-slate-700/50">
+                              {tag}
+                              <button onClick={(e) => { e.stopPropagation(); handleRemoveTag(resource.id, tag); }} className="text-slate-600 hover:text-red-400 ml-0.5"><X className="w-2.5 h-2.5" /></button>
+                            </span>
+                          ))}
+                          {editingTagsFor === resource.id ? (
+                            <div className="relative">
+                              <input
+                                type="text"
+                                value={tagInput}
+                                onChange={e => setTagInput(e.target.value)}
+                                onKeyDown={e => { if (e.key === 'Enter' && tagInput.trim()) { handleAddTag(resource.id, tagInput); } else if (e.key === 'Escape') { setEditingTagsFor(null); setTagInput(''); } }}
+                                onBlur={() => setTimeout(() => { setEditingTagsFor(null); setTagInput(''); }, 150)}
+                                placeholder="add tag…"
+                                autoFocus
+                                className="w-20 bg-slate-950 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-slate-200 focus:outline-none focus:border-emerald-600"
+                              />
+                              {tagInput && tagSuggestions.length > 0 && (
+                                <div className="absolute top-full left-0 mt-1 bg-slate-900 border border-slate-700 rounded-md shadow-xl z-10 max-h-32 overflow-y-auto min-w-[100px]">
+                                  {tagSuggestions.filter(t => !resource.tags?.includes(t)).slice(0, 8).map(t => (
+                                    <button key={t} onMouseDown={() => handleAddTag(resource.id, t)} className="block w-full text-left px-2 py-1 text-xs text-slate-300 hover:bg-slate-800 hover:text-white">{t}</button>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          ) : (
+                            <button onClick={() => { setEditingTagsFor(resource.id); setTagInput(''); }} className="text-xs text-slate-600 hover:text-emerald-400 px-1" title="Add tag">+</button>
+                          )}
                         </div>
                       </div>
                       <div className="flex items-center gap-1 flex-shrink-0">
@@ -841,13 +1204,13 @@ export default function ResourcesPage() {
                     </div>
                   );
                 })}
-                {displayedResources.length === 0 && (
-                  <p className="text-sm text-slate-500 text-center py-4">No thin resources — all resources have 4+ chunks.</p>
+                {filteredResources.length === 0 && (
+                  <p className="text-sm text-slate-500 text-center py-4">No matching resources found.</p>
                 )}
               </>
             ) : (
               // Grouped view: parent cards + collapsed/expanded children
-              topLevelResources.map(resource => {
+              topLevelFiltered.map(resource => {
                 const state = cardState[resource.id] ?? 'idle';
                 const msg = cardMsg[resource.id] ?? '';
                 const isWebpage = resource.resourceType === 'webpage';
@@ -860,18 +1223,45 @@ export default function ResourcesPage() {
                 return (
                   <div key={resource.id}>
                     {/* Parent card */}
-                    <div className="group bg-slate-900 border border-slate-800 hover:border-slate-700 rounded-lg p-4 flex items-start gap-3 transition-colors">
-                      <div className="w-8 h-8 rounded-lg bg-slate-800 border border-slate-700/60 flex items-center justify-center flex-shrink-0 text-slate-400 mt-0.5">
-                        {getResourceIcon(resource)}
-                      </div>
+                    <div className={`group bg-slate-900 border border-slate-800 hover:border-slate-700 rounded-lg p-4 flex items-start gap-3 transition-colors ${resource.isCompleted ? 'opacity-60' : ''}`}>
+                      <button
+                        onClick={() => handleToggleCompletion(resource.id)}
+                        className={`w-8 h-8 rounded-lg border flex items-center justify-center flex-shrink-0 mt-0.5 transition-colors ${
+                          resource.isCompleted
+                            ? 'bg-emerald-900/40 border-emerald-700/60 text-emerald-400'
+                            : 'bg-slate-800 border-slate-700/60 text-slate-400 hover:border-emerald-700 hover:text-emerald-400'
+                        }`}
+                        title={resource.isCompleted ? 'Mark incomplete' : 'Mark completed'}
+                      >
+                        {resource.isCompleted ? <Check className="w-4 h-4" /> : getResourceIcon(resource)}
+                      </button>
                       <div className="flex-1 min-w-0">
-                        <p className="text-sm font-medium text-slate-100 truncate">{resource.title}</p>
+                        <p className={`text-sm font-medium truncate ${resource.isCompleted ? 'text-slate-400 line-through' : 'text-slate-100'}`}>{resource.title}</p>
                         {resource.url && (
                           <a href={resource.url} target="_blank" rel="noopener noreferrer" className="text-xs text-blue-400 hover:text-blue-300 truncate block mt-0.5">{resource.url}</a>
                         )}
                         <div className="flex items-center gap-2 mt-1.5 flex-wrap">
                           <span className="text-xs px-1.5 py-0.5 rounded bg-slate-800 text-slate-500 border border-slate-700/50">{resource.resourceType}</span>
                           {badge && <span className={`text-xs px-1.5 py-0.5 rounded font-mono ${badge.className}`} title={badge.title}>{badge.label}</span>}
+                          {resource.nodeCount > 0 && (
+                            <span className="relative">
+                              <button
+                                onClick={() => handleShowLinkedNodes(resource.id)}
+                                className="text-xs px-1.5 py-0.5 rounded bg-blue-950/40 text-blue-400 border border-blue-800/40 hover:bg-blue-900/40 hover:text-blue-300 transition-colors cursor-pointer"
+                              >
+                                {resource.nodeCount} node{resource.nodeCount !== 1 ? 's' : ''}
+                              </button>
+                              {nodePopoverFor === resource.id && (
+                                <div className="absolute top-full left-0 mt-1 bg-slate-900 border border-slate-700 rounded-md shadow-xl z-20 min-w-[180px] max-w-[280px] max-h-40 overflow-y-auto p-1.5">
+                                  {nodePopoverTitles.length > 0 ? nodePopoverTitles.map((t, i) => (
+                                    <p key={i} className="text-xs text-slate-300 px-2 py-1 rounded hover:bg-slate-800 truncate">{t}</p>
+                                  )) : (
+                                    <p className="text-xs text-slate-500 px-2 py-1">No linked nodes</p>
+                                  )}
+                                </div>
+                              )}
+                            </span>
+                          )}
                           {hasChildren && (
                             <button
                               onClick={() => setExpandedParents(prev => { const next = new Set(prev); next.has(resource.id) ? next.delete(resource.id) : next.add(resource.id); return next; })}
@@ -883,6 +1273,38 @@ export default function ResourcesPage() {
                           )}
                           <span className="text-xs text-slate-600">{resource.createdAt && !isNaN(Date.parse(resource.createdAt)) ? new Date(resource.createdAt).toLocaleDateString() : ''}</span>
                           {state !== 'idle' && <span className={`text-xs font-medium ${state === 'loading' ? 'text-slate-500' : state === 'done' ? 'text-emerald-400' : state === 'unchanged' ? 'text-slate-500' : 'text-red-400'}`}>{state === 'loading' ? 'Re-scraping…' : msg}</span>}
+                        </div>
+                        {/* Tags */}
+                        <div className="flex items-center gap-1 mt-1.5 flex-wrap">
+                          {resource.tags?.map(tag => (
+                            <span key={tag} className="inline-flex items-center gap-0.5 text-xs px-1.5 py-0.5 rounded-full bg-slate-800 text-slate-400 border border-slate-700/50">
+                              {tag}
+                              <button onClick={(e) => { e.stopPropagation(); handleRemoveTag(resource.id, tag); }} className="text-slate-600 hover:text-red-400 ml-0.5"><X className="w-2.5 h-2.5" /></button>
+                            </span>
+                          ))}
+                          {editingTagsFor === resource.id ? (
+                            <div className="relative">
+                              <input
+                                type="text"
+                                value={tagInput}
+                                onChange={e => setTagInput(e.target.value)}
+                                onKeyDown={e => { if (e.key === 'Enter' && tagInput.trim()) { handleAddTag(resource.id, tagInput); } else if (e.key === 'Escape') { setEditingTagsFor(null); setTagInput(''); } }}
+                                onBlur={() => setTimeout(() => { setEditingTagsFor(null); setTagInput(''); }, 150)}
+                                placeholder="add tag…"
+                                autoFocus
+                                className="w-20 bg-slate-950 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-slate-200 focus:outline-none focus:border-emerald-600"
+                              />
+                              {tagInput && tagSuggestions.length > 0 && (
+                                <div className="absolute top-full left-0 mt-1 bg-slate-900 border border-slate-700 rounded-md shadow-xl z-10 max-h-32 overflow-y-auto min-w-[100px]">
+                                  {tagSuggestions.filter(t => !resource.tags?.includes(t)).slice(0, 8).map(t => (
+                                    <button key={t} onMouseDown={() => handleAddTag(resource.id, t)} className="block w-full text-left px-2 py-1 text-xs text-slate-300 hover:bg-slate-800 hover:text-white">{t}</button>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          ) : (
+                            <button onClick={() => { setEditingTagsFor(resource.id); setTagInput(''); }} className="text-xs text-slate-600 hover:text-emerald-400 px-1" title="Add tag">+</button>
+                          )}
                         </div>
                       </div>
                       <div className="flex items-center gap-1 flex-shrink-0">

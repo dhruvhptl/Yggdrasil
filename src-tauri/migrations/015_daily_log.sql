@@ -1,0 +1,6 @@
+CREATE TABLE IF NOT EXISTS daily_logs (
+    id TEXT PRIMARY KEY,
+    date DATE UNIQUE NOT NULL,
+    notes TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

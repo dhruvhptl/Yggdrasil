@@ -4,7 +4,7 @@ import { MimirProvider } from "./contexts/MimirContext";
 import MainLayout from "./layouts/MainLayout";
 import HomePage from "./pages/Homepage";
 import TreesPage from "./pages/TreesPage";
-import QuestsPage from "./pages/QuestsPage";
+import DailyPage from "./pages/DailyPage";
 import ResourcesPage from "./pages/ResourcesPage";
 import WorkPage from "./pages/WorkPage";
 import JobsPage from "./pages/JobsPage";
@@ -21,7 +21,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<HomePage />} />
           <Route path="/trees" element={<TreesPage />} />
-          <Route path="/quests" element={<QuestsPage />} />
+          <Route path="/quests" element={<DailyPage />} />
           <Route path="/resources" element={<ResourcesPage />} />
           <Route path="/work" element={<WorkPage />} />
           <Route path="/jobs" element={<JobsPage />} />

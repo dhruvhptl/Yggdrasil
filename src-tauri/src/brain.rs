@@ -1,22 +1,40 @@
 // src-tauri/src/brain.rs
 
 use base64::{Engine as _, engine::general_purpose};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use tauri::State;
 use uuid::Uuid;
+use std::fs::OpenOptions;
+use std::io::Write as IoWrite;
 use crate::database::Database;
+
+/// Accept both `"id": "abc"` and `"id": 9` from LLM output
+fn string_or_int<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrInt { Str(String), Int(i64), Float(f64) }
+    match StringOrInt::deserialize(deserializer)? {
+        StringOrInt::Str(s) => Ok(s),
+        StringOrInt::Int(n) => Ok(n.to_string()),
+        StringOrInt::Float(f) => Ok(f.to_string()),
+    }
+}
+
+fn string_or_int_default<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    string_or_int(deserializer).or(Ok(String::new()))
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SkillTree {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_or_int_default")]
     pub project_id: String,
     pub phases: Vec<Phase>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Phase {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_or_int_default")]
     pub id: String,
     pub name: String,
     #[serde(default)]
@@ -28,7 +46,7 @@ pub struct Phase {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Skill {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_or_int_default")]
     pub id: String,
     pub name: String,
     #[serde(default)]
@@ -42,8 +60,9 @@ pub struct Skill {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Checkpoint {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_or_int_default")]
     pub id: String,
+    #[serde(alias = "name", default)]
     pub title: String,
     #[serde(default)]
     pub mastery_criteria: String,
@@ -130,18 +149,32 @@ async fn extract_concept_graph(api_key: &str, context: &str) -> Result<ConceptGr
         context
     );
 
+    // Debug: log concept graph prompt
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("debug_tree_gen.txt") {
+        let _ = writeln!(f, "\n{}\n== CONCEPT GRAPH PROMPT (phase1_context)\n{}\n{}\n", "=".repeat(80), "=".repeat(80), user_prompt);
+    }
+
     let concept_model = std::env::var("CONCEPT_GRAPH_MODEL")
         .unwrap_or_else(|_| "llama-3.3-70b-versatile".to_string());
-    println!("🧠 Concept graph model: {}", concept_model);
+    let concept_base_url = std::env::var("CONCEPT_GRAPH_BASE_URL")
+        .unwrap_or_else(|_| "https://api.groq.com/openai/v1/chat/completions".to_string());
+    let concept_api_key = std::env::var("CONCEPT_GRAPH_API_KEY")
+        .unwrap_or_else(|_| api_key.to_string());
+    println!("🧠 Concept graph model: {} via {}", concept_model, concept_base_url);
 
     let graph_json = call_llm(
-        "https://api.groq.com/openai/v1/chat/completions",
-        api_key,
+        &concept_base_url,
+        &concept_api_key,
         &concept_model,
         build_concept_graph_system_prompt(),
         &user_prompt,
     )
     .await?;
+
+    // Debug: log concept graph raw response
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("debug_tree_gen.txt") {
+        let _ = writeln!(f, "\n{}\n== CONCEPT GRAPH RAW RESPONSE\n{}\n{}\n", "=".repeat(80), "=".repeat(80), graph_json);
+    }
 
     // Parse via Value first to tolerate LLM quirks like duplicate keys
     let value: serde_json::Value = serde_json::from_str(&graph_json)
@@ -747,6 +780,12 @@ Name a specific class, function, file, or behavior from THIS codebase.
 
 ## Phase Design
 
+Phase 1 MUST begin with at least one skill covering raw language fundamentals
+for each primary language detected in the repo — e.g. Rust ownership/borrowing/lifetimes,
+TypeScript type system, Python data model. These skills come before any framework or
+library skills. Even if the source code looks sophisticated, assume the developer does
+not deeply understand the language itself.
+
 **Phase 1 — Technology Foundations (MANDATORY, always first)**
 
 This phase MUST exist in every tree. Its purpose is to teach the underlying technologies
@@ -1297,11 +1336,24 @@ pub async fn analyze_repo(
     ];
     let mut dep_contents: Vec<(String, String)> = Vec::new();
     for dep_file in &dep_candidates {
-        if all_paths.iter().any(|f| f.as_str() == *dep_file) {
-            let url = format!("{}/contents/{}", base, dep_file);
-            if let Some(content) = fetch_github_file(&gh, &url, 300).await {
-                dep_contents.push((dep_file.to_string(), content));
-                println!("  Fetched: {}", dep_file);
+        // Search all paths for any file ending with this name (not just root)
+        let matches: Vec<&String> = all_paths
+            .iter()
+            .filter(|f| {
+                f.as_str() == *dep_file
+                    || f.ends_with(&format!("/{}", dep_file))
+            })
+            .collect();
+        if matches.is_empty() {
+            println!("  [dep] {} — not found", dep_file);
+        } else {
+            println!("  [dep] {} — {} match(es): {:?}", dep_file, matches.len(), matches);
+        }
+        for matched_path in matches {
+            let url = format!("{}/contents/{}", base, matched_path);
+            if let Some(content) = fetch_github_file(&gh, &url, 1500).await {
+                dep_contents.push((matched_path.clone(), content));
+                println!("  Fetched: {}", matched_path);
             }
         }
     }
@@ -1539,6 +1591,11 @@ pub async fn analyze_repo(
         )
     };
 
+    // Debug: log tree generation prompt
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("debug_tree_gen.txt") {
+        let _ = writeln!(f, "\n{}\n== TREE GEN PROMPT (user_prompt)\n{}\n{}\n", "=".repeat(80), "=".repeat(80), user_prompt);
+    }
+
     let tree_model = std::env::var("TREE_GEN_MODEL")
         .unwrap_or_else(|_| "moonshotai/kimi-k2".to_string());
     let tree_api_key = std::env::var("TREE_GEN_API_KEY")
@@ -1549,6 +1606,11 @@ pub async fn analyze_repo(
     println!("🌲 Tree gen model: {}", tree_model);
     let tree_json =
         call_llm(&tree_base_url, &tree_api_key, &tree_model, &build_repo_system_prompt(), &user_prompt).await?;
+
+    // Debug: log tree generation raw response
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("debug_tree_gen.txt") {
+        let _ = writeln!(f, "\n{}\n== TREE GEN RAW RESPONSE\n{}\n{}\n", "=".repeat(80), "=".repeat(80), tree_json);
+    }
 
     let mut skill_tree: SkillTree = serde_json::from_str(&tree_json)
         .map_err(|e| format!("Generated JSON doesn't match SkillTree schema: {}", e))?;

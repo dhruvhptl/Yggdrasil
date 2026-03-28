@@ -803,6 +803,8 @@ function NodePanel({ node, skillLocked, onSave, onClose, onAddChild, onDelete }:
         : (node.tasks as { mastery_criteria?: string; exercises?: string[]; notes?: string; completed?: boolean } | null))
     : null;
   const [notesText, setNotesText] = useState(checkpoint?.notes ?? '');
+  const [showDayPicker, setShowDayPicker] = useState(false);
+  const [dayPickerLoading, setDayPickerLoading] = useState(false);
   const notesTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -1025,6 +1027,65 @@ function NodePanel({ node, skillLocked, onSave, onClose, onAddChild, onDelete }:
                 {checkpoint.completed ? 'Reached' : 'Mark as reached'}
               </span>
             </button>
+            {/* Add to today's matrix */}
+            <div style={{ marginTop: 8, position: 'relative' }}>
+              <button
+                onClick={() => setShowDayPicker((v) => !v)}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 6,
+                  background: 'none', border: '1px solid #334155',
+                  borderRadius: 6, padding: '4px 10px', cursor: 'pointer',
+                  color: '#94a3b8', fontSize: 11,
+                }}
+              >
+                <span style={{ fontSize: 13 }}>+</span> Add to today
+              </button>
+              {showDayPicker && (
+                <div style={{
+                  position: 'absolute', top: '100%', left: 0, marginTop: 4,
+                  background: '#1e293b', border: '1px solid #334155',
+                  borderRadius: 8, padding: 6, display: 'flex', flexDirection: 'column', gap: 4,
+                  zIndex: 10, minWidth: 140,
+                }}>
+                  {[
+                    { key: 'do', label: 'Do', color: '#dc2626' },
+                    { key: 'schedule', label: 'Schedule', color: '#2563eb' },
+                    { key: 'delegate', label: 'Delegate', color: '#d97706' },
+                    { key: 'eliminate', label: 'Eliminate', color: '#64748b' },
+                  ].map((q) => (
+                    <button
+                      key={q.key}
+                      disabled={dayPickerLoading}
+                      onClick={async () => {
+                        setDayPickerLoading(true);
+                        try {
+                          const today = new Date().toISOString().slice(0, 10);
+                          await invoke('add_quest_to_day', {
+                            date: today,
+                            nodeId: node.id,
+                            quadrant: q.key,
+                          });
+                          setShowDayPicker(false);
+                        } catch (e) {
+                          console.error('Failed to add to today:', e);
+                        } finally {
+                          setDayPickerLoading(false);
+                        }
+                      }}
+                      style={{
+                        background: 'none', border: 'none', cursor: 'pointer',
+                        color: q.color, fontSize: 12, textAlign: 'left',
+                        padding: '4px 8px', borderRadius: 4,
+                      }}
+                      onMouseEnter={(e) => { (e.target as HTMLElement).style.background = '#0f172a'; }}
+                      onMouseLeave={(e) => { (e.target as HTMLElement).style.background = 'none'; }}
+                    >
+                      {q.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
         )}
 
