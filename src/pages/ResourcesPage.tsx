@@ -1,6 +1,7 @@
 // src/pages/ResourcesPage.tsx
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { Trash2, Link, FileText, Globe, BookOpen, X, RefreshCw, CheckCircle2, Minus, XCircle, Filter, Search, ChevronDown, ChevronRight, Play, Tag, Wand2, Check } from 'lucide-react';
 import { MimirResource } from '../types';
 
@@ -94,7 +95,6 @@ function getYouTubeBadgeProps(n: number): { label: string; className: string } {
 export default function ResourcesPage() {
   const [resources, setResources] = useState<MimirResource[]>([]);
   const [loading, setLoading] = useState(true);
-  const [mimiDown, setMimiDown] = useState(false);
 
   // Chunk counts
   const [chunkCounts, setChunkCounts] = useState<Record<string, number>>({});
@@ -115,6 +115,8 @@ export default function ResourcesPage() {
   const [autoTagResult, setAutoTagResult] = useState<string | null>(null);
   const [rematching, setRematching] = useState(false);
   const [rematchResult, setRematchResult] = useState<string | null>(null);
+  const [reembedding, setReembedding] = useState(false);
+  const [reembedResult, setReembedResult] = useState<string | null>(null);
   const [completionFilter, setCompletionFilter] = useState<'all' | 'completed' | 'incomplete'>('all');
   const [nodePopoverFor, setNodePopoverFor] = useState<string | null>(null);
   const [nodePopoverTitles, setNodePopoverTitles] = useState<string[]>([]);
@@ -141,6 +143,7 @@ export default function ResourcesPage() {
   const [bulkDone, setBulkDone] = useState(false);
   const [bulkSummary, setBulkSummary] = useState<{ improved: number; unchanged: number; failed: number } | null>(null);
   const [bulkRunning, setBulkRunning] = useState(false);
+  const [bulkCurrent, setBulkCurrent] = useState<{ index: number; total: number; title: string } | null>(null);
 
   // Playlist state
   const [playlistDetected, setPlaylistDetected] = useState(false);
@@ -172,14 +175,8 @@ export default function ResourcesPage() {
     try {
       const list = await invoke<MimirResource[]>('get_mimir_resources');
       setResources(list);
-      setMimiDown(false);
     } catch (err) {
-      const msg = String(err);
-      if (msg.includes('not running') || msg.includes('unavailable') || msg.includes('Connection refused')) {
-        setMimiDown(true);
-      } else {
-        console.error('Failed to load resources:', err);
-      }
+      console.error('Failed to load resources:', err);
     } finally {
       setLoading(false);
     }
@@ -236,6 +233,22 @@ export default function ResourcesPage() {
       setTimeout(() => setRematchResult(null), 5000);
     } finally {
       setRematching(false);
+    }
+  }
+
+  async function handleReembedPdfs() {
+    if (reembedding) return;
+    setReembedding(true);
+    setReembedResult(null);
+    try {
+      const result = await invoke<string>('reembed_pdfs');
+      setReembedResult(result);
+      setTimeout(() => setReembedResult(null), 5000);
+    } catch (err) {
+      setReembedResult(`Failed: ${err}`);
+      setTimeout(() => setReembedResult(null), 5000);
+    } finally {
+      setReembedding(false);
     }
   }
 
@@ -447,62 +460,58 @@ export default function ResourcesPage() {
     setBulkProgress([]);
     setBulkDone(false);
     setBulkSummary(null);
+    setBulkCurrent(null);
     setBulkRunning(true);
 
-    try {
-      const response = await fetch('http://localhost:3001/rescrape', { method: 'POST' });
-      if (!response.ok || !response.body) {
-        throw new Error(`Sidecar error: ${response.status}`);
+    const unlistenProgress = await listen<{
+      status: 'starting' | 'improved' | 'unchanged' | 'failed';
+      current: number; total: number; resourceId: string; title: string;
+      oldChunks?: number; newChunks?: number;
+    }>('rescrape-progress', ({ payload }) => {
+      if (payload.status === 'starting') {
+        setBulkCurrent({ index: payload.current, total: payload.total, title: payload.title });
+        return;
       }
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() ?? '';
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-          try {
-            const event = JSON.parse(trimmed);
-            if (event.type === 'progress') {
-              setBulkProgress(prev => [...prev, {
-                resourceId: event.resourceId,
-                title: event.title,
-                status: event.status,
-                oldChunks: event.oldChunks,
-                newChunks: event.newChunks,
-              }]);
-              // Update chunk count live for improved resources
-              if (event.status === 'improved' && event.newChunks != null) {
-                setChunkCounts(prev => ({ ...prev, [event.resourceId]: event.newChunks }));
-              }
-            } else if (event.type === 'complete') {
-              setBulkDone(true);
-              setBulkSummary({
-                improved: event.improved,
-                unchanged: event.unchanged,
-                failed: event.failed,
-              });
-            }
-          } catch {
-            // skip malformed lines
-          }
-        }
+      setBulkCurrent(null);
+      const finalStatus = payload.status as 'improved' | 'unchanged' | 'failed';
+      setBulkProgress(prev => [...prev, {
+        resourceId: payload.resourceId,
+        title: payload.title,
+        status: finalStatus,
+        oldChunks: payload.oldChunks ?? 0,
+        newChunks: payload.newChunks ?? 0,
+      }]);
+      if (payload.status === 'improved' && payload.newChunks != null) {
+        setChunkCounts(prev => ({ ...prev, [payload.resourceId]: payload.newChunks! }));
       }
-    } catch (err) {
+    });
+
+    const unlistenComplete = await listen<{
+      improved: number; unchanged: number; failed: number; total: number;
+    }>('rescrape-complete', ({ payload }) => {
+      setBulkCurrent(null);
       setBulkDone(true);
-      console.error('Rescrape all failed:', err);
-    } finally {
+      setBulkSummary({
+        improved: payload.improved,
+        unchanged: payload.unchanged,
+        failed: payload.failed,
+      });
+      unlistenProgress();
+      unlistenComplete();
       setBulkRunning(false);
       loadChunkCounts();
+    });
+
+    try {
+      await invoke('rescrape_all');
+    } catch (err) {
+      setBulkCurrent(null);
+      setBulkDone(true);
+      unlistenProgress();
+      unlistenComplete();
+      setBulkRunning(false);
+      loadChunkCounts();
+      console.error('Rescrape all failed:', err);
     }
   }
 
@@ -701,6 +710,7 @@ export default function ResourcesPage() {
     setBulkProgress([]);
     setBulkSummary(null);
     setBulkDone(false);
+    setBulkCurrent(null);
   }
 
   const urlResources = resources.filter(r => r.resourceType === 'webpage');
@@ -783,23 +793,9 @@ export default function ResourcesPage() {
         </p>
       </div>
 
-      {/* Sidecar down warning */}
-      {mimiDown && (
-        <div className="bg-amber-950/40 border border-amber-800/60 rounded-lg p-4 text-sm text-amber-300">
-          <strong>Mimir sidecar is not running.</strong> Start it with:
-          <code className="ml-2 px-2 py-0.5 bg-amber-900/40 rounded text-amber-200 font-mono text-xs">
-            npm --prefix sidecar start
-          </code>
-          <span className="block mt-1 text-amber-400/70 text-xs">
-            Or run <code className="font-mono">npm run tauri dev</code> which starts it automatically via concurrently.
-          </span>
-        </div>
-      )}
-
       {/* Add resource panel */}
-      {!mimiDown && (
-        <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 flex flex-col gap-3">
-          <p className="text-xs font-medium text-slate-500 uppercase tracking-wider">Add Resource</p>
+      <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 flex flex-col gap-3">
+        <p className="text-xs font-medium text-slate-500 uppercase tracking-wider">Add Resource</p>
 
           {/* Mode toggle */}
           <div className="flex gap-1 bg-slate-950 rounded-md p-1 w-fit">
@@ -916,12 +912,11 @@ export default function ResourcesPage() {
             </p>
           )}
         </div>
-      )}
 
       {/* Resource list */}
       {loading ? (
         <p className="text-sm text-slate-500">Loading…</p>
-      ) : resources.length === 0 && !mimiDown ? (
+      ) : resources.length === 0 ? (
         <p className="text-sm text-slate-500">
           No resources yet. Ingest a URL, paste some text, or upload a PDF to get started.
         </p>
@@ -1005,7 +1000,7 @@ export default function ResourcesPage() {
                 {/* Re-match all nodes */}
                 <button
                   onClick={handleRematchAll}
-                  disabled={rematching || mimiDown}
+                  disabled={rematching}
                   className="flex items-center gap-1.5 text-xs text-slate-400 hover:text-blue-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
                   title="Re-match all leaf nodes to resources via embeddings"
                 >
@@ -1013,11 +1008,22 @@ export default function ResourcesPage() {
                   {rematching ? 'Matching…' : 'Re-match'}
                 </button>
 
+                {/* Re-embed PDFs */}
+                <button
+                  onClick={handleReembedPdfs}
+                  disabled={reembedding}
+                  className="flex items-center gap-1.5 text-xs text-slate-400 hover:text-amber-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                  title="Re-embed all PDF resources from stored chunk text (use after embedding model change)"
+                >
+                  <BookOpen className={`w-3.5 h-3.5 ${reembedding ? 'animate-spin' : ''}`} />
+                  {reembedding ? 'Re-embedding…' : 'Re-embed PDFs'}
+                </button>
+
                 {/* Re-scrape all */}
                 {urlResources.length > 0 && (
                   <button
                     onClick={handleRescrapeAll}
-                    disabled={bulkRunning || mimiDown}
+                    disabled={bulkRunning}
                     className="flex items-center gap-1.5 text-xs text-slate-400 hover:text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
                     title={`Re-scrape ${urlResources.length} URL resource${urlResources.length !== 1 ? 's' : ''} with Scrapling`}
                   >
@@ -1086,6 +1092,11 @@ export default function ResourcesPage() {
               {rematchResult && (
                 <div className={`text-xs px-3 py-1.5 rounded-md ${rematchResult.startsWith('Failed') ? 'bg-red-950/40 text-red-400 border border-red-800/50' : 'bg-blue-950/40 text-blue-400 border border-blue-800/50'}`}>
                   {rematchResult}
+                </div>
+              )}
+              {reembedResult && (
+                <div className={`text-xs px-3 py-1.5 rounded-md ${reembedResult.startsWith('Failed') ? 'bg-red-950/40 text-red-400 border border-red-800/50' : 'bg-amber-950/40 text-amber-400 border border-amber-800/50'}`}>
+                  {reembedResult}
                 </div>
               )}
 
@@ -1219,6 +1230,7 @@ export default function ResourcesPage() {
                 const children = childrenByParent[resource.id] || [];
                 const hasChildren = children.length > 0;
                 const isExpanded = expandedParents.has(resource.id);
+                const completedChildren = children.filter(c => c.isCompleted).length;
 
                 return (
                   <div key={resource.id}>
@@ -1268,7 +1280,10 @@ export default function ResourcesPage() {
                               className="flex items-center gap-1 text-xs px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700/50 hover:text-slate-200 hover:border-slate-600 transition-colors"
                             >
                               {isExpanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
-                              {children.length} video{children.length !== 1 ? 's' : ''}
+                              {completedChildren > 0
+                                ? <><span className="text-emerald-400">{completedChildren}</span>/{children.length} videos</>
+                                : <>{children.length} video{children.length !== 1 ? 's' : ''}</>
+                              }
                             </button>
                           )}
                           <span className="text-xs text-slate-600">{resource.createdAt && !isNaN(Date.parse(resource.createdAt)) ? new Date(resource.createdAt).toLocaleDateString() : ''}</span>
@@ -1334,12 +1349,20 @@ export default function ResourcesPage() {
                             ? (isYouTube ? getYouTubeBadgeProps(childChunks) : getChunkBadgeProps(childChunks))
                             : null;
                           return (
-                            <div key={child.id} className="group bg-slate-900/60 border border-slate-800/60 hover:border-slate-700 rounded-lg px-3 py-2.5 flex items-center gap-2.5 transition-colors">
-                              <div className="w-6 h-6 rounded bg-slate-800 border border-slate-700/40 flex items-center justify-center flex-shrink-0 text-slate-500">
-                                {getResourceIcon(child)}
-                              </div>
+                            <div key={child.id} className={`group bg-slate-900/60 border border-slate-800/60 hover:border-slate-700 rounded-lg px-3 py-2.5 flex items-center gap-2.5 transition-colors ${child.isCompleted ? 'opacity-60' : ''}`}>
+                              <button
+                                onClick={() => handleToggleCompletion(child.id)}
+                                className={`w-5 h-5 rounded border flex items-center justify-center flex-shrink-0 transition-colors ${
+                                  child.isCompleted
+                                    ? 'bg-emerald-900/40 border-emerald-700/60 text-emerald-400'
+                                    : 'bg-slate-800 border-slate-700/40 text-slate-600 hover:border-emerald-700 hover:text-emerald-400'
+                                }`}
+                                title={child.isCompleted ? 'Mark incomplete' : 'Mark complete'}
+                              >
+                                {child.isCompleted ? <Check className="w-3 h-3" /> : getResourceIcon(child)}
+                              </button>
                               <div className="flex-1 min-w-0">
-                                <p className="text-xs font-medium text-slate-300 truncate">{child.title}</p>
+                                <p className={`text-xs font-medium truncate ${child.isCompleted ? 'text-slate-500 line-through' : 'text-slate-300'}`}>{child.title}</p>
                                 {child.url && (
                                   <a href={child.url} target="_blank" rel="noopener noreferrer" className="text-xs text-blue-500 hover:text-blue-400 truncate block">{child.url}</a>
                                 )}
@@ -1694,14 +1717,15 @@ export default function ResourcesPage() {
               <div className="flex items-center gap-2">
                 <RefreshCw className={`w-4 h-4 text-blue-400 ${bulkRunning ? 'animate-spin' : ''}`} />
                 <h3 className="text-white font-semibold text-sm">
-                  {bulkDone ? 'Re-scrape Complete' : `Re-scraping ${urlResources.length} URL${urlResources.length !== 1 ? 's' : ''}…`}
+                  {bulkDone
+                    ? 'Re-scrape Complete'
+                    : bulkCurrent
+                      ? `${bulkCurrent.index}/${bulkCurrent.total} URLs…`
+                      : `Re-scraping ${urlResources.length} URL${urlResources.length !== 1 ? 's' : ''}…`}
                 </h3>
               </div>
               {bulkDone && (
-                <button
-                  onClick={closeBulkModal}
-                  className="text-slate-500 hover:text-white transition-colors"
-                >
+                <button onClick={closeBulkModal} className="text-slate-500 hover:text-white transition-colors">
                   <X className="w-4 h-4" />
                 </button>
               )}
@@ -1720,19 +1744,24 @@ export default function ResourcesPage() {
                   )}
                   <span className="flex-1 truncate text-slate-300 text-xs">{p.title}</span>
                   {p.status === 'improved' && (
-                    <span className="text-emerald-400 text-xs font-mono flex-shrink-0">
-                      {p.oldChunks}→{p.newChunks}
-                    </span>
+                    <span className="text-emerald-400 text-xs font-mono flex-shrink-0">{p.oldChunks}→{p.newChunks}</span>
                   )}
                   {p.status === 'unchanged' && (
                     <span className="text-slate-600 text-xs flex-shrink-0">{p.oldChunks} chunks</span>
                   )}
                 </div>
               ))}
-              {!bulkDone && (
+              {bulkCurrent && (
+                <div className="flex items-center gap-2.5 text-xs text-slate-400">
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin flex-shrink-0 text-blue-400" />
+                  <span className="flex-1 truncate">{bulkCurrent.title}</span>
+                  <span className="text-slate-600 flex-shrink-0">{bulkCurrent.index}/{bulkCurrent.total}</span>
+                </div>
+              )}
+              {!bulkDone && !bulkCurrent && bulkProgress.length === 0 && (
                 <div className="flex items-center gap-2.5 text-xs text-slate-500">
                   <RefreshCw className="w-3.5 h-3.5 animate-spin flex-shrink-0" />
-                  <span>Processing…</span>
+                  <span>Starting…</span>
                 </div>
               )}
             </div>

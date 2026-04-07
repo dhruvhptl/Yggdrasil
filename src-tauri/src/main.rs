@@ -1,3 +1,7 @@
+// Prevents the console window from appearing on Windows in production builds.
+// The `cfg_attr` ensures it only applies in release mode so you keep the console during dev.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod commands;
 mod database;
 mod tree_commands;
@@ -68,6 +72,7 @@ fn main() {
             mimir::toggle_resource_completion,
             mimir::on_resource_completed,
             mimir::get_linked_node_titles,
+            mimir::reembed_pdfs,
             work_commands::create_coop,
             work_commands::get_coops,
             work_commands::create_topic,

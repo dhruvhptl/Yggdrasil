@@ -5,8 +5,6 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use tauri::State;
 use uuid::Uuid;
-use std::fs::OpenOptions;
-use std::io::Write as IoWrite;
 use crate::database::Database;
 
 /// Accept both `"id": "abc"` and `"id": 9` from LLM output
@@ -149,11 +147,6 @@ async fn extract_concept_graph(api_key: &str, context: &str) -> Result<ConceptGr
         context
     );
 
-    // Debug: log concept graph prompt
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("debug_tree_gen.txt") {
-        let _ = writeln!(f, "\n{}\n== CONCEPT GRAPH PROMPT (phase1_context)\n{}\n{}\n", "=".repeat(80), "=".repeat(80), user_prompt);
-    }
-
     let concept_model = std::env::var("CONCEPT_GRAPH_MODEL")
         .unwrap_or_else(|_| "llama-3.3-70b-versatile".to_string());
     let concept_base_url = std::env::var("CONCEPT_GRAPH_BASE_URL")
@@ -170,11 +163,6 @@ async fn extract_concept_graph(api_key: &str, context: &str) -> Result<ConceptGr
         &user_prompt,
     )
     .await?;
-
-    // Debug: log concept graph raw response
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("debug_tree_gen.txt") {
-        let _ = writeln!(f, "\n{}\n== CONCEPT GRAPH RAW RESPONSE\n{}\n{}\n", "=".repeat(80), "=".repeat(80), graph_json);
-    }
 
     // Parse via Value first to tolerate LLM quirks like duplicate keys
     let value: serde_json::Value = serde_json::from_str(&graph_json)
@@ -1153,11 +1141,8 @@ pub async fn generate_skill_tree(
     println!("Project ID: {}", project_id);
     println!("PRD length: {} chars\n", prd_text.len());
 
-    let env_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".env");
-    dotenv::from_path(&env_path).ok();
-    dotenv::dotenv().ok();
     let groq_key = std::env::var("GROQ_API_KEY")
-        .map_err(|_| "GROQ_API_KEY not found in .env file".to_string())?;
+        .map_err(|_| "GROQ_API_KEY environment variable not set".to_string())?;
 
     // Phase 1: Extract concept dependency graph
     let graph_context = match extract_concept_graph(&groq_key, &prd_text).await {
@@ -1234,11 +1219,8 @@ pub async fn analyze_repo(
 
     println!("\n=== Analyze Repo: {}/{} ===", owner, repo);
 
-    let env_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".env");
-    dotenv::from_path(&env_path).ok();
-    dotenv::dotenv().ok();
     let groq_key = std::env::var("GROQ_API_KEY")
-        .map_err(|_| "GROQ_API_KEY not found in .env file".to_string())?;
+        .map_err(|_| "GROQ_API_KEY environment variable not set".to_string())?;
 
     // Build GitHub HTTP client
     let mut header_map = reqwest::header::HeaderMap::new();
@@ -1591,11 +1573,6 @@ pub async fn analyze_repo(
         )
     };
 
-    // Debug: log tree generation prompt
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("debug_tree_gen.txt") {
-        let _ = writeln!(f, "\n{}\n== TREE GEN PROMPT (user_prompt)\n{}\n{}\n", "=".repeat(80), "=".repeat(80), user_prompt);
-    }
-
     let tree_model = std::env::var("TREE_GEN_MODEL")
         .unwrap_or_else(|_| "moonshotai/kimi-k2".to_string());
     let tree_api_key = std::env::var("TREE_GEN_API_KEY")
@@ -1606,11 +1583,6 @@ pub async fn analyze_repo(
     println!("🌲 Tree gen model: {}", tree_model);
     let tree_json =
         call_llm(&tree_base_url, &tree_api_key, &tree_model, &build_repo_system_prompt(), &user_prompt).await?;
-
-    // Debug: log tree generation raw response
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("debug_tree_gen.txt") {
-        let _ = writeln!(f, "\n{}\n== TREE GEN RAW RESPONSE\n{}\n{}\n", "=".repeat(80), "=".repeat(80), tree_json);
-    }
 
     let mut skill_tree: SkillTree = serde_json::from_str(&tree_json)
         .map_err(|e| format!("Generated JSON doesn't match SkillTree schema: {}", e))?;

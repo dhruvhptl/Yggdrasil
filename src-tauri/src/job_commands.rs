@@ -57,10 +57,7 @@ pub struct SkillDemand {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 fn load_api_key() -> Result<String, String> {
-    let env_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".env");
-    dotenv::from_path(&env_path).ok();
-    dotenv::dotenv().ok();
-    std::env::var("GROQ_API_KEY").map_err(|_| "GROQ_API_KEY not set in src-tauri/.env".to_string())
+    std::env::var("GROQ_API_KEY").map_err(|_| "GROQ_API_KEY environment variable not set".to_string())
 }
 
 fn row_to_job(r: &sqlx::postgres::PgRow) -> Result<JobApplication, String> {

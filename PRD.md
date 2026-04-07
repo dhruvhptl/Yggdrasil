@@ -1,6 +1,6 @@
 # Yggdrasil — Product Requirements Document
-**Version:** 2.0  
-**Updated:** March 2026
+**Version:** 2.1  
+**Updated:** April 2026
 
 ---
 
@@ -58,35 +58,32 @@ Yggdrasil puts it all in one place.
 
 ---
 
-## Current State (v1.0)
+## Current State (v2.1)
 
 ### What's Built & Working
 
 | Module | Status | Notes |
 |---|---|---|
-| Mimir Library — URL ingestion | ✅ Done | 5-tier scraper, YouTube transcripts, PDFs |
-| Mimir Library — YouTube playlists | ✅ Done | Parent-child grouping, 54-video batch ingest |
-| Mimir Library — Page type detection | ✅ Done | Auto-detects resource lists, triggers child modal |
-| Mimir Library — External links modal | ✅ Done | 54 links from datasciencehive ingested as children |
-| Mimir Chat — RAG | ✅ Done | pgvector cosine search, Groq LLaMA 3.3-70b synthesis |
+| Mimir Library — URL ingestion | ✅ Done | 3-tier scraper, YouTube transcripts, PDF via pymupdf |
+| Mimir Library — PDF ingestion | ✅ Done | TOC-aware chunking, section titles + page ranges on chunks |
+| Mimir Library — YouTube playlists | ✅ Done | Parent-child grouping, per-video completion tracking |
+| Mimir Library — Page type detection | ✅ Done | Auto-detects resource lists, triggers child ingest modal |
+| Mimir Library — External links modal | ✅ Done | Links from resource-list pages ingested as children |
+| Mimir Library — Rescrape All | ✅ Done | Bulk rescrape with real-time progress events; YouTube videos excluded |
+| Mimir Library — Re-embed PDFs | ✅ Done | Re-embeds from sections_json or raw_text without re-uploading |
+| Mimir Chat — RAG | ✅ Done | pgvector cosine search, Groq LLaMA 3.3-70b synthesis, section+page citations |
 | Mimir Chat — Reranking | ✅ Done | llama-3.1-8b-instant reranker, top-3 selection |
+| Mimir — Native Rust | ✅ Done | No Node.js sidecar — all ingest/RAG/rescrape in mimir.rs |
+| Embeddings | ✅ Done | pplx-embed-v1-0.6b (1024-dim) via OpenRouter |
 | Tree Generation — PRD | ✅ Done | Kimi-k2, concept graph, topo sort |
 | Tree Generation — GitHub repo | ✅ Done | GitHub API, source file analysis, concept graph |
-| Tree Rendering | ✅ Done | Custom SVG (YggdrasilTree.tsx), trunk/branch/leaf organic layout, node panel, checkpoint completion |
-| Auto-matching checkpoints to resources | ✅ Done | pgvector match on checkpoint title + description |
-| Universal Skill Tree — Galaxy | ✅ Done | 58 skills, 97 gaps — needs visual rebuild |
-| Jobs Page | ✅ Done | 11/100+ jobs added, skill gap detection |
+| Tree Rendering | ✅ Done | Custom Canvas (YggdrasilTree.tsx), trunk/branch/leaf organic layout, node panel, checkpoint completion |
+| Auto-matching checkpoints to resources | ✅ Done | pgvector cosine match on checkpoint title + description |
+| Universal Skill Tree — Galaxy | ✅ Done | Skills, dependencies, gap analysis |
+| Jobs Page | ✅ Done | Kanban + skill gap detection |
 | Resume Page | ✅ Done | Auto-parse, skill extraction |
-| Work Page | ✅ Done | Projects, skill extraction |
-| Quests Page | ✅ Done | Cross-tree quest view |
-
-### Known Issues
-
-- `parent_id` not propagating for external links modal children (datasciencehive 54 videos not grouped)
-- Mimir chat passes `null` for `treeId` and `nodeTitle` — not quest-aware
-- Tree nodes too cramped, labels truncate too early
-- 11 resources permanently unscrapable (paywalls, dead links, JS-only)
-- datasciencehive scrapes only 3 chunks without `force_dynamic`
+| Work Page | ✅ Done | Co-op tracker, skill extraction |
+| Daily Matrix | ✅ Done | Eisenhower 2x2 triage for quests + free-form tasks |
 
 ---
 
@@ -98,15 +95,16 @@ Yggdrasil puts it all in one place.
 |---|---|---|
 | Frontend | React 19 + TypeScript + Vite + Tailwind | ✅ |
 | Desktop | Tauri 2.0 | ✅ |
-| Main backend | Rust + Axum | ✅ |
+| Main backend | Rust + sqlx | ✅ |
 | Database | Postgres on Neon (pgvector enabled) | ✅ |
-| AI generation | Kimi-k2 via OpenRouter | ✅ |
-| AI chat / extraction | Groq — LLaMA 3.3-70b-versatile | ✅ |
-| Tree visualization | ReactFlow | ✅ |
+| AI generation | Kimi K2 + Gemini Flash via OpenRouter | ✅ |
+| AI chat / extraction | Groq — LLaMA 3.3-70b-versatile + 3.1-8b-instant | ✅ |
+| Tree visualization | Custom HTML Canvas (L-system) | ✅ |
 | Work/Skills galaxy | D3 force simulation | ✅ |
-| Mimir sidecar | Node.js + TypeScript (port 3001) | ✅ |
-| Embeddings | Transformers.js all-MiniLM-L6-v2 (384d) | ✅ |
-| Vector search | pgvector on Neon | ✅ |
+| Mimir | Native Rust in mimir.rs — no sidecar | ✅ |
+| PDF extraction | Python scraper /fetch-pdf with pymupdf (TOC-aware) | ✅ |
+| Embeddings | Perplexity pplx-embed-v1-0.6b (1024-dim) via OpenRouter | ✅ |
+| Vector search | pgvector on Neon — vector(1024) | ✅ |
 | GitHub integration | REST API via reqwest | ✅ |
 
 **Running cost: ~$0/month.** Only real cost is tree generation at ~$0.10/tree.
@@ -116,9 +114,10 @@ Yggdrasil puts it all in one place.
 ```
 Tauri App (React frontend)
        ↓
-Rust/Axum main API (port 3000)  ←→  Neon Postgres (pgvector enabled)
-       ↓                                     ↑
-Node.js Mimir sidecar (port 3001)  ──────────┘
+Rust backend (Tauri commands)  ←→  Neon Postgres (pgvector enabled)
+       ↓
+Python scraper (port 3002)     ←→  OpenRouter (embeddings + tree gen)
+                                ←→  Groq (chat synthesis + reranking)
 ```
 
 ### Database Rules
@@ -146,38 +145,19 @@ Node.js Mimir sidecar (port 3001)  ──────────┘
 
 ## Immediate Priorities (Now)
 
-### 1. Checkpoint Model Migration
+### 1. Ingest the Mimir Library
 
-Migrate the learning model from quests → checkpoints across the full stack:
+- Upload key PDFs (textbooks, papers) — section-aware chunking now preserves TOC structure
+- Ingest YouTube playlists for active learning tracks
+- Run Re-embed PDFs after any embedding model change
 
-- **DB migration** — alter `tree_nodes` leaf nodes: repurpose `tasks` JSONB to `{ mastery_criteria: string, exercises: string[], notes: string }`, drop `difficulty` and `estimated_hours` from the schema
-- **Rust** — update `save_tree_to_database()` in `brain.rs` to write the new checkpoint shape
-- **System prompts** — rewrite `build_system_prompt()` and `build_repo_system_prompt()` to generate concept checkpoints with mastery criteria and exercises instead of tasks
-- **Frontend** — update `YggdrasilTree.tsx` node panel to show mastery criteria, exercises, resources, and notes. Remove task checklist.
-- **Migration script** — convert all existing leaf `tasks` arrays into the new checkpoint shape (best-effort: existing task title → mastery criteria, task description → first exercise)
+### 2. Climb Trees
 
-### 2. Climb 4 Trees
+Generate and climb trees for active projects. Take notes in checkpoint panels. Use Mimir chat while climbing. Document every pain point.
 
-Generate and climb trees for:
+### 3. Add Remaining Jobs
 
-- `github.com/dhruvhptl/pluto` — N-body physics simulator (Python + Julia)
-- `duely` — TBD repo
-- `bloch-sphere` — TBD repo
-- `yggdrasil` — this app itself
-
-Take notes in checkpoint panels. Use Mimir chat while climbing. Document every pain point.
-
-### 3. Fix Parent-Child for External Links
-
-`handleIngestExternalLinks` in `ResourcesPage.tsx` is not passing `parent_id` to child ingests. Change `parentId` to `parent_id` in the invoke call.
-
-### 4. Dynamic Mimir Context
-
-Pass current checkpoint node title and tree ID to Mimir chat. `MimirChat.tsx` currently passes `null` for both.
-
-### 5. Add Remaining Jobs
-
-Only 11/100+ jobs entered. Target: 50+ before V2.
+Expand the job tracker. Target: 50+ jobs before reviewing skill gap analysis.
 
 ---
 
@@ -337,13 +317,11 @@ Not prioritized. Review after climbing the 4 trees.
 
 In order:
 
-1. Checkpoint model migration (DB + Rust + system prompts + frontend)
-2. Fix `parent_id` for external links modal children
-3. Add dynamic context to Mimir chat (pass `nodeTitle` + `treeId`)
-4. Generate trees for: pluto, duely, bloch-sphere, yggdrasil
-5. Climb all 4 trees — take notes, use Mimir, document pain points
-6. Add 50+ jobs to jobs page
-7. Review pain points → prioritize V2 features
+1. Ingest PDFs + playlists into Mimir library — section-aware chunking now works
+2. Generate trees for active projects
+3. Climb trees — take notes, use Mimir chat, document pain points
+4. Add 50+ jobs to jobs page
+5. Review pain points → prioritize V2 features
 
 ---
 

@@ -7,14 +7,8 @@ pub struct Database {
 
 impl Database {
     pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        // Load .env from src-tauri/ (CARGO_MANIFEST_DIR) regardless of CWD at runtime
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let env_path = std::path::Path::new(manifest_dir).join(".env");
-        dotenv::from_path(&env_path).ok();
-        dotenv::dotenv().ok(); // fallback: also check CWD
-
         let database_url = std::env::var("DATABASE_URL")
-            .expect("DATABASE_URL must be set in src-tauri/.env");
+            .expect("DATABASE_URL environment variable must be set");
 
         let pool = PgPoolOptions::new()
             .max_connections(5)

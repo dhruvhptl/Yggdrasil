@@ -7,7 +7,7 @@
     "dev": "vite",
     "dev:mimir": "npm --prefix sidecar start",
     "dev:scraper": "python scraper/main.py",
-    "dev:all": "concurrently --names vite,mimir,scraper \"vite\" \"npm --prefix sidecar start\" \"python scraper/main.py\"",
+    "dev:all": "concurrently --names vite,scraper \"vite\" \"python scraper/main.py\"",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",

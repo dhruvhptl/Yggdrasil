@@ -16,5 +16,11 @@ chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json"] }
 reqwest = { version = "0.12", features = ["json"] }
-dotenv = "0.15"
 base64 = "0.21"
+
+# Mimir — embeddings via Perplexity API + RAG (replaces Node.js sidecar)
+sha2 = "0.10"
+hex = "0.4"
+scraper = "0.22"
+ego-tree = "0.10"
+pdf-extract = "0.7"

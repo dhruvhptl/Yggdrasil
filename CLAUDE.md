@@ -8,17 +8,17 @@ Read `PRD.md` for the full vision. This file is your technical bible.
 
 ---
 
-## Current State (v2.0)
+## Current State (v2.1)
 
 **All core features shipped (Phases 0-5 complete):**
 - Project creation, listing, edit, delete
 - AI tree generation from PRD text and GitHub repo URL (two-phase: concept graph → tree)
 - Custom canvas-based organic tree renderer (L-system branches, node ornaments at tips)
 - Quest tracking with checkpoint completion, notes, unlock mechanics, progress cascade
-- Mimir sidecar: URL/PDF/text ingestion, chunking, embeddings, pgvector storage
-- Mimir chat: RAG assistant with tree-aware system prompt, reranking, source citations
+- Mimir: URL/PDF/text ingestion, TOC-aware chunking, 1024-dim embeddings, pgvector storage — fully in Rust, no sidecar
+- Mimir chat: RAG assistant with tree-aware system prompt, reranking, source citations (section title + page range)
 - Auto-matching resources to quest nodes on tree generation
-- Resource library: search, tag filters, type/sort dropdowns, auto-tagging, completion tracking
+- Resource library: search, tag filters, type/sort dropdowns, auto-tagging, completion tracking, per-video playlist completion
 - Work page: co-op tracker + D3 force galaxy visualization + AI skill extraction
 - Jobs page: kanban board + JD analysis + skill demand analytics + follow-up tracker
 - Resume page: paste/upload resume, AI parsing, skill pre-population
@@ -27,7 +27,7 @@ Read `PRD.md` for the full vision. This file is your technical bible.
 - Daily Eisenhower Matrix: 2x2 quadrant triage for quests + free-form tasks, day navigation
 - Tree export as ZIP
 - Postgres on Neon with pgvector
-- All migrations (001-016) run automatically on startup
+- All migrations (001-020) run automatically on startup
 
 ---
 
@@ -61,7 +61,7 @@ Read `PRD.md` for the full vision. This file is your technical bible.
 │   │   ├── commands.rs                # Project CRUD
 │   │   ├── tree_commands.rs           # Tree/node CRUD + quest completion + unlock mechanics
 │   │   ├── brain.rs                   # Groq AI generation + GitHub repo analysis
-│   │   ├── mimir.rs                   # Mimir resource CRUD, tags, completion, chat proxy
+│   │   ├── mimir.rs                   # Full Mimir implementation: ingest, RAG, rescrape, tags, completion
 │   │   ├── work_commands.rs           # Co-op/topic/resource/skill commands
 │   │   ├── job_commands.rs            # Job application commands
 │   │   ├── idea_commands.rs           # Ideas CRUD + promote to project
@@ -70,22 +70,12 @@ Read `PRD.md` for the full vision. This file is your technical bible.
 │   │   ├── daily_commands.rs          # Daily Eisenhower Matrix commands
 │   │   ├── export_commands.rs         # Tree ZIP export
 │   │   └── database.rs               # PgPool connection + migrations
-│   ├── migrations/                    # Auto-run on startup, sequential (001-016)
-│   └── .env                           # DATABASE_URL + API keys (never commit)
-├── sidecar/                           # Node.js Mimir service
-│   ├── src/
-│   │   └── routes/
-│   │       ├── ingest.ts              # URL/PDF/text ingestion + embeddings
-│   │       ├── chat.ts                # RAG chat with tree-aware context
-│   │       ├── match.ts               # Resource-to-node matching
-│   │       ├── resources.ts           # Resource listing
-│   │       ├── discover.ts            # Link discovery
-│   │       ├── playlist.ts            # YouTube playlist ingestion
-│   │       └── rescrape.ts            # Re-scrape stale resources
-│   └── package.json
+│   ├── migrations/                    # Auto-run on startup, sequential (001-020)
+│   └── capabilities/
+│       └── default.json               # Tauri 2 capability grants (includes core:event:allow-listen)
 ├── scraper/                           # Python FastAPI scraper (port 3002)
-│   ├── main.py
-│   └── requirements.txt
+│   ├── main.py                        # /fetch, /fetch-pdf, /fetch-playlist, /discover, /health
+│   └── requirements.txt               # includes pymupdf
 └── dev.sh                             # Bitwarden-based env loader + launch
 ```
 
@@ -102,10 +92,10 @@ Read `PRD.md` for the full vision. This file is your technical bible.
 | AI generation | OpenRouter (Kimi K2 for trees, Gemini Flash for concept graphs) + Groq (LLaMA for chat/skills) |
 | Tree renderer | Custom HTML Canvas (L-system procedural branches) |
 | Work/Skills galaxy | D3 force simulation |
-| Mimir sidecar | Node.js + TypeScript (port 3001) |
-| Scraper | Python FastAPI (port 3002) |
-| Embeddings | Transformers.js all-MiniLM-L6-v2 (384 dimensions) |
-| Vector search | pgvector on Neon |
+| Mimir | Native Rust in mimir.rs — no sidecar process |
+| Scraper | Python FastAPI (port 3002) — URL scraping, PDF extraction (pymupdf), playlist |
+| Embeddings | Perplexity pplx-embed-v1-0.6b (1024 dimensions) via OpenRouter |
+| Vector search | pgvector on Neon — vector(1024) column |
 | GitHub | REST API via reqwest |
 
 ---
@@ -126,9 +116,14 @@ disciplines       -- id, name, description, color
 ### Mimir tables
 ```sql
 mimir_resources   -- id, title, url, type, status, user_notes, content_hash, parent_id,
-                  -- tags TEXT[], is_completed, created_at, updated_at
-mimir_chunks      -- id, resource_id FK, content, chunk_index
-mimir_embeddings  -- id, chunk_id FK, embedding vector(384)
+                  -- tags TEXT[], is_completed, created_at, updated_at,
+                  -- raw_text TEXT,          ← full extracted text (PDFs only)
+                  -- sections_json JSONB     ← TOC-aware section structure (PDFs only)
+mimir_chunks      -- id, resource_id FK, content, chunk_index,
+                  -- section_title TEXT,     ← heading this chunk falls under
+                  -- page_start INT,         ← first page of chunk content
+                  -- page_end INT            ← last page of chunk content
+mimir_embeddings  -- id, chunk_id FK, embedding vector(1024)
 mimir_node_links  -- id, resource_id FK, node_id FK, relevance_score
 ```
 
@@ -212,11 +207,17 @@ const tasks = Array.isArray(node.tasks)
 
 // Loading states on all async operations
 const [loading, setLoading] = useState(false);
+
+// Use listen() from @tauri-apps/api/event for Tauri events
+import { listen } from '@tauri-apps/api/event';
+const unlisten = await listen<PayloadType>('event-name', ({ payload }) => { ... });
+// Always call unlisten() when done — ideally inside the complete handler, not finally
 ```
 
 ### Never Do
 - Never hardcode `DATABASE_URL`
 - Never commit `.env` files
+- Never use dotenvy/load_env in Rust — env vars are loaded by dev.sh before the process starts
 - Never use `?N` placeholders (Postgres uses `$N`)
 - Never store JSON as TEXT (always JSONB)
 - Never generate quests that are implementation tasks ("Build X", "Implement Y")
@@ -238,7 +239,7 @@ const result = await invoke<ReturnType>('command_name', { paramName: value });
 3. Call from frontend with `invoke('command_name', { params })`
 
 ### Add a Migration
-Create `src-tauri/migrations/NNN_description.sql` — runs automatically on startup. Never modify existing migrations. Current highest: 016.
+Create `src-tauri/migrations/NNN_description.sql` — runs automatically on startup. Never modify existing migrations. Current highest: **020**.
 
 ### Add a New Page
 1. Create `src/pages/NewPage.tsx`
@@ -249,30 +250,31 @@ Create `src-tauri/migrations/NNN_description.sql` — runs automatically on star
 ```bash
 bash dev.sh
 ```
-This unlocks Bitwarden, exports all env vars, and runs `npm run tauri dev`.
+This unlocks Bitwarden, exports all env vars into the process, and runs `npm run tauri dev`.
+The Rust backend and Python scraper both read env vars from the process environment — no `.env` file is required at runtime.
 
 ---
 
 ## Environment Variables
 
+All vars are exported by `dev.sh` from Bitwarden before the process starts. No `.env` file is needed at runtime.
+
 ```bash
-# src-tauri/.env (for direct runs without dev.sh)
+# Fetched from Bitwarden by dev.sh
 DATABASE_URL=postgresql://...neon.tech/neondb?sslmode=require
 GROQ_API_KEY=gsk_...
 GITHUB_TOKEN=ghp_...
-
-# Set by dev.sh (OpenRouter for tree generation)
 OPENROUTER_API_KEY=sk-or-...
+YOUTUBE_API_KEY=...
+
+# Derived in dev.sh
 TREE_GEN_BASE_URL=https://openrouter.ai/api/v1/chat/completions
 TREE_GEN_API_KEY=$OPENROUTER_API_KEY
 TREE_GEN_MODEL=moonshotai/kimi-k2
 CONCEPT_GRAPH_MODEL=google/gemini-2.5-flash
 CONCEPT_GRAPH_BASE_URL=https://openrouter.ai/api/v1/chat/completions
 CONCEPT_GRAPH_API_KEY=$OPENROUTER_API_KEY
-YOUTUBE_API_KEY=...
-
-# Sidecar reads DATABASE_URL from src-tauri/.env
-MIMIR_PORT=3001
+MIMIR_PORT=3001   # unused — Mimir is now native Rust, no port
 ```
 
 ---
@@ -309,27 +311,69 @@ Tree generation uses a two-phase pipeline via OpenRouter:
 
 ---
 
-## Mimir Sidecar
+## Mimir (Native Rust)
 
-Runs on port 3001. Reads `DATABASE_URL` from `src-tauri/.env`.
+Mimir is fully implemented in `src-tauri/src/mimir.rs`. There is no Node.js sidecar.
+
+### Embedding Pipeline
+- Model: `perplexity/pplx-embed-v1-0.6b` via OpenRouter (`https://openrouter.ai/api/v1/embeddings`)
+- Output: 1024-dim float32 vector, L2-normalized
+- Storage: pgvector `vector(1024)` column (migration 017 widened from 384)
+- One `reqwest::Client` created per ingest operation and passed through to `get_embedding()`
+- Do NOT add `"dimensions"` to the request body — pplx-embed does not support MRL truncation via API
+
+### PDF Ingestion Pipeline
+1. Frontend sends base64 PDF to `ingest_mimir_pdf` Tauri command
+2. Rust computes SHA256 for dedup, then POSTs base64 to Python scraper `POST /fetch-pdf`
+3. Python scraper (pymupdf / fitz):
+   - Tries `doc.get_toc()` first — if ≥ 2 entries, uses TOC as authoritative section structure
+   - Falls back to font-size heuristic heading detection if TOC is absent
+   - Returns `{ text, pages, sections: [{title, heading_level, page_start, page_end, blocks}] }`
+4. Rust stores: `raw_text` (full text), `sections_json` (JSONB structure) on the resource row
+5. If `section_count > 1`: `store_sections_and_embeddings()` — 400-word sliding window with 50-word overlap, block-level page provenance per chunk, `section_title` set on every chunk
+6. If flat fallback: `store_chunks_and_embeddings()` — standard chunking, no section metadata
+
+### Re-embedding PDFs
+`reembed_pdfs` command re-embeds all PDF resources from stored data without re-uploading:
+- Prefers `sections_json` → re-chunks with section structure preserved
+- Falls back to `raw_text` → flat chunking (warns that section structure is lost)
+- Skips if neither is present (pre-migration PDFs)
+
+### Rescraping
+- `rescrape_all` excludes YouTube URLs (`youtube.com/watch`, `youtu.be/`) at the SQL level
+- `rescrape_one` also checks and skips YouTube videos with a log message
+- Playlist video children (type=webpage with parent type=text) are excluded from bulk rescrape
+
+### RAG Chat Sources
+`MimirChatSource` includes:
+- `sectionTitle: string | null` — heading the matched chunk falls under
+- `pageStart: number | null` — first page of the chunk
+- `pageEnd: number | null` — last page of the chunk
+
+### Tauri Capabilities
+`src-tauri/capabilities/default.json` grants:
+- `core:default` — all standard Tauri core APIs
+- `core:event:default`, `core:event:allow-listen`, `core:event:allow-unlisten`, `core:event:allow-emit` — required for `listen()` from frontend (used by rescrape-progress events)
+- `opener:default`
+
+### Known Limitations
+- Scanned/image-based PDFs fail (no OCR) — user must paste text instead
+- YouTube video children cannot be re-scraped (transcript was fetched at ingest time)
+
+---
+
+## Python Scraper (port 3002)
 
 ### Endpoints
-- `POST /ingest/url` — scrape URL, chunk, embed, store
-- `POST /ingest/pdf` — parse PDF (text-based only), chunk, embed, store
-- `POST /ingest/text` — chunk text directly, embed, store
-- `POST /match/:nodeId` — find top 5 matching resources for a quest node
-- `POST /chat` — RAG chat: embed query, pgvector search, rerank, inject tree structure if treeId present, Groq synthesis
-- `GET /resources` — list all resources with tags, completion status, node counts
-- `DELETE /resources/:id` — remove resource + chunks + embeddings
-- `POST /discover` — discover links from resource content
-- `POST /playlist` — ingest YouTube playlist
-- `POST /rescrape/:id` — re-scrape a resource
-- `POST /rescrape/all` — re-scrape all stale resources
+- `POST /fetch` — scrape URL with 3-tier fetcher (AsyncFetcher → StealthyFetcher → DynamicFetcher), YouTube transcript detection
+- `POST /fetch-pdf` — pymupdf PDF extraction with TOC-aware section detection, returns `{text, pages, sections}`
+- `POST /fetch-playlist` — YouTube Data API v3 playlist metadata (requires `YOUTUBE_API_KEY`)
+- `POST /discover` — extract internal links from a page (max 50)
+- `GET /health` — liveness check
 
-### Known limitations
-- Scanned/image-based PDFs fail (no OCR) — user must paste text instead
-- Body size limit: 50MB (configured in Express setup)
-- Null bytes stripped from PDF text before storage
+### Notes
+- env vars are loaded by dev.sh before the scraper process starts — no dotenv call inside main.py
+- `pymupdf` (`fitz`) is required — run `pip install pymupdf` or install from requirements.txt
 
 ---
 

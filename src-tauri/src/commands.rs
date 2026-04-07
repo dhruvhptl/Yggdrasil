@@ -24,18 +24,6 @@ pub struct Discipline {
     pub color: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Skill {
-    pub id: String,
-    pub name: String,
-    pub description: String,
-    pub discipline_id: String,
-    pub proficiency_level: String,
-    pub progress: u8,
-    pub is_unlocked: bool,
-    pub prerequisites: Vec<String>,
-    pub project_ids: Vec<String>,
-}
 
 #[tauri::command]
 pub async fn create_project(

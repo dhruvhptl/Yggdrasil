@@ -309,11 +309,8 @@ pub async fn extract_skills(
     let notes: Option<String> = row.try_get("notes").map_err(|e| e.to_string())?;
 
     // Load API key
-    let env_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".env");
-    dotenv::from_path(&env_path).ok();
-    dotenv::dotenv().ok();
     let api_key = std::env::var("GROQ_API_KEY")
-        .map_err(|_| "GROQ_API_KEY not set in src-tauri/.env".to_string())?;
+        .map_err(|_| "GROQ_API_KEY environment variable not set".to_string())?;
 
     let system_prompt = "You are a skill extractor. Given a research resource title and learner \
         notes, return a JSON array of skill tags this resource demonstrates. Include the specific \

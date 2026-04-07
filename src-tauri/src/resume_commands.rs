@@ -157,11 +157,8 @@ pub async fn parse_resume(
     println!("\n=== Parse Resume ===");
     println!("Text length: {} chars\n", text.len());
 
-    let env_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".env");
-    dotenv::from_path(&env_path).ok();
-    dotenv::dotenv().ok();
     let api_key = std::env::var("GROQ_API_KEY")
-        .map_err(|_| "GROQ_API_KEY not found in .env file".to_string())?;
+        .map_err(|_| "GROQ_API_KEY environment variable not set".to_string())?;
 
     let system_prompt = "You extract structured data from resumes. Return ONLY valid JSON, nothing else.";
 

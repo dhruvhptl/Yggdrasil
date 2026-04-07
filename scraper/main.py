@@ -1,15 +1,12 @@
 import asyncio
+import base64
 import json
 import os
-import pathlib
 import urllib.request
 import sys
 
 sys.stdout.reconfigure(encoding='utf-8')
-from dotenv import load_dotenv
-
-# Load env vars from src-tauri/.env so YOUTUBE_API_KEY etc. are available
-load_dotenv(pathlib.Path(__file__).parent.parent / "src-tauri" / ".env")
+# env vars are loaded by dev.sh before this process starts
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -19,6 +16,7 @@ from urllib.parse import urlparse, urljoin, parse_qs
 import uvicorn
 from youtube_transcript_api import YouTubeTranscriptApi
 from googleapiclient.discovery import build as googleapi_build
+import fitz  # pymupdf
 
 app = FastAPI()
 
@@ -72,6 +70,30 @@ class PlaylistResponse(BaseModel):
     playlist_title: str
     playlist_id: str
     videos: list[PlaylistVideo]
+
+
+class PdfFetchRequest(BaseModel):
+    pdf_base64: str
+    filename: str = ""
+
+
+class PdfBlock(BaseModel):
+    text: str
+    page: int
+
+
+class PdfSection(BaseModel):
+    title: str
+    heading_level: str  # "chapter" | "section" | "flat"
+    page_start: int
+    page_end: int
+    blocks: list[PdfBlock]
+
+
+class PdfFetchResponse(BaseModel):
+    text: str
+    pages: int
+    sections: list[PdfSection]
 
 
 def extract_text(page) -> str:
@@ -655,6 +677,298 @@ async def discover_url(request: DiscoverRequest):
     links = extract_links(page, url)
     print(f"[scraper] Discovered {len(links)} links from {url}")
     return DiscoverResponse(source_url=url, links=[DiscoveredLink(**l) for l in links])
+
+
+MIN_HEADINGS_FOR_STRUCTURE = 2
+
+# Numbered heading patterns: "1", "1.2", "1.2.3", "Chapter 3", "Section 4.1"
+# Trailing \S? is optional — a span may contain only the number (e.g. "2.3") with
+# the title text in a separate span on the same line.
+_NUMBERED_HEADING_RE = re.compile(
+    r"^(?:(?:Chapter|Section|Part|Appendix)\s+)?\d+(?:\.\d+)*\.?\s*\S?",
+    re.IGNORECASE,
+)
+
+def _is_chapter_level(text: str) -> bool:
+    """True for top-level headings: 'Chapter N', 'Part N', bare single digit, or 'N.'"""
+    return bool(re.match(
+        r"^(?:Chapter|Part|Appendix)\s+\d+|^\d+\.\s+\S|^\d+\s+[A-Z]",
+        text.strip(), re.IGNORECASE,
+    ))
+
+
+@app.post("/fetch-pdf", response_model=PdfFetchResponse)
+async def fetch_pdf(request: PdfFetchRequest):
+    try:
+        pdf_bytes = base64.b64decode(request.pdf_base64)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Invalid base64: {e}")
+
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Could not open PDF: {e}")
+
+    page_count = doc.page_count
+
+    # ── Pass 1: collect all spans with page provenance ──────────────────────
+    all_spans: list[dict] = []          # {text, size, flags, bbox, page_no, page_h}
+    # line_size_counts: how many lines are dominated by each font size.
+    # Using line-dominance rather than character volume avoids math equation
+    # micro-spans (subscripts, symbols) skewing the body size estimate.
+    line_size_counts: dict[float, int] = {}
+
+    for page_no, page in enumerate(doc, start=1):
+        page_h = page.rect.height
+        blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
+        for blk in blocks:
+            if blk.get("type") != 0:   # type 0 = text block
+                continue
+            for line in blk.get("lines", []):
+                line_char_by_size: dict[float, int] = {}
+                for span in line.get("spans", []):
+                    raw = span.get("text", "").replace("\0", "").strip()
+                    if not raw:
+                        continue
+                    size = round(span["size"], 1)
+                    line_char_by_size[size] = line_char_by_size.get(size, 0) + len(raw)
+                    all_spans.append({
+                        "text": raw,
+                        "size": size,
+                        "flags": span.get("flags", 0),
+                        "bbox": span["bbox"],          # (x0, y0, x1, y1)
+                        "page_no": page_no,
+                        "page_h": page_h,
+                    })
+                # credit this line to whichever size has the most characters on it
+                if line_char_by_size:
+                    dominant = max(line_char_by_size, key=lambda s: line_char_by_size[s])
+                    line_size_counts[dominant] = line_size_counts.get(dominant, 0) + 1
+
+    # Get TOC before closing — fitz returns [[level, title, page], ...]
+    toc = doc.get_toc(simple=True)
+    doc.close()
+
+    if not all_spans:
+        raise HTTPException(status_code=422, detail="Could not extract meaningful text from PDF")
+
+    # ── Body font size = size dominating the most lines ──────────────────────
+    # Line-dominance is robust against equation micro-spans inflating small sizes.
+    body_size = max(line_size_counts, key=lambda s: line_size_counts[s]) if line_size_counts else 10.0
+
+    # ── Filter repeated header/footer text (appears on 3+ pages at same y%) ─
+    # Key: (rounded_y_pct, text) → set of page numbers
+    _pos_text_pages: dict[tuple, set] = {}
+    for sp in all_spans:
+        y_pct = sp["bbox"][1] / sp["page_h"] if sp["page_h"] else 0.5
+        if y_pct < 0.08 or y_pct > 0.92:
+            key = (round(y_pct, 2), sp["text"])
+            _pos_text_pages.setdefault(key, set()).add(sp["page_no"])
+    repeated = {text for (_, text), pages in _pos_text_pages.items() if len(pages) >= 3}
+
+    # ── TOC fast-path: use embedded TOC if it has enough entries ─────────────
+    # doc.get_toc() returns [[level, title, page], ...] (1-indexed pages).
+    # This is authoritative for well-structured PDFs like textbooks and reports.
+    if len(toc) >= MIN_HEADINGS_FOR_STRUCTURE:
+        print(f"[scraper/pdf-toc] Using embedded TOC: {len(toc)} entries")
+
+        # Build sections from TOC entries, assign page ranges
+        toc_sections: list[dict] = []
+        for i, (level, title, page_start) in enumerate(toc):
+            page_end = toc[i + 1][2] - 1 if i + 1 < len(toc) else page_count
+            page_end = max(page_start, page_end)  # guard against same-page entries
+            toc_sections.append({
+                "title": title.strip(),
+                "heading_level": "chapter" if level == 1 else "section",
+                "page_start": page_start,
+                "page_end": page_end,
+                "blocks": [],
+            })
+
+        # Assign body spans to sections by page range
+        for sp in all_spans:
+            if sp["text"] in repeated:
+                continue
+            p = sp["page_no"]
+            for sec in toc_sections:
+                if sec["page_start"] <= p <= sec["page_end"]:
+                    sec["blocks"].append({"text": sp["text"], "page": p})
+                    break
+
+        # Build output, skipping empty sections
+        sections_out = [
+            PdfSection(
+                title=sec["title"],
+                heading_level=sec["heading_level"],
+                page_start=sec["page_start"],
+                page_end=sec["page_end"],
+                blocks=[PdfBlock(text=b["text"], page=b["page"]) for b in sec["blocks"]],
+            )
+            for sec in toc_sections if sec["blocks"]
+        ]
+
+        flat_text = "\n\n".join(
+            sec["title"] + "\n" + " ".join(b["text"] for b in sec["blocks"])
+            for sec in toc_sections if sec["blocks"]
+        ).strip()
+
+        if len(flat_text) < 50:
+            raise HTTPException(status_code=422, detail="Could not extract meaningful text from PDF")
+
+        print(
+            f"[scraper] PDF '{request.filename}': {page_count} pages, "
+            f"{len(toc)} TOC entries → {len(sections_out)} sections, {len(flat_text)} chars"
+        )
+        return PdfFetchResponse(text=flat_text, pages=page_count, sections=sections_out)
+
+    # ── Pass 2: classify each span as heading or body block (font heuristics) ─
+    # A span is bold if bit 4 (16) of flags is set
+    def is_bold(flags: int) -> bool:
+        return bool(flags & 16)
+
+    def classify_span(sp: dict) -> str:
+        """Returns 'chapter', 'section', or 'body'."""
+        if sp["text"] in repeated:
+            return "body"
+        size_diff = sp["size"] - body_size
+        bold = is_bold(sp["flags"])
+        text = sp["text"].strip()
+        numbered = bool(_NUMBERED_HEADING_RE.match(text))
+        # Reject pure numeric strings — page numbers, footnote markers, equation labels
+        if numbered and not re.search(r'[A-Za-z]', text):
+            numbered = False
+
+        # Must be visually heading-sized or bold (relaxed from <=2 to <=1)
+        if size_diff <= 1 and not bold:
+            return "body"
+        # Unnumbered headings require a larger size diff (relaxed from <=4 to <=3)
+        if not numbered and size_diff <= 3:
+            return "body"
+
+        if _is_chapter_level(text):
+            return "chapter"
+        return "section"
+
+    # ── Merge consecutive body spans into paragraph blocks ───────────────────
+    # We group by (page_no) continuity; a heading resets the group.
+    headings: list[dict] = []   # {text, level, page_no}
+    body_blocks: list[dict] = []  # accumulated blocks between headings
+
+    # We'll build sections as we scan
+    raw_sections: list[dict] = []   # {title, heading_level, blocks:[{text,page}]}
+    current_title = "[Start]"
+    current_level = "flat"
+    current_blocks: list[dict] = []
+
+    for sp in all_spans:
+        cls = classify_span(sp)
+        if cls in ("chapter", "section"):
+            if current_blocks or current_title != "[Start]":
+                raw_sections.append({
+                    "title": current_title,
+                    "heading_level": current_level,
+                    "blocks": list(current_blocks),
+                })
+            current_title = sp["text"]
+            current_level = cls
+            current_blocks = []
+        else:
+            if sp["text"] not in repeated:
+                current_blocks.append({"text": sp["text"], "page": sp["page_no"]})
+
+    # Flush last section
+    if current_blocks:
+        raw_sections.append({
+            "title": current_title,
+            "heading_level": current_level,
+            "blocks": list(current_blocks),
+        })
+
+    # ── Debug: report top 20 heading candidates and why they passed/failed ──────
+    # Collect all spans that were above body size or bold (potential headings)
+    candidates_debug: list[dict] = []
+    for sp in all_spans:
+        if sp["text"] in repeated:
+            continue
+        size_diff = sp["size"] - body_size
+        bold = is_bold(sp["flags"])
+        if size_diff <= 0 and not bold:
+            continue  # no signal at all — skip from debug output
+        text = sp["text"].strip()
+        numbered = bool(_NUMBERED_HEADING_RE.match(text))
+        fail_reason = None
+        if size_diff <= 2 and not bold:
+            fail_reason = f"size_diff={size_diff:.1f}<=2 and not bold"
+        elif not numbered and size_diff <= 4:
+            fail_reason = f"unnumbered and size_diff={size_diff:.1f}<=4"
+        candidates_debug.append({
+            "text": text[:80],
+            "size": sp["size"],
+            "size_diff": size_diff,
+            "bold": bold,
+            "numbered": numbered,
+            "page": sp["page_no"],
+            "result": fail_reason or ("chapter" if _is_chapter_level(text) else "section"),
+        })
+
+    # Sort by size_diff desc, take top 20
+    candidates_debug.sort(key=lambda x: x["size_diff"], reverse=True)
+    print(f"[scraper/pdf-debug] body_size={body_size}pt, repeated_strings={len(repeated)}, "
+          f"heading_candidates={len(candidates_debug)}")
+    for c in candidates_debug[:20]:
+        status = "✅ PASS" if c["result"] in ("chapter", "section") else f"❌ FAIL: {c['result']}"
+        print(
+            f"  {status} | p{c['page']} | size={c['size']}pt (diff={c['size_diff']:+.1f}) | "
+            f"bold={c['bold']} numbered={c['numbered']} | \"{c['text']}\""
+        )
+    detected = len(real_headings := [s for s in raw_sections if s["heading_level"] in ("chapter", "section")])
+    print(f"[scraper/pdf-debug] {detected} headings passed → "
+          f"{'structured' if detected >= MIN_HEADINGS_FOR_STRUCTURE else 'FLAT FALLBACK'}")
+
+    # ── Determine whether structure is meaningful ─────────────────────────────
+
+    if len(real_headings) < MIN_HEADINGS_FOR_STRUCTURE:
+        # Fall back: single flat section with all text
+        flat_text = " ".join(
+            sp["text"] for sp in all_spans if sp["text"] not in repeated
+        ).strip()
+        if len(flat_text) < 50:
+            raise HTTPException(status_code=422, detail="Could not extract meaningful text from PDF")
+        sections_out = [PdfSection(
+            title="Full Text",
+            heading_level="flat",
+            page_start=1,
+            page_end=page_count,
+            blocks=[PdfBlock(text=flat_text, page=1)],
+        )]
+        print(f"[scraper] PDF '{request.filename}': {page_count} pages, flat fallback ({len(flat_text)} chars)")
+        return PdfFetchResponse(text=flat_text, pages=page_count, sections=sections_out)
+
+    # ── Build final sections with page provenance ─────────────────────────────
+    sections_out: list[PdfSection] = []
+    for sec in raw_sections:
+        if not sec["blocks"]:
+            continue
+        pages_in_sec = [b["page"] for b in sec["blocks"]]
+        sections_out.append(PdfSection(
+            title=sec["title"],
+            heading_level=sec["heading_level"],
+            page_start=min(pages_in_sec),
+            page_end=max(pages_in_sec),
+            blocks=[PdfBlock(text=b["text"], page=b["page"]) for b in sec["blocks"]],
+        ))
+
+    flat_text = "\n\n".join(
+        sec["title"] + "\n" + " ".join(b["text"] for b in sec["blocks"])
+        for sec in raw_sections if sec["blocks"]
+    ).strip()
+
+    heading_count = len([s for s in sections_out if s.heading_level in ("chapter", "section")])
+    print(
+        f"[scraper] PDF '{request.filename}': {page_count} pages, "
+        f"{heading_count} headings, {len(sections_out)} sections, {len(flat_text)} chars"
+    )
+    return PdfFetchResponse(text=flat_text, pages=page_count, sections=sections_out)
 
 
 @app.get("/health")
