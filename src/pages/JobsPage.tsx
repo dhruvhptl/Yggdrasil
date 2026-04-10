@@ -4,7 +4,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { DragDropContext, Droppable, Draggable, DropResult } from '@hello-pangea/dnd';
-import { ExternalLink, Plus, X, RefreshCw, ChevronDown, Calendar } from 'lucide-react';
+import { ExternalLink, Plus, X, RefreshCw, ChevronDown, Calendar, Trash2 } from 'lucide-react';
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
 
@@ -27,6 +27,7 @@ interface JobApplication {
   ratingRole?: number;
   season: string;
   createdAt: string;
+  followUpDone: boolean;
 }
 
 interface JobSkill {
@@ -78,7 +79,7 @@ const STATUS_COLORS: Record<Status, string> = {
   rejected: '#ef4444',
 };
 
-const SEASONS = ['Winter 2026', 'Fall 2025', 'Summer 2025', 'Winter 2025'];
+const DEFAULT_SEASONS = ['Winter 2026', 'Fall 2025', 'Summer 2025', 'Winter 2025'];
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -126,6 +127,8 @@ function computeOverall(
 }
 
 // Compact styled date input with calendar icon prefix.
+// Uses defaultValue + onBlur so partial keystrokes don't fire updates mid-entry.
+// key={value} resets the uncontrolled input when switching to a different job.
 function DateField({ label, value, onChange }: { label: string; value?: string; onChange: (v: string | null) => void }) {
   return (
     <label className="block">
@@ -133,9 +136,10 @@ function DateField({ label, value, onChange }: { label: string; value?: string; 
       <div className="mt-1 relative flex items-center bg-slate-800 border border-slate-700 rounded-lg overflow-hidden focus-within:border-emerald-600/50 focus-within:ring-1 focus-within:ring-emerald-600/20 transition-all">
         <Calendar className="absolute left-2.5 w-3 h-3 text-slate-500 pointer-events-none flex-shrink-0" />
         <input
+          key={value ?? ''}
           type="date"
           defaultValue={isoToDateInput(value)}
-          onChange={(e) => onChange(e.target.value || null)}
+          onBlur={(e) => onChange(e.target.value || null)}
           className="w-full bg-transparent pl-8 pr-2 py-1.5 text-white text-xs focus:outline-none [color-scheme:dark]"
         />
       </div>
@@ -276,9 +280,24 @@ interface DetailPanelProps {
   onClose: () => void;
   onUpdate: (updated: JobApplication) => void;
   onSkillsRefresh: (skills: JobSkill[]) => void;
+  onDelete: (id: string) => void;
 }
 
-function JobDetailPanel({ job, skills, onClose, onUpdate, onSkillsRefresh }: DetailPanelProps) {
+function JobDetailPanel({ job, skills, onClose, onUpdate, onSkillsRefresh, onDelete }: DetailPanelProps) {
+  const [deleting, setDeleting] = useState(false);
+
+  async function handleDelete() {
+    if (!window.confirm(`Delete ${job.company} — ${job.position}?`)) return;
+    setDeleting(true);
+    try {
+      await invoke('delete_job', { id: job.id });
+      onDelete(job.id);
+    } catch (err) {
+      console.error('delete_job failed:', err);
+    } finally {
+      setDeleting(false);
+    }
+  }
   const [notes, setNotes] = useState(job.notes ?? '');
   const [jd, setJd] = useState(job.jobDescription ?? '');
   const [extracting, setExtracting] = useState(false);
@@ -446,6 +465,9 @@ function JobDetailPanel({ job, skills, onClose, onUpdate, onSkillsRefresh }: Det
               <ExternalLink className="w-4 h-4" />
             </a>
           )}
+          <button onClick={handleDelete} disabled={deleting} title="Delete job" className="text-slate-400 hover:text-red-400 disabled:opacity-40 transition-colors">
+            <Trash2 className="w-4 h-4" />
+          </button>
           <button onClick={onClose} className="text-slate-400 hover:text-white transition-colors">
             <X className="w-4 h-4" />
           </button>
@@ -908,7 +930,7 @@ function FollowUpsView({ jobs, onJobClick, onMarked }: FollowUpsViewProps) {
   const [marking, setMarking] = useState<string | null>(null);
 
   const relevant = jobs
-    .filter((j) => j.dateFollowUp || j.status === 'applied' || j.status === 'interviewing')
+    .filter((j) => !j.followUpDone && (j.dateFollowUp || j.status === 'applied' || j.status === 'interviewing'))
     .sort((a, b) => {
       const ta = a.dateFollowUp ? new Date(a.dateFollowUp).getTime() : Infinity;
       const tb = b.dateFollowUp ? new Date(b.dateFollowUp).getTime() : Infinity;
@@ -990,7 +1012,8 @@ type View = 'board' | 'analytics' | 'followups';
 
 export default function JobsPage() {
   const [view, setView] = useState<View>('board');
-  const [selectedSeason, setSelectedSeason] = useState<string>(SEASONS[0]);
+  const [selectedSeason, setSelectedSeason] = useState<string>(DEFAULT_SEASONS[0]);
+  const [allSeasons, setAllSeasons] = useState<string[]>(DEFAULT_SEASONS);
   const [jobs, setJobs] = useState<JobApplication[]>([]);
   const [skillDemand, setSkillDemand] = useState<SkillDemand[]>([]);
   const [workSkillNames, setWorkSkillNames] = useState<Set<string>>(new Set());
@@ -1009,6 +1032,17 @@ export default function JobsPage() {
       ]);
       setJobs(j);
       setSkillDemand(sd);
+      // Merge seasons from all loaded jobs with defaults, preserving order
+      const allJobSeasons = invoke<JobApplication[]>('get_jobs', { season: null })
+        .catch(() => [] as JobApplication[])
+        .then((all: JobApplication[]) => {
+          const seen = new Set<string>();
+          const merged: string[] = [];
+          for (const s of DEFAULT_SEASONS) { if (!seen.has(s)) { seen.add(s); merged.push(s); } }
+          for (const job of all) { if (!seen.has(job.season)) { seen.add(job.season); merged.push(job.season); } }
+          setAllSeasons(merged);
+        });
+      void allJobSeasons;
 
       // Extract all skill names from work graph
       const names = new Set<string>();
@@ -1042,6 +1076,11 @@ export default function JobsPage() {
   function handleJobUpdate(updated: JobApplication) {
     setJobs((prev) => prev.map((j) => j.id === updated.id ? updated : j));
     setSelectedJob(updated);
+  }
+
+  function handleJobDelete(id: string) {
+    setJobs((prev) => prev.filter((j) => j.id !== id));
+    setSelectedJob(null);
   }
 
   function handleMarkedFollowUp(_id: string) {
@@ -1090,7 +1129,7 @@ export default function JobsPage() {
           </button>
           {showSeasonMenu && (
             <div className="absolute right-0 top-full mt-1 bg-slate-800 border border-slate-700 rounded-lg shadow-xl z-10 min-w-40 py-1">
-              {SEASONS.map((s) => (
+              {allSeasons.map((s) => (
                 <button
                   key={s}
                   onClick={() => { setSelectedSeason(s); setShowSeasonMenu(false); }}
@@ -1146,6 +1185,7 @@ export default function JobsPage() {
           onClose={() => setSelectedJob(null)}
           onUpdate={handleJobUpdate}
           onSkillsRefresh={setSelectedJobSkills}
+          onDelete={handleJobDelete}
         />
       )}
     </div>

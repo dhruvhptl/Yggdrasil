@@ -3,7 +3,7 @@ import { useState, useEffect, useMemo } from "react";
 import ProjectInput from "../components/ProjectInput";
 import { Project } from "../types";
 import { invoke } from "@tauri-apps/api/core";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 
 interface Discipline {
   id: string;
@@ -15,6 +15,8 @@ export default function HomePage() {
   const [disciplines, setDisciplines] = useState<Discipline[]>([]);
   const [loading, setLoading] = useState(true);
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const prefillName = searchParams.get('prefill') ?? undefined;
 
   useEffect(() => {
     loadProjects();
@@ -55,7 +57,7 @@ export default function HomePage() {
       </div>
 
       {/* Create project */}
-      <ProjectInput onProjectCreated={handleProjectCreated} />
+      <ProjectInput onProjectCreated={handleProjectCreated} prefillName={prefillName} />
 
       {/* Project list */}
       <div className="flex flex-col gap-3">

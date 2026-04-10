@@ -415,43 +415,21 @@ async fn save_tree_to_database(
 
 // ─── Mimir auto-matching ─────────────────────────────────────────────────────
 
-/// Call Mimir sidecar to semantically link library resources to each leaf node.
-/// Best-effort: if the sidecar is not running, tree generation still succeeds.
-async fn auto_match_tree_nodes(leaf_node_ids: &[String]) {
+/// Semantically link library resources to each leaf node using native Mimir.
+/// Best-effort: failures are logged but don't prevent tree generation from succeeding.
+async fn auto_match_tree_nodes(pool: &sqlx::PgPool, leaf_node_ids: &[String]) {
     if leaf_node_ids.is_empty() {
         return;
     }
 
     let client = reqwest::Client::new();
-
-    // Quick health check first
-    let alive = client
-        .get("http://localhost:3001/health")
-        .timeout(std::time::Duration::from_secs(2))
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
-
-    if !alive {
-        println!("⚠️  Mimir sidecar not running — skipping auto-match");
-        return;
-    }
-
     let mut matched = 0usize;
+
     for node_id in leaf_node_ids {
-        match client
-            .post(format!("http://localhost:3001/match/{}", node_id))
-            .timeout(std::time::Duration::from_secs(30))
-            .send()
-            .await
-        {
-            Ok(r) if r.status().is_success() => matched += 1,
-            Ok(r) => println!("⚠️  Mimir match returned {} for node {}", r.status(), node_id),
-            Err(e) => {
-                println!("⚠️  Mimir match error: {}", e);
-                break;
-            }
+        match crate::mimir::match_node_impl(pool, &client, node_id).await {
+            Ok(resources) if !resources.is_empty() => matched += 1,
+            Ok(_) => {} // no matching resources — fine
+            Err(e) => println!("⚠️  Mimir auto-match error for node {}: {}", node_id, e),
         }
     }
 
@@ -1199,7 +1177,7 @@ pub async fn generate_skill_tree(
     let (tree_id, leaf_node_ids) = save_tree_to_database(&skill_tree, &database).await?;
     println!("💾 Saved to database with tree_id: {}", tree_id);
 
-    auto_match_tree_nodes(&leaf_node_ids).await;
+    auto_match_tree_nodes(&database.pool, &leaf_node_ids).await;
 
     let mut response_json = serde_json::json!(skill_tree);
     response_json["tree_id"] = serde_json::json!(tree_id);
@@ -1479,7 +1457,7 @@ pub async fn analyze_repo(
     };
 
     // 10. Fetch targeted source files (Phase 1-driven or fallback)
-    let mut files_to_fetch: Vec<String> = if relevant_file_paths.is_empty() {
+    let files_to_fetch: Vec<String> = if relevant_file_paths.is_empty() {
         let fallback = select_fallback_files(&all_paths, 10);
         println!("  Using fallback file selection: {} files", fallback.len());
         fallback
@@ -1490,20 +1468,6 @@ pub async fn analyze_repo(
             .filter(|p| all_paths.contains(p))
             .collect()
     };
-
-    // Always include pinned files (core project files) if they exist in the repo
-    let pinned = vec![
-        "src-tauri/src/brain.rs",
-        "sidecar/src/routes/match.ts",
-        "sidecar/src/routes/ingest.ts",
-        "sidecar/src/index.ts",
-    ];
-    for p in &pinned {
-        let ps = p.to_string();
-        if all_paths.contains(&ps) && !files_to_fetch.contains(&ps) {
-            files_to_fetch.push(ps);
-        }
-    }
 
     let source_files = fetch_relevant_files(&gh, &base, &files_to_fetch, 4000, 40000).await;
     println!("  Source files fetched: {} files", source_files.len());
@@ -1593,7 +1557,7 @@ pub async fn analyze_repo(
     let (tree_id, leaf_node_ids) = save_tree_to_database(&skill_tree, &database).await?;
     println!("💾 Saved repo tree with tree_id: {}", tree_id);
 
-    auto_match_tree_nodes(&leaf_node_ids).await;
+    auto_match_tree_nodes(&database.pool, &leaf_node_ids).await;
 
     let mut response_json = serde_json::json!(skill_tree);
     response_json["tree_id"] = serde_json::json!(tree_id);

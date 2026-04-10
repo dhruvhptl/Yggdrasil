@@ -30,6 +30,7 @@ pub struct ResearchTopic {
     pub id: String,
     pub coop_id: String,
     pub name: String,
+    pub track: String,
     pub created_at: String,
 }
 
@@ -75,6 +76,7 @@ pub struct TopicWithResources {
     pub id: String,
     pub coop_id: String,
     pub name: String,
+    pub track: String,
     pub created_at: String,
     pub resources: Vec<ResourceWithSkills>,
 }
@@ -182,24 +184,32 @@ pub async fn get_coops(database: State<'_, Database>) -> Result<Vec<CoopTerm>, S
 pub async fn create_topic(
     coop_id: String,
     name: String,
+    track: Option<String>,
     database: State<'_, Database>,
 ) -> Result<ResearchTopic, String> {
     if name.trim().is_empty() {
         return Err("Topic name is required".into());
     }
 
+    let track_val = track
+        .as_deref()
+        .filter(|t| matches!(*t, "hardware" | "software" | "general"))
+        .unwrap_or("general")
+        .to_string();
+
     let id = Uuid::new_v4().to_string();
 
-    sqlx::query("INSERT INTO research_topics (id, coop_id, name) VALUES ($1, $2, $3)")
+    sqlx::query("INSERT INTO research_topics (id, coop_id, name, track) VALUES ($1, $2, $3, $4)")
         .bind(&id)
         .bind(&coop_id)
         .bind(name.trim())
+        .bind(&track_val)
         .execute(&database.pool)
         .await
         .map_err(|e| e.to_string())?;
 
     let row = sqlx::query(
-        "SELECT id, coop_id, name, created_at FROM research_topics WHERE id = $1"
+        "SELECT id, coop_id, name, track, created_at FROM research_topics WHERE id = $1"
     )
     .bind(&id)
     .fetch_one(&database.pool)
@@ -210,6 +220,7 @@ pub async fn create_topic(
         id: row.try_get("id").map_err(|e| e.to_string())?,
         coop_id: row.try_get("coop_id").map_err(|e| e.to_string())?,
         name: row.try_get("name").map_err(|e| e.to_string())?,
+        track: row.try_get("track").unwrap_or_else(|_| "general".to_string()),
         created_at: row.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")
             .map(|dt| dt.to_rfc3339())
             .map_err(|e| e.to_string())?,
@@ -312,10 +323,12 @@ pub async fn extract_skills(
     let api_key = std::env::var("GROQ_API_KEY")
         .map_err(|_| "GROQ_API_KEY environment variable not set".to_string())?;
 
-    let system_prompt = "You are a skill extractor. Given a research resource title and learner \
-        notes, return a JSON array of skill tags this resource demonstrates. Include the specific \
-        method (e.g. 'LDA', 'BERT') AND the broader domain (e.g. 'Topic Modelling', 'NLP'). \
-        Return ONLY a JSON array of strings, nothing else. Max 6 tags.";
+    let system_prompt = "You are a skill extractor. Given a research resource title and notes, \
+        return a JSON array of up to 6 skill tags. Prefer broader domain terms over hyper-specific \
+        ones — e.g. prefer 'NLP' over 'tokenization', 'Deep Learning' over 'dropout regularization', \
+        'Cloud Computing' over 'S3 bucket configuration'. Include the specific technique only if it \
+        is well-known in its own right (e.g. 'BERT', 'Transformer', 'LDA', 'RLHF'). \
+        Return ONLY a valid JSON array of strings, nothing else. No markdown fences.";
 
     let user_prompt = format!(
         "Title: {}\nNotes: {}",
@@ -334,8 +347,8 @@ pub async fn extract_skills(
                 { "role": "system", "content": system_prompt },
                 { "role": "user",   "content": user_prompt }
             ],
-            "temperature": 0.3,
-            "max_tokens": 200
+            "temperature": 0.2,
+            "max_tokens": 150
         }))
         .timeout(std::time::Duration::from_secs(30))
         .send()
@@ -351,9 +364,39 @@ pub async fn extract_skills(
         .as_str()
         .unwrap_or("[]");
 
-    // Parse the bare JSON array the model returns
-    let skill_names: Vec<String> = serde_json::from_str(content)
-        .unwrap_or_default();
+    // Strip markdown fences if the model wrapped the response
+    let clean = content
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+
+    let raw_names: Vec<String> = serde_json::from_str(clean).unwrap_or_default();
+
+    // Normalize and deduplicate: lowercase comparison, prefer longer form
+    // e.g. "Transformer" + "Transformers" → keep "Transformers"
+    //      "NLP" + "Natural Language Processing" → keep "Natural Language Processing"
+    let mut normalized: Vec<String> = Vec::new();
+    'outer: for name in raw_names {
+        let trimmed = name.trim().to_string();
+        if trimmed.is_empty() { continue; }
+        let lower = trimmed.to_lowercase();
+        // Check if any already-accepted skill subsumes or is subsumed by this one
+        for existing in &mut normalized {
+            let el = existing.to_lowercase();
+            if el == lower { continue 'outer; } // exact duplicate
+            // One is a prefix/suffix of the other — keep the longer form
+            if el.contains(&lower) || lower.contains(&el) {
+                if trimmed.len() > existing.len() {
+                    *existing = trimmed.clone();
+                }
+                continue 'outer;
+            }
+        }
+        normalized.push(trimmed);
+        if normalized.len() >= 6 { break; }
+    }
 
     // Idempotent: delete existing skills for this resource
     sqlx::query("DELETE FROM work_resource_skills WHERE resource_id = $1")
@@ -362,19 +405,16 @@ pub async fn extract_skills(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Insert new skills
+    // Insert normalized skills
     let mut result = Vec::new();
-    for skill_name in skill_names {
-        if skill_name.trim().is_empty() {
-            continue;
-        }
+    for skill_name in normalized {
         let skill_id = Uuid::new_v4().to_string();
         sqlx::query(
             "INSERT INTO work_resource_skills (id, resource_id, skill_name) VALUES ($1, $2, $3)"
         )
         .bind(&skill_id)
         .bind(&resource_id)
-        .bind(skill_name.trim())
+        .bind(&skill_name)
         .execute(&database.pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -382,7 +422,7 @@ pub async fn extract_skills(
         result.push(WorkResourceSkill {
             id: skill_id,
             resource_id: resource_id.clone(),
-            skill_name: skill_name.trim().to_string(),
+            skill_name,
             tree_id: None,
         });
     }
@@ -405,7 +445,7 @@ pub async fn get_full_work_graph(
     .map_err(|e| e.to_string())?;
 
     let topic_rows = sqlx::query(
-        "SELECT id, coop_id, name, created_at FROM research_topics ORDER BY created_at ASC"
+        "SELECT id, coop_id, name, track, created_at FROM research_topics ORDER BY created_at ASC"
     )
     .fetch_all(&database.pool)
     .await
@@ -470,6 +510,7 @@ pub async fn get_full_work_graph(
             id: topic_id.clone(),
             coop_id: coop_id.clone(),
             name: r.try_get("name").map_err(|e| e.to_string())?,
+            track: r.try_get("track").unwrap_or_else(|_| "general".to_string()),
             created_at: r.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")
                 .map(|dt| dt.to_rfc3339())
                 .map_err(|e| e.to_string())?,

@@ -134,6 +134,7 @@ export interface DailyQuestLink {
   nodeTitle: string | null;
   nodeProgress: number | null;
   nodeIsLocked: boolean | null;
+  completed: boolean;
 }
 
 export interface DailyLog {

@@ -6,7 +6,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
 import * as d3 from 'd3';
-import { ChevronDown, ChevronRight, Plus, ExternalLink, X, Loader2 } from 'lucide-react';
+import { ChevronDown, ChevronRight, ChevronLeft, Plus, ExternalLink, X, Loader2, Cpu, Code2, Layers } from 'lucide-react';
 
 // ─── Domain types ─────────────────────────────────────────────────────────────
 
@@ -16,7 +16,7 @@ interface ResourceWithSkills {
   url?: string; notes?: string; completed: boolean; createdAt: string;
   skills: WorkResourceSkill[];
 }
-interface TopicWithResources { id: string; coopId: string; name: string; createdAt: string; resources: ResourceWithSkills[]; }
+interface TopicWithResources { id: string; coopId: string; name: string; track: string; createdAt: string; resources: ResourceWithSkills[]; }
 interface CoopWithTopics {
   id: string; company: string; role: string;
   startDate: string; endDate: string; color: string; createdAt: string;
@@ -480,6 +480,14 @@ function SkillPopover({
 
 // ─── Left Panel ───────────────────────────────────────────────────────────────
 
+type Track = 'hardware' | 'software' | 'general';
+const TRACK_LABELS: Record<Track, string> = { hardware: 'Hardware', software: 'Software', general: 'General' };
+const TRACK_ICONS: Record<Track, React.ReactNode> = {
+  hardware: <Cpu style={{ width: 10, height: 10 }} />,
+  software: <Code2 style={{ width: 10, height: 10 }} />,
+  general: <Layers style={{ width: 10, height: 10 }} />,
+};
+
 interface CoopFormState { company: string; role: string; startDate: string; endDate: string; color: string; }
 type SourceType = 'url' | 'pdf';
 interface ResourceFormState { title: string; url: string; notes: string; completed: boolean; sourceType: SourceType; }
@@ -487,9 +495,13 @@ interface ResourceFormState { title: string; url: string; notes: string; complet
 function LeftPanel({
   graph,
   onRefresh,
+  collapsed,
+  onToggleCollapse,
 }: {
   graph: WorkGraph;
   onRefresh: () => Promise<void>;
+  collapsed: boolean;
+  onToggleCollapse: () => void;
 }) {
   const [showCoopForm, setShowCoopForm] = useState(false);
   const [coopForm, setCoopForm] = useState<CoopFormState>({ company: '', role: '', startDate: '', endDate: '', color: '#10b981' });
@@ -497,7 +509,9 @@ function LeftPanel({
 
   const [addingTopicFor, setAddingTopicFor] = useState<string | null>(null);
   const [topicName, setTopicName] = useState('');
+  const [topicTrack, setTopicTrack] = useState<Track>('general');
   const [savingTopic, setSavingTopic] = useState(false);
+  const [collapsedTracks, setCollapsedTracks] = useState<Set<string>>(new Set());
 
   const [addingResourceFor, setAddingResourceFor] = useState<string | null>(null);
   const [resourceForm, setResourceForm] = useState<ResourceFormState>({ title: '', url: '', notes: '', completed: false, sourceType: 'url' as SourceType});
@@ -536,8 +550,9 @@ function LeftPanel({
     if (!topicName.trim()) return;
     setSavingTopic(true);
     try {
-      await invoke('create_topic', { coopId, name: topicName });
+      await invoke('create_topic', { coopId, name: topicName, track: topicTrack });
       setTopicName('');
+      setTopicTrack('general');
       setAddingTopicFor(null);
       setExpandedCoops(prev => new Set([...prev, coopId]));
       await onRefresh();
@@ -576,13 +591,10 @@ function LeftPanel({
             reader.readAsDataURL(pdfFile);
           });
 
-          const pdfResult = await invoke<{ id: string; title: string; textPreview?: string }>(
+          await invoke<{ id: string; title: string; textPreview?: string }>(
             'ingest_mimir_pdf',
             { filename: pdfFile.name, pdfBase64: base64 },
           );
-          if (pdfResult.textPreview) {
-            notesForResource = pdfResult.textPreview;
-          }
         } finally {
           setUploadingPdf(false);
         }
@@ -638,17 +650,40 @@ function LeftPanel({
     borderRadius: 5, color: '#f1f5f9', fontSize: 11, cursor: 'pointer',
   });
 
+  if (collapsed) {
+    return (
+      <div style={{ width: 28, flexShrink: 0, borderRight: '1px solid #1e293b', display: 'flex', flexDirection: 'column', alignItems: 'center', background: '#0a0f1a', height: '100%', paddingTop: 12 }}>
+        <button
+          onClick={onToggleCollapse}
+          title="Expand panel"
+          style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#475569', padding: 4, borderRadius: 4, display: 'flex', alignItems: 'center' }}
+        >
+          <ChevronRight style={{ width: 14, height: 14 }} />
+        </button>
+      </div>
+    );
+  }
+
   return (
-    <div style={{ width: 320, flexShrink: 0, borderRight: '1px solid #1e293b', display: 'flex', flexDirection: 'column', background: '#0a0f1a', height: '100%' }}>
+    <div style={{ width: 320, flexShrink: 0, borderRight: '1px solid #1e293b', display: 'flex', flexDirection: 'column', background: '#0a0f1a', height: '100%', transition: 'width 0.2s ease' }}>
       {/* Header */}
       <div style={{ padding: '12px 14px', borderBottom: '1px solid #1e293b', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0 }}>
         <span style={{ fontWeight: 600, fontSize: 13, color: '#f1f5f9' }}>Co-op Work</span>
-        <button
-          onClick={() => setShowCoopForm(v => !v)}
-          style={{ ...btnStyle(), display: 'flex', alignItems: 'center', gap: 4, fontSize: 11 }}
-        >
-          <Plus className="w-3 h-3" /> Add Co-op
-        </button>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          <button
+            onClick={() => setShowCoopForm(v => !v)}
+            style={{ ...btnStyle(), display: 'flex', alignItems: 'center', gap: 4, fontSize: 11 }}
+          >
+            <Plus className="w-3 h-3" /> Add Co-op
+          </button>
+          <button
+            onClick={onToggleCollapse}
+            title="Collapse panel"
+            style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#475569', padding: 4, borderRadius: 4, display: 'flex', alignItems: 'center' }}
+          >
+            <ChevronLeft style={{ width: 14, height: 14 }} />
+          </button>
+        </div>
       </div>
 
       {/* Add co-op form */}
@@ -701,7 +736,23 @@ function LeftPanel({
 
             {expandedCoops.has(coop.id) && (
               <div style={{ paddingLeft: 18 }}>
-                {coop.topics.map(topic => (
+                {/* Group topics by track */}
+                {(['software', 'hardware', 'general'] as Track[]).map(track => {
+                  const trackTopics = coop.topics.filter(t => (t.track || 'general') === track);
+                  if (trackTopics.length === 0) return null;
+                  const trackKey = `${coop.id}-${track}`;
+                  const isTrackCollapsed = collapsedTracks.has(trackKey);
+                  return (
+                    <div key={track}>
+                      <button
+                        onClick={() => setCollapsedTracks(prev => { const s = new Set(prev); s.has(trackKey) ? s.delete(trackKey) : s.add(trackKey); return s; })}
+                        style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 4, padding: '4px 4px 2px', background: 'none', border: 'none', cursor: 'pointer', textAlign: 'left' }}
+                      >
+                        {isTrackCollapsed ? <ChevronRight style={{ width: 9, height: 9, color: '#334155', flexShrink: 0 }} /> : <ChevronDown style={{ width: 9, height: 9, color: '#334155', flexShrink: 0 }} />}
+                        <span style={{ color: '#334155', display: 'flex', alignItems: 'center', gap: 3 }}>{TRACK_ICONS[track]}</span>
+                        <span style={{ fontSize: 9, fontWeight: 700, color: '#334155', letterSpacing: '0.08em', textTransform: 'uppercase' }}>{TRACK_LABELS[track]}</span>
+                      </button>
+                      {!isTrackCollapsed && trackTopics.map(topic => (
                   <div key={topic.id} style={{ marginBottom: 2 }}>
                     <button
                       onClick={() => toggleTopic(topic.id)}
@@ -828,10 +879,31 @@ function LeftPanel({
                     )}
                   </div>
                 ))}
+                    </div>
+                  );
+                })}
 
                 {addingTopicFor === coop.id ? (
                   <div style={{ padding: '6px 8px' }}>
                     <input placeholder="Topic name" value={topicName} onChange={e => setTopicName(e.target.value)} style={{ ...inputStyle, marginBottom: 4 }} autoFocus />
+                    {/* Track selector */}
+                    <div style={{ display: 'flex', gap: 3, marginBottom: 4 }}>
+                      {(['software', 'hardware', 'general'] as Track[]).map(t => (
+                        <button
+                          key={t}
+                          onClick={() => setTopicTrack(t)}
+                          style={{
+                            flex: 1, padding: '3px 0', fontSize: 9, fontWeight: 600,
+                            background: topicTrack === t ? '#1e293b' : 'transparent',
+                            color: topicTrack === t ? '#f1f5f9' : '#64748b',
+                            border: `1px solid ${topicTrack === t ? '#334155' : '#1e293b'}`,
+                            borderRadius: 4, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 3,
+                          }}
+                        >
+                          {TRACK_ICONS[t]} {TRACK_LABELS[t]}
+                        </button>
+                      ))}
+                    </div>
                     <div style={{ display: 'flex', gap: 4 }}>
                       <button onClick={() => handleAddTopic(coop.id)} disabled={savingTopic} style={btnStyle()}>
                         {savingTopic ? '…' : 'Add'}
@@ -841,7 +913,7 @@ function LeftPanel({
                   </div>
                 ) : (
                   <button
-                    onClick={() => { setAddingTopicFor(coop.id); setTopicName(''); }}
+                    onClick={() => { setAddingTopicFor(coop.id); setTopicName(''); setTopicTrack('general'); }}
                     style={{ fontSize: 10, color: '#475569', background: 'none', border: 'none', cursor: 'pointer', padding: '4px 8px', display: 'flex', alignItems: 'center', gap: 3 }}
                   >
                     <Plus className="w-3 h-3" /> Add Topic
@@ -863,6 +935,7 @@ export default function WorkPage() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedSkill, setSelectedSkill] = useState<SkillNodeData | null>(null);
+  const [panelCollapsed, setPanelCollapsed] = useState(false);
 
   async function loadAll() {
     try {
@@ -887,7 +960,7 @@ export default function WorkPage() {
 
   return (
     <div style={{ display: 'flex', height: '100%', overflow: 'hidden' }}>
-      <LeftPanel graph={graph} onRefresh={loadAll} />
+      <LeftPanel graph={graph} onRefresh={loadAll} collapsed={panelCollapsed} onToggleCollapse={() => setPanelCollapsed(v => !v)} />
 
       {/* D3 galaxy canvas */}
       <div

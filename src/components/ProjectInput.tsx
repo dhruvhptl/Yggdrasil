@@ -6,10 +6,11 @@ import { Project } from '../types';
 
 interface ProjectInputProps {
   onProjectCreated?: (project: Project) => void;
+  prefillName?: string;
 }
 
-export default function ProjectInput({ onProjectCreated }: ProjectInputProps) {
-  const [formData, setFormData] = useState({ name: '', description: '', discipline: '' });
+export default function ProjectInput({ onProjectCreated, prefillName }: ProjectInputProps) {
+  const [formData, setFormData] = useState({ name: prefillName ?? '', description: '', discipline: '' });
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 

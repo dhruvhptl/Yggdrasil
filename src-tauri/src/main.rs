@@ -116,6 +116,7 @@ fn main() {
             daily_commands::add_free_task_to_day,
             daily_commands::move_to_quadrant,
             daily_commands::remove_from_day,
+            daily_commands::toggle_task_complete,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

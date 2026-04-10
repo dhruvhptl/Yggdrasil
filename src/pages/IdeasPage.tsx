@@ -296,16 +296,14 @@ function IdeaCard({ idea, onUpdate, onDelete, onPromote, promoting }: IdeaCardPr
 
           <div className="flex items-center gap-1">
             {/* Promote to project */}
-            {tag === 'project_idea' && (
-              <button
-                onClick={() => onPromote(idea.id)}
-                disabled={promoting}
-                title="Turn into project"
-                className="p-1.5 text-slate-500 hover:text-emerald-400 disabled:opacity-40 transition-colors rounded"
-              >
-                <GitBranch className="w-3.5 h-3.5" />
-              </button>
-            )}
+            <button
+              onClick={() => onPromote(idea.id)}
+              disabled={promoting}
+              title="Turn into project"
+              className="p-1.5 text-slate-500 hover:text-emerald-400 disabled:opacity-40 transition-colors rounded"
+            >
+              <GitBranch className="w-3.5 h-3.5" />
+            </button>
 
             {/* Pin */}
             <button
@@ -342,6 +340,7 @@ export default function IdeasPage() {
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState<FilterTab>('all');
   const [promotingId, setPromotingId] = useState<string | null>(null);
+  const [promoteToast, setPromoteToast] = useState<string | null>(null);
 
   useEffect(() => {
     invoke<Idea[]>('get_ideas')
@@ -378,7 +377,14 @@ export default function IdeasPage() {
     setPromotingId(id);
     try {
       const projectId = await invoke<string>('idea_to_project', { id });
-      navigate(`/project/${projectId}`);
+      // Remove the promoted idea from local state (Rust already deleted it)
+      setIdeas((prev) => prev.filter((i) => i.id !== id));
+      // Show a brief toast then navigate
+      setPromoteToast('Project created — opening tree…');
+      setTimeout(() => {
+        setPromoteToast(null);
+        navigate(`/project/${projectId}`);
+      }, 1200);
     } catch (err) {
       console.error('idea_to_project failed:', err);
       setPromotingId(null);
@@ -447,6 +453,14 @@ export default function IdeasPage() {
           )}
         </div>
       </div>
+
+      {/* Promote success toast */}
+      {promoteToast && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 bg-emerald-950/90 border border-emerald-700/60 rounded-lg px-4 py-2.5 shadow-xl">
+          <GitBranch className="w-4 h-4 text-emerald-400" />
+          <span className="text-sm font-medium text-emerald-300">{promoteToast}</span>
+        </div>
+      )}
     </div>
   );
 }

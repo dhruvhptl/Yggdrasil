@@ -32,6 +32,7 @@ pub struct JobApplication {
     pub rating_role: Option<i32>,
     pub season: String,
     pub created_at: String,
+    pub follow_up_done: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +94,7 @@ fn row_to_job(r: &sqlx::postgres::PgRow) -> Result<JobApplication, String> {
         rating_role: r.try_get("rating_role").map_err(|e| e.to_string())?,
         season: r.try_get("season").map_err(|e| e.to_string())?,
         created_at,
+        follow_up_done: r.try_get("follow_up_done").unwrap_or(false),
     })
 }
 
@@ -274,8 +276,8 @@ pub async fn update_job(
         "UPDATE job_applications SET \
          status = COALESCE($2, status), \
          notes = $3, \
-         date_applied = $4::TIMESTAMPTZ, \
-         date_follow_up = $5::TIMESTAMPTZ, \
+         date_applied = $4::DATE::TIMESTAMPTZ, \
+         date_follow_up = $5::DATE::TIMESTAMPTZ, \
          rating_overall = $6, \
          rating_location = $7, \
          rating_alignment = $8, \
@@ -401,14 +403,19 @@ pub async fn get_skill_demand(
         return Ok(vec![]);
     }
 
-    // Skill aggregates — avg_rating computed from 4 sub-ratings (rating_overall is never set by UI)
+    // Skill aggregates — avg_rating only counts jobs where at least one rating is set.
+    // NULL ratings are excluded from the average so unrated jobs don't dilute the score.
     let agg_sql_base =
         "SELECT js.skill_name, \
          COUNT(DISTINCT js.job_id) as count, \
-         AVG(\
-           (COALESCE(ja.rating_location, 3) + COALESCE(ja.rating_alignment, 3) + \
-            COALESCE(ja.rating_salary, 3) + COALESCE(ja.rating_role, 3))::float / 4.0\
-         ) as avg_rating \
+         AVG(NULLIF(\
+           (COALESCE(ja.rating_location, 0) + COALESCE(ja.rating_alignment, 0) + \
+            COALESCE(ja.rating_salary, 0) + COALESCE(ja.rating_role, 0))::float / \
+           NULLIF((CASE WHEN ja.rating_location IS NOT NULL THEN 1 ELSE 0 END + \
+                   CASE WHEN ja.rating_alignment IS NOT NULL THEN 1 ELSE 0 END + \
+                   CASE WHEN ja.rating_salary IS NOT NULL THEN 1 ELSE 0 END + \
+                   CASE WHEN ja.rating_role IS NOT NULL THEN 1 ELSE 0 END), 0)\
+         , 0)) as avg_rating \
          FROM job_skills js \
          JOIN job_applications ja ON js.job_id = ja.id";
 
@@ -429,10 +436,15 @@ pub async fn get_skill_demand(
         .map(|r| -> Result<SkillDemand, String> {
             let skill_name: String = r.try_get("skill_name").map_err(|e| e.to_string())?;
             let count: i64 = r.try_get("count").map_err(|e| e.to_string())?;
-            let avg_rating: f64 = r.try_get("avg_rating").map_err(|e| e.to_string())?;
+            let avg_rating: Option<f64> = r.try_get("avg_rating").map_err(|e| e.to_string())?;
             let frequency = count as f64 / total_jobs as f64;
-            // demand_score: (fraction of jobs requiring skill) * (avg sub-rating quality / 5) * 100
-            let demand_score = frequency * (avg_rating / 5.0) * 100.0;
+            // demand_score: frequency * 100 when no ratings, or frequency * (rating/5) * 100 when rated.
+            // This avoids the COALESCE-3 hack that made every unrated skill score 60% of frequency.
+            let demand_score = match avg_rating {
+                Some(r) if r > 0.0 => frequency * (r / 5.0) * 100.0,
+                _ => frequency * 100.0,
+            };
+            let avg_rating = avg_rating.unwrap_or(0.0);
             println!(
                 "  📊 Skill '{}': count={}/{} (freq={:.0}%), avg_rating={:.2}, demand_score={:.1}",
                 skill_name, count, total_jobs,
@@ -461,11 +473,13 @@ pub async fn mark_followed_up(
     id: String,
     database: State<'_, Database>,
 ) -> Result<(), String> {
-    sqlx::query("UPDATE job_applications SET date_follow_up = NOW() WHERE id = $1")
-        .bind(&id)
-        .execute(&database.pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    sqlx::query(
+        "UPDATE job_applications SET date_follow_up = NOW(), follow_up_done = TRUE WHERE id = $1"
+    )
+    .bind(&id)
+    .execute(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 

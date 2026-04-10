@@ -51,34 +51,33 @@ pub struct SyncResult {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn normalize_skill_name(name: &str) -> String {
-    name.trim().to_lowercase()
-}
-
 async fn upsert_skill(
     pool: &PgPool,
     name: &str,
     domain: Option<&str>,
     evidence_entry: serde_json::Value,
 ) -> Result<String, String> {
-    let normalized = normalize_skill_name(name);
-    if normalized.is_empty() {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
         return Err("Empty skill name".to_string());
     }
     let id = Uuid::new_v4().to_string();
     let evidence_arr = serde_json::json!([evidence_entry]);
 
+    // ON CONFLICT uses a case-insensitive expression index on LOWER(name).
+    // If an existing row has a different casing, we keep the existing name
+    // (DO UPDATE does not update `name`) so the first-inserted casing wins.
     let row = sqlx::query(
         "INSERT INTO universal_skills (id, name, domain, level, evidence, last_updated)
          VALUES ($1, $2, $3, 1, $4::jsonb, NOW())
-         ON CONFLICT (name) DO UPDATE SET
+         ON CONFLICT (LOWER(name)) DO UPDATE SET
              evidence = universal_skills.evidence || $4::jsonb,
              domain = COALESCE($3, universal_skills.domain),
              last_updated = NOW()
          RETURNING id"
     )
     .bind(&id)
-    .bind(&normalized)
+    .bind(trimmed)
     .bind(domain)
     .bind(&evidence_arr)
     .fetch_one(pool)
@@ -132,7 +131,7 @@ async fn sync_trees_inner(pool: &PgPool) -> Result<SyncResult, String> {
          JOIN projects p ON t.project_id = p.id
          WHERE n.type = 'branch'
            AND parent.type = 'branch'
-           AND n.progress > 0"
+           AND n.progress = 100"
     )
     .fetch_all(pool)
     .await
@@ -297,6 +296,31 @@ pub async fn sync_all_skills(
     let r1 = sync_resume_inner(&database.pool).await?;
     let r2 = sync_trees_inner(&database.pool).await?;
     let r3 = sync_work_inner(&database.pool).await?;
+
+    // Prune skills that still have empty evidence after the full sync —
+    // these are stale rows whose sources (resources, tree nodes) no longer exist.
+    let pruned = sqlx::query(
+        "DELETE FROM skill_dependencies
+         WHERE source_skill_id IN (SELECT id FROM universal_skills WHERE evidence = '[]'::jsonb)
+            OR target_skill_id IN (SELECT id FROM universal_skills WHERE evidence = '[]'::jsonb)"
+    )
+    .execute(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .rows_affected();
+
+    let deleted = sqlx::query(
+        "DELETE FROM universal_skills WHERE evidence = '[]'::jsonb"
+    )
+    .execute(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .rows_affected();
+
+    if deleted > 0 {
+        println!("🌳 Pruned {} stale skills ({} dep rows)", deleted, pruned);
+    }
+
     recalculate_levels_inner(&database.pool).await?;
 
     println!("🌳 Synced all skills: resume={}, trees={}, work={}", r1.upserted, r2.upserted, r3.upserted);
@@ -356,14 +380,17 @@ pub async fn get_skill_gaps(
     season: Option<String>,
     database: State<'_, Database>,
 ) -> Result<Vec<SkillGap>, String> {
-    // Get demanded skills from job_skills
+    // Single query: join job_skills with universal_skills in one pass.
+    // LEFT JOIN on LOWER(name) so we get current_level = NULL when skill is absent.
     let demand_rows = if let Some(ref s) = season {
         sqlx::query(
             "SELECT js.skill_name,
                     COUNT(DISTINCT js.job_id) AS count,
-                    (SELECT COUNT(*) FROM job_applications WHERE season = $1) AS total
+                    (SELECT COUNT(*) FROM job_applications WHERE season = $1) AS total,
+                    MAX(us.level) AS current_level
              FROM job_skills js
              JOIN job_applications ja ON js.job_id = ja.id
+             LEFT JOIN universal_skills us ON LOWER(us.name) = LOWER(js.skill_name)
              WHERE ja.season = $1
              GROUP BY js.skill_name"
         )
@@ -374,8 +401,10 @@ pub async fn get_skill_gaps(
         sqlx::query(
             "SELECT js.skill_name,
                     COUNT(DISTINCT js.job_id) AS count,
-                    (SELECT COUNT(*) FROM job_applications) AS total
+                    (SELECT COUNT(*) FROM job_applications) AS total,
+                    MAX(us.level) AS current_level
              FROM job_skills js
+             LEFT JOIN universal_skills us ON LOWER(us.name) = LOWER(js.skill_name)
              GROUP BY js.skill_name"
         )
         .fetch_all(&database.pool)
@@ -393,17 +422,9 @@ pub async fn get_skill_gaps(
         let frequency = count as f64 / total as f64;
         let demand_score = frequency * 100.0;
 
-        // Look up in universal_skills (case-insensitive via normalized name)
-        let skill_row = sqlx::query(
-            "SELECT level FROM universal_skills WHERE name = $1"
-        )
-        .bind(&normalize_skill_name(&skill_name))
-        .fetch_optional(&database.pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-        let current_level: i32 = skill_row
-            .and_then(|r| r.try_get::<i32, _>("level").ok())
+        // NULL level means skill is absent from universal_skills → treat as 0
+        let current_level: i32 = row.try_get::<Option<i32>, _>("current_level")
+            .unwrap_or(None)
             .unwrap_or(0);
 
         // Gap = demanded but level 0 (missing) or level 1 (only aware)
@@ -453,37 +474,7 @@ pub async fn infer_skill_dependencies(
     let system_prompt = "Given a list of technical skills, identify prerequisite relationships. \
         Return ONLY a JSON array of objects: [{\"from\": \"skill_a\", \"to\": \"skill_b\"}] \
         where skill_a is a prerequisite for skill_b. Only include strong, clear prerequisites. \
-        Use the exact skill names provided. Max 30 relationships. Return ONLY the JSON array.";
-
-    let user_prompt = format!("Skills: {}", skill_names.join(", "));
-
-    let client = reqwest::Client::new();
-    let response = client
-        .post("https://api.groq.com/openai/v1/chat/completions")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&serde_json::json!({
-            "model": "llama-3.3-70b-versatile",
-            "messages": [
-                { "role": "system", "content": system_prompt },
-                { "role": "user",   "content": user_prompt }
-            ],
-            "temperature": 0.3,
-            "max_tokens": 2000
-        }))
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
-        .await
-        .map_err(|e| format!("Groq request failed: {}", e))?;
-
-    let body: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Groq response parse error: {}", e))?;
-
-    let content = body["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or("[]");
+        Use the exact skill names provided. Max 30 relationships. Return ONLY the JSON array, no markdown.";
 
     #[derive(Deserialize)]
     struct DepPair {
@@ -491,7 +482,65 @@ pub async fn infer_skill_dependencies(
         to: String,
     }
 
-    let pairs: Vec<DepPair> = serde_json::from_str(content).unwrap_or_default();
+    // Build a lowercase name → id lookup to match LLM output case-insensitively
+    let lower_to_id: std::collections::HashMap<String, String> = name_to_id.iter()
+        .map(|(name, id)| (name.to_lowercase(), id.clone()))
+        .collect();
+
+    let client = reqwest::Client::new();
+
+    // Batch into groups of 30 to stay well within token limits
+    const BATCH_SIZE: usize = 30;
+    let batches: Vec<&[String]> = skill_names.chunks(BATCH_SIZE).collect();
+    let mut all_pairs: Vec<DepPair> = Vec::new();
+
+    for (i, batch) in batches.iter().enumerate() {
+        if i > 0 {
+            // Small delay between batches to avoid rate limiting
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+
+        let user_prompt = format!("Skills: {}", batch.join(", "));
+
+        let response = client
+            .post("https://api.groq.com/openai/v1/chat/completions")
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "model": "llama-3.3-70b-versatile",
+                "messages": [
+                    { "role": "system", "content": system_prompt },
+                    { "role": "user",   "content": user_prompt }
+                ],
+                "temperature": 0.3,
+                "max_tokens": 1000
+            }))
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|e| format!("Groq request failed (batch {}): {}", i, e))?;
+
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| format!("Groq parse error (batch {}): {}", i, e))?;
+
+        let content = body["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("[]");
+
+        // Strip markdown fences before parsing
+        let clean = content
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+
+        let batch_pairs: Vec<DepPair> = serde_json::from_str(clean).unwrap_or_default();
+        println!("  🔗 Batch {}: {} pairs from {} skills", i + 1, batch_pairs.len(), batch.len());
+        all_pairs.extend(batch_pairs);
+    }
 
     // Clear existing inferred dependencies
     sqlx::query("DELETE FROM skill_dependencies WHERE relationship = 'prerequisite'")
@@ -500,9 +549,9 @@ pub async fn infer_skill_dependencies(
         .map_err(|e| e.to_string())?;
 
     let mut count = 0;
-    for pair in &pairs {
-        let from_id = name_to_id.get(&normalize_skill_name(&pair.from));
-        let to_id = name_to_id.get(&normalize_skill_name(&pair.to));
+    for pair in &all_pairs {
+        let from_id = lower_to_id.get(&pair.from.to_lowercase());
+        let to_id = lower_to_id.get(&pair.to.to_lowercase());
 
         if let (Some(from_id), Some(to_id)) = (from_id, to_id) {
             if from_id == to_id { continue; }
@@ -525,6 +574,6 @@ pub async fn infer_skill_dependencies(
         }
     }
 
-    println!("🔗 Inferred {} skill dependencies from {} pairs", count, pairs.len());
+    println!("🔗 Inferred {} skill dependencies from {} total pairs ({} batches)", count, all_pairs.len(), batches.len());
     Ok(count)
 }

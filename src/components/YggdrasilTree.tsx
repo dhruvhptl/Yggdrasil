@@ -1251,9 +1251,13 @@ function NodePanel({ node, skillLocked, onSave, onClose, onAddChild, onDelete }:
         <div style={{ display: 'flex', gap: 6 }}>
           <button
             onClick={onAddChild}
+            disabled={node.type === 'leaf'}
             style={{
-              flex: 1, padding: '6px 0', background: '#1e3a2e', color: '#6ee7b7',
-              border: '1px solid #166534', borderRadius: 6, cursor: 'pointer', fontSize: 11,
+              flex: 1, padding: '6px 0',
+              background: node.type === 'leaf' ? '#1e293b' : '#1e3a2e',
+              color: node.type === 'leaf' ? '#475569' : '#6ee7b7',
+              border: `1px solid ${node.type === 'leaf' ? '#334155' : '#166534'}`,
+              borderRadius: 6, cursor: node.type === 'leaf' ? 'not-allowed' : 'pointer', fontSize: 11,
             }}
           >
             + Add Child
@@ -1455,7 +1459,10 @@ export default function YggdrasilTree({ projectId }: YggdrasilTreeProps) {
         title: updates.title ?? null,
         description: updates.description ?? null,
         progress: updates.progress ?? null,
-        tasks: updates.tasks ?? null,
+        // Send undefined (not null) when tasks isn't changing — Tauri maps undefined
+        // to None in Rust, which falls back to the existing DB value. Sending null
+        // would be deserialized as Some(Value::Null) and wipe the tasks JSONB.
+        tasks: 'tasks' in updates ? (updates.tasks ?? null) : undefined,
         resources: updates.resources !== undefined ? (updates.resources ?? null) : null,
         position: null,
       });

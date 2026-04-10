@@ -160,6 +160,13 @@ pub async fn idea_to_project(
     .await
     .map_err(|e| e.to_string())?;
 
+    // Delete the source idea now that it has been promoted
+    sqlx::query("DELETE FROM ideas WHERE id = $1")
+        .bind(&id)
+        .execute(&database.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
     println!("💡 Promoted idea {} → project {}", id, project_id);
     Ok(project_id)
 }

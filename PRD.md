@@ -1,5 +1,5 @@
 # Yggdrasil — Product Requirements Document
-**Version:** 2.1  
+**Version:** 2.2  
 **Updated:** April 2026
 
 ---
@@ -153,11 +153,21 @@ Python scraper (port 3002)     ←→  OpenRouter (embeddings + tree gen)
 
 ### 2. Climb Trees
 
-Generate and climb trees for active projects. Take notes in checkpoint panels. Use Mimir chat while climbing. Document every pain point.
+Generate and climb trees for active projects. Take notes in checkpoint panels. Use Mimir chat while climbing. Document every pain point — these feed the V2 roadmap.
 
 ### 3. Add Remaining Jobs
 
 Expand the job tracker. Target: 50+ jobs before reviewing skill gap analysis.
+
+### 4. V2 Build Sequence (after climbing)
+
+In order — each depends on the previous being stable:
+
+1. **Smarter retrieval** — usage_weight column, feedback signals, dynamic context injection
+2. **Chat history persistence** — mimir_chat_sessions + mimir_chat_messages tables
+3. **Knowledge graph schema** — typed edges, prerequisite traversal, resource attachment to skill nodes
+4. **Universal Skill Tree visual rebuild** — canvas renderer, organic tree layout, glowing nodes
+5. **Graph-aware Mimir retrieval** — graph traversal before cosine search
 
 ---
 
@@ -200,21 +210,20 @@ All existing leaf nodes (quests) are migrated to the checkpoint model. The `task
 
 ---
 
-
+## V2 Features
 
 ### 2.1 Scraper Upgrade
 
-The current 5-tier scraper works for most sites but has limitations. V2 goals:
+The current scraper works for most sites but has limitations:
 
 - Better `extract_text()` for div-heavy sites (currently misses content in non-semantic HTML)
 - Audio transcription via Whisper for YouTube videos with no captions
 - Video description + chapters as fallback when transcript unavailable
-- Fix the 11 permanently broken resources — replace with better URLs
 - Proper encoding handling — UTF-8 forced on Windows (`sys.stdout.reconfigure`)
 
 ### 2.2 GitHub Repo Reader Upgrade
 
-Current `analyze_repo` in `brain.rs` does shallow fetching. V2 upgrade:
+Current `analyze_repo` in `brain.rs` does shallow file fetching. V2 upgrade:
 
 - Tree-sitter Rust crate — parse source files into structured symbols (functions, classes, imports)
 - Call graph analysis — which functions call which
@@ -222,71 +231,176 @@ Current `analyze_repo` in `brain.rs` does shallow fetching. V2 upgrade:
 - Richer LLM context — structured symbol map instead of raw file dumps
 - Result: checkpoints reference specific patterns the author actually used, not just library names
 
-### 2.3 System Prompt Rewrite — Checkpoint Model
-
-Update `build_system_prompt()` and `build_repo_system_prompt()` in `brain.rs` to generate checkpoints instead of quests:
-
-- Each leaf node is a **concept**, not a task — title is a noun phrase, not an imperative
-- Output includes `mastery_criteria` (what understanding looks like), `exercises` (specific things to work through)
-- No `difficulty` or `estimated_hours` fields
-- Banned patterns updated: no "Learn X", "Read X", "Watch X" — titles must be concept names
-- Example good checkpoint: `"Velocity-Verlet Symplectic Integration"` not `"Learn how integrators work"`
-
 ### 2.3 Universal Skill Tree — Visual Rebuild
 
-The current galaxy view needs to become a proper ever-growing tree:
+The current D3 galaxy view becomes a proper knowledge graph — the visual centrepiece of the app:
 
-- Single root node (you), main branches emerge dynamically from skill data
-- Fully dynamic domain clustering — LLM classifies each skill into domains, creates new domains as needed
-- Completed quests from project trees automatically light up nodes
+- **Visual**: dark organic canvas, warm amber/green gradient background, twisted branches, glowing circular nodes — inspired by mythological Yggdrasil
+- **Structure**: Domain → Concept → Technical Skill hierarchy
+- **Typed edges**: `requires`, `builds_on`, `applies`, `referenced_by`
+- Single root node (you), domain branches emerge dynamically from skill data
+- Completed quests from project trees automatically light up dependent skill nodes via prerequisite traversal
 - Job demand highlights — branches required by target JDs glow differently
-- Radial tree layout that expands outward as nodes are added
-- Eventually spans to represent your entire learning journey
+- Resources attach directly to skill nodes, not just quest nodes
+- Radial tree layout that expands outward as skills are acquired
 
-Data feeds into universal tree:
-- Project trees — completed quests unlock skills
-- Work page — job skills extracted from JDs
-- Future: courses, certifications, reading completions
+Data feeds:
+- Project trees — completed checkpoints unlock and illuminate skill nodes
+- Work page — extracted skills from co-op resources
+- Job tracker — demand shapes which branches to grow toward
+- Resume — pre-populates existing skills
 
-### 2.4 RAG Improvements
+---
 
-- Dynamic context — Mimir chat knows which quest you're on, biases search toward matched resources
-- Chat history persistence — currently React state only, lost on refresh
-- Gap analysis — `GET /gaps/:treeId` — identify what's missing from library for a given tree
-- Better distance threshold tuning — currently 0.85, may need per-domain calibration
+## Mimir Intelligence Roadmap
+
+### Current State
+
+Mimir is a RAG system — it indexes resources and retrieves relevant chunks via cosine similarity. Quality improves as the library grows, but there is no feedback loop and no memory. Every query starts from scratch.
+
+```
+Query → embed → cosine search → rerank → synthesize → response
+                     ↑
+               no feedback, no weighting, no history
+```
+
+### V2 — Smarter Retrieval
+
+**Feedback signals on chat responses**
+
+After each Mimir chat response, the user can rate it (helpful / not helpful). This signal is stored and used to adjust future retrieval weighting for the sources that contributed to that response.
+
+- New table: `mimir_feedback (id, chunk_id, response_id, signal, created_at)`
+- Helpful responses boost `usage_weight` on contributing chunks
+- Not-helpful responses suppress those chunks for similar queries
+
+**Usage-weighted retrieval**
+
+Resources the user reads and completes get boosted in similarity search. A resource sitting unread at 0% contributes equally to one with 20 highlights and a complete badge — this fixes that.
+
+- New column: `usage_weight FLOAT NOT NULL DEFAULT 1.0` on `mimir_chunks`
+- Boosted by: chunk retrieved → user engages with source → `usage_weight += 0.1`
+- Boosted by: resource marked complete → all its chunks `usage_weight += 0.5`
+- Applied in cosine search: `similarity_score * usage_weight` as effective retrieval score
+
+**Dynamic context injection**
+
+Mimir knows which quest you're currently viewing and biases retrieval toward resources already linked to that node. The selected node's title + description are prepended to the query embedding.
+
+### V2 — Knowledge Graph (Skills Page Rebuild)
+
+Skills, concepts, resources, and quests become nodes in a unified knowledge graph. This replaces the current D3 force galaxy.
+
+**Graph schema**
+
+```
+Nodes: Domain | Concept | TechnicalSkill | Resource | Quest
+Edges (typed):
+  requires      — Concept A must be understood before Concept B
+  builds_on     — TechnicalSkill extends a Concept
+  applies       — Quest demonstrates a TechnicalSkill
+  referenced_by — Resource teaches a Concept or TechnicalSkill
+```
+
+**Prerequisite traversal**
+
+Completing a quest lights up the skill nodes it `applies`. Reaching 100% on a skill node unlocks successor nodes connected by `requires` edges — the same unlock mechanic already in project trees, generalised across the universal graph.
+
+**Resource attachment**
+
+Resources attach to skill and concept nodes directly (via `referenced_by` edges), not just to quest nodes. Mimir auto-match runs against the full graph, not just leaf nodes.
+
+**Job demand integration**
+
+The job tracker's skill demand scores flow into the graph as edge weights. Branches leading to high-demand skills glow; the gap between current level and demand score is visualised as branch thickness or color.
+
+**Visual design**
+
+Dark organic canvas tree — the same aesthetic as the project tree renderer, scaled up:
+- Warm amber/deep green gradient background
+- Twisted procedural branches from a single root node (you)
+- Glowing circular nodes: dim for locked, softly lit for in-progress, bright for mastered
+- Domain nodes are larger, brighter, higher in the canopy
+- Skill nodes cluster around their domain branch
+- Resource nodes appear as small satellites orbiting skill nodes
+
+### V2 — Personal Knowledge Graph as Librarian
+
+Mimir stops being a document search engine and becomes a navigator of your personal knowledge graph.
+
+**Graph-aware retrieval**
+
+When you ask Mimir a question, it doesn't just cosine-search chunks — it first locates the relevant concept nodes in the knowledge graph, then retrieves resources attached to those nodes and their prerequisites.
+
+```
+Query: "explain backpropagation"
+→ Find concept node: Backpropagation
+→ Traverse: requires → Chain Rule, Matrix Calculus
+→ Retrieve: resources on all three concepts (ordered by prerequisites)
+→ Synthesise: "You're working on Backpropagation. You'll need Chain Rule first.
+               You have these resources in your library..."
+```
+
+**Chat history persistence**
+
+Chat history currently lives only in React state and is lost on refresh. V2 persists it:
+
+- New table: `mimir_chat_sessions (id, created_at)` and `mimir_chat_messages (id, session_id, role, content, created_at)`
+- Sessions are resumed automatically on the same tree/node context
+- History window: last 10 messages injected into context for continuity
+
+**Dynamic context**
+
+Mimir always knows:
+- Which quest node is selected in the tree canvas → biases retrieval and tone
+- Which resources are already linked to that node → avoids redundant suggestions
+- Your current skill level on the relevant skill nodes → calibrates explanation depth
+
+The system prompt is rebuilt on each query incorporating this dynamic context, not just a static template.
 
 ---
 
 ## V3 Features
 
-### 3.1 Mimir as Unified Agent
+### 3.1 Fine-Tuning on Personal Learning History
 
-Everything AI-powered consolidates under one agent (Mimir) with tool-calling:
+Fine-tune a small local model on everything Yggdrasil knows about how you learn:
 
-| Tool | Model | Purpose |
-|---|---|---|
-| `search_library(query)` | Claude Sonnet | RAG across all chunks |
-| `generate_tree(context)` | Kimi-k2 | Tree JSON generation |
-| `analyze_repo(url)` | Kimi-k2 | GitHub analysis + concept graph |
-| `scrape_url(url)` | Haiku / Gemini Flash | Scraper summarization |
-| `match_resources(node_id)` | MiniLM embeddings | Auto-match quests to library |
-| `rerank(chunks, query)` | llama-3.1-8b-instant | Fast relevance filtering |
+**Training data sources**
+- Quest checkpoint notes — what you wrote while climbing trees
+- Mimir chat history — questions you asked and responses you rated helpful
+- Completed checkpoints — which concepts you mastered and in what order
+- Resource highlights (future) — passages you flagged while reading
 
-Mimir orchestrates everything. One conversation drives the full workflow: analyze repo → generate tree → match resources → answer questions while climbing.
+**What it enables**
 
-### 3.2 RAG + Library Before Quest Generation
+True personalisation — the model knows how you learn, what analogies click for you, which prerequisites you actually have vs nominally have, and where you typically get stuck.
 
-Before generating quests, RAG across Mimir library to find relevant resources the user already has. Quests reference specific resources: "Watch this video in your library" or "Read this chapter you already ingested." Requires library to be rich enough first.
+- Generates checkpoint mastery criteria calibrated to your actual level
+- Writes exercises that match your learning style
+- Mimir chat responses reference your own notes: "You wrote about this when you learned X"
 
-### 3.3 MCP Integration & Deployment
+**Infrastructure**
 
-Deploy scraper to Railway or Oracle Cloud. Expose Mimir tools via MCP server so external tools (Claude Code, other agents) can query your knowledge library. Build `/batch` endpoint for bulk operations.
+Runs locally via the Python sidecar (port 3002) — a fine-tuned 1-3B parameter model (Phi-3 Mini, Qwen-2, or similar) loaded via llama.cpp or MLX on Apple Silicon. No cloud inference cost.
+
+### 3.2 MCP Integration & Deployment
+
+Expose Mimir tools via MCP server so external tools (Claude Code, other agents) can query your personal knowledge library:
+
+```
+mimir.search(query)      → ranked chunks from your library
+mimir.graph(concept)     → prerequisite graph for a concept
+mimir.status(skill)      → your current level + evidence
+```
+
+Deploy Python scraper to Railway or Oracle Cloud for always-on ingest without the desktop app running.
 
 ---
 
 ## Ideas Backlog
 
-Not prioritized. Review after climbing the 4 trees.
+Not prioritized. Review after climbing 4+ trees and the V2 knowledge graph is live.
 
 ### Scraper
 - Auto-detect YouTube links on resource-list pages and offer playlist-style ingest
@@ -295,33 +409,17 @@ Not prioritized. Review after climbing the 4 trees.
 
 ### Tree
 - Tree spreading — more horizontal spacing, longer labels before truncation
-- Quest difficulty visual indicators on tree nodes
-- Estimated time remaining shown on branch/phase nodes
-- Tree comparison — how does your pluto tree compare to someone else's
+- Tree comparison — how does your tree compare to someone else's (shareable snapshots)
 
 ### Learning
-- Spaced repetition — resurface completed quests for review after N days
-- Quest notes export — compile all notes from a tree into a study document
-- Resource recommendations — "you're missing content on X, here are 3 sources"
+- Spaced repetition — resurface completed checkpoints for review after N days
+- Quest notes export — compile all checkpoint notes from a tree into a study document
 - Progress sharing — shareable skill tree snapshots
 
-### Universal Tree
-- Skill decay — skills fade if not practiced/reviewed
-- Skill prerequisites visualization — show what unlocks what
+### Universal Tree / Knowledge Graph
+- Skill decay — skills fade if not reinforced after N weeks
 - Learning velocity — how fast are you acquiring skills over time
 - Domain comparison vs job market — which domains are you over/under-indexed in
-
----
-
-## Immediate Action Items
-
-In order:
-
-1. Ingest PDFs + playlists into Mimir library — section-aware chunking now works
-2. Generate trees for active projects
-3. Climb trees — take notes, use Mimir chat, document pain points
-4. Add 50+ jobs to jobs page
-5. Review pain points → prioritize V2 features
 
 ---
 

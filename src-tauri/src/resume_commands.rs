@@ -292,7 +292,9 @@ pub async fn parse_resume(
 pub async fn get_resume(
     database: State<'_, Database>,
 ) -> Result<Option<ResumeProfile>, String> {
-    let profile_row = sqlx::query_as::<_, (String, String, Option<String>, Option<String>, serde_json::Value, serde_json::Value, serde_json::Value, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>(
+    use sqlx::Row;
+
+    let profile_row = sqlx::query(
         "SELECT id, raw_text, name, email, education, work_experience, skills, created_at, updated_at \
          FROM resume_profile ORDER BY created_at DESC LIMIT 1"
     )
@@ -305,13 +307,16 @@ pub async fn get_resume(
         None => return Ok(None),
     };
 
-    let profile_id = row.0.clone();
+    let profile_id: String = row.try_get("id").map_err(|e| e.to_string())?;
 
-    // Fetch projects with linked project names
-    let project_rows = sqlx::query_as::<_, (String, String, String, Option<String>, serde_json::Value, Option<String>, Option<String>, chrono::DateTime<chrono::Utc>)>(
+    // Fetch projects with linked project name in a single LEFT JOIN — no N+1
+    let project_rows = sqlx::query(
         "SELECT rp.id, rp.resume_id, rp.name, rp.description, rp.tech_stack, rp.github_url, \
-                rp.linked_project_id, rp.created_at \
-         FROM resume_projects rp WHERE rp.resume_id = $1 ORDER BY rp.created_at"
+                rp.linked_project_id, rp.created_at, p.name AS linked_project_name \
+         FROM resume_projects rp \
+         LEFT JOIN projects p ON p.id = rp.linked_project_id \
+         WHERE rp.resume_id = $1 \
+         ORDER BY rp.created_at"
     )
     .bind(&profile_id)
     .fetch_all(&database.pool)
@@ -319,48 +324,49 @@ pub async fn get_resume(
     .map_err(|e| e.to_string())?;
 
     let mut projects: Vec<ResumeProject> = Vec::new();
-    for pr in project_rows {
-        let linked_name = if let Some(ref pid) = pr.6 {
-            let name_row = sqlx::query_as::<_, (String,)>(
-                "SELECT name FROM projects WHERE id = $1"
-            )
-            .bind(pid)
-            .fetch_optional(&database.pool)
-            .await
-            .map_err(|e| e.to_string())?;
-            name_row.map(|n| n.0)
-        } else {
-            None
-        };
-
+    for pr in &project_rows {
         projects.push(ResumeProject {
-            id: pr.0,
-            resume_id: pr.1,
-            name: pr.2,
-            description: pr.3,
-            tech_stack: serde_json::from_value(pr.4).unwrap_or_default(),
-            github_url: pr.5,
-            linked_project_id: pr.6,
-            linked_project_name: linked_name,
-            created_at: pr.7.to_rfc3339(),
+            id: pr.try_get("id").map_err(|e| e.to_string())?,
+            resume_id: pr.try_get("resume_id").map_err(|e| e.to_string())?,
+            name: pr.try_get("name").map_err(|e| e.to_string())?,
+            description: pr.try_get("description").map_err(|e| e.to_string())?,
+            tech_stack: serde_json::from_value(
+                pr.try_get::<serde_json::Value, _>("tech_stack").map_err(|e| e.to_string())?
+            ).unwrap_or_default(),
+            github_url: pr.try_get("github_url").map_err(|e| e.to_string())?,
+            linked_project_id: pr.try_get("linked_project_id").map_err(|e| e.to_string())?,
+            linked_project_name: pr.try_get("linked_project_name").map_err(|e| e.to_string())?,
+            created_at: pr.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")
+                .map(|d| d.to_rfc3339())
+                .map_err(|e| e.to_string())?,
         });
     }
 
-    let education: Vec<Education> = serde_json::from_value(row.4).unwrap_or_default();
-    let work_experience: Vec<WorkExperience> = serde_json::from_value(row.5).unwrap_or_default();
-    let skills: Vec<String> = serde_json::from_value(row.6).unwrap_or_default();
+    let education: Vec<Education> = serde_json::from_value(
+        row.try_get::<serde_json::Value, _>("education").map_err(|e| e.to_string())?
+    ).unwrap_or_default();
+    let work_experience: Vec<WorkExperience> = serde_json::from_value(
+        row.try_get::<serde_json::Value, _>("work_experience").map_err(|e| e.to_string())?
+    ).unwrap_or_default();
+    let skills: Vec<String> = serde_json::from_value(
+        row.try_get::<serde_json::Value, _>("skills").map_err(|e| e.to_string())?
+    ).unwrap_or_default();
 
     Ok(Some(ResumeProfile {
-        id: row.0,
-        raw_text: row.1,
-        name: row.2,
-        email: row.3,
+        id: profile_id,
+        raw_text: row.try_get("raw_text").map_err(|e| e.to_string())?,
+        name: row.try_get("name").map_err(|e| e.to_string())?,
+        email: row.try_get("email").map_err(|e| e.to_string())?,
         education,
         work_experience,
         skills,
         projects,
-        created_at: row.7.to_rfc3339(),
-        updated_at: row.8.to_rfc3339(),
+        created_at: row.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")
+            .map(|d| d.to_rfc3339())
+            .map_err(|e| e.to_string())?,
+        updated_at: row.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at")
+            .map(|d| d.to_rfc3339())
+            .map_err(|e| e.to_string())?,
     }))
 }
 

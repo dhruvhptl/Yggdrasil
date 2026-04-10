@@ -590,21 +590,6 @@ async fn fetch_page_title(url: &str) -> String {
     }
 }
 
-// ─── PDF text extraction ────────────────────────────────────────────────────
-
-fn extract_text_from_pdf(bytes: &[u8]) -> Result<(String, i32), String> {
-    let text = pdf_extract::extract_text_from_mem(bytes)
-        .map_err(|e| format!("PDF extraction failed: {}", e))?;
-
-    // Strip null bytes
-    let text = text.replace('\0', "").trim().to_string();
-
-    // Rough page estimate (pdf-extract doesn't give page count directly)
-    let pages = (text.len() as f64 / 3000.0).ceil().max(1.0) as i32;
-
-    Ok((text, pages))
-}
-
 // ─── Tauri commands ─────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -950,11 +935,26 @@ pub async fn ingest_mimir_pdf(
 
 #[tauri::command]
 pub async fn extract_pdf_text(pdf_base64: String) -> Result<PdfTextResult, String> {
-    let bytes = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD, &pdf_base64
-    ).map_err(|e| format!("Invalid base64: {}", e))?;
+    // Use Python scraper (pymupdf) for better layout handling — same as ingest_mimir_pdf
+    let client = reqwest::Client::new();
+    let scraper_resp = client
+        .post(format!("{}/fetch-pdf", SCRAPER_URL))
+        .json(&json!({ "pdf_base64": pdf_base64, "filename": "" }))
+        .timeout(std::time::Duration::from_secs(60))
+        .send()
+        .await
+        .map_err(|e| format!("Scraper request failed: {}", e))?;
 
-    let (text, pages) = extract_text_from_pdf(&bytes)?;
+    if !scraper_resp.status().is_success() {
+        let err: serde_json::Value = scraper_resp.json().await.unwrap_or_default();
+        return Err(err["detail"].as_str().unwrap_or("PDF extraction failed").to_string());
+    }
+
+    let result: serde_json::Value = scraper_resp.json().await
+        .map_err(|e| format!("Failed to parse scraper response: {}", e))?;
+
+    let text = result["text"].as_str().unwrap_or("").to_string();
+    let pages = result["pages"].as_i64().unwrap_or(1) as i32;
 
     if text.len() < 50 {
         return Err("Could not extract meaningful text from PDF".to_string());
@@ -962,15 +962,15 @@ pub async fn extract_pdf_text(pdf_base64: String) -> Result<PdfTextResult, Strin
 
     println!("📄 Extracted PDF text: {} chars, {} pages", text.len(), pages);
     Ok(PdfTextResult {
-        text: text.clone(),
-        pages,
         chars: text.len() as i32,
+        text,
+        pages,
     })
 }
 
 // ─── Match node to resources ────────────────────────────────────────────────
 
-async fn match_node_impl(
+pub async fn match_node_impl(
     pool: &sqlx::PgPool,
     client: &reqwest::Client,
     node_id: &str,
