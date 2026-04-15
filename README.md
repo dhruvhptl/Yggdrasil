@@ -2,37 +2,6 @@
 
 A personal learning OS. Paste a project repo or PRD, get an AI-generated skill tree of everything behind what you built. Co-op experience, job applications, and learning progress all feed into a Universal Skill Tree — your living proof of expertise.
 
-## Architecture
-
-```
-React frontend (Vite, port 1420)
-       ↓
-Rust backend (Tauri commands)  ←→  Neon Postgres (pgvector, vector(1024))
-                                ←→  OpenRouter (tree gen: Kimi K2 + Gemini Flash)
-                                ←→  Groq (chat synthesis + reranking: LLaMA 3.3-70b)
-
-Python scraper (port 3002)     ←→  OpenRouter (embeddings: pplx-embed-v1-0.6b)
-```
-
-Mimir (resource ingestion, RAG, embeddings) runs as **native Rust** inside the Tauri process — no separate sidecar.
-
-## Tech Stack
-
-| Layer | Technology |
-|---|---|
-| Frontend | React 19 + TypeScript + Vite + Tailwind |
-| Desktop | Tauri 2.0 |
-| Backend | Rust + sqlx |
-| Database | Postgres on Neon (pgvector, `vector(1024)`) |
-| Tree generation | Kimi K2 via OpenRouter (outline + checkpoint expansion) |
-| Concept graph | Gemini Flash via OpenRouter |
-| Chat + extraction | Groq — LLaMA 3.3-70b-versatile + 3.1-8b-instant (reranker) |
-| Embeddings | Perplexity pplx-embed-v1-0.6b (1024-dim) via OpenRouter |
-| Tree renderer | Custom HTML Canvas (tapered filled branches, polar layout, atmospheric roots) |
-| Visualizations | D3 force simulation |
-| Mimir | Native Rust in `mimir.rs` — no sidecar |
-| Scraper | Python FastAPI (port 3002) — URL scraping, PDF extraction (pymupdf), playlists |
-
 ## Prerequisites
 
 | Tool | Install | Version |
@@ -88,14 +57,21 @@ Store the following as **password** items in your Bitwarden vault:
 
 `dev.sh` derives the following from the above automatically:
 
+```bash
+DATABASE_URL=postgresql://user:pass@host.neon.tech/neondb?sslmode=require
+GROQ_API_KEY=gsk_...
+OPENROUTER_API_KEY=sk-or-...
+TREE_GEN_API_KEY=sk-or-...  # same as OPENROUTER_API_KEY
+TREE_GEN_BASE_URL=https://openrouter.ai/api/v1/chat/completions
+TREE_GEN_MODEL=moonshotai/kimi-k2
+CONCEPT_GRAPH_MODEL=google/gemini-2.5-flash
+CONCEPT_GRAPH_BASE_URL=https://openrouter.ai/api/v1/chat/completions
+CONCEPT_GRAPH_API_KEY=sk-or-...  # same as OPENROUTER_API_KEY
+YOUTUBE_API_KEY=...
+GITHUB_TOKEN=ghp_...
 ```
-TREE_GEN_API_KEY        = OPENROUTER_API_KEY
-TREE_GEN_BASE_URL       = https://openrouter.ai/api/v1/chat/completions
-TREE_GEN_MODEL          = google/gemini-2.5-flash
-CONCEPT_GRAPH_MODEL     = google/gemini-2.5-flash
-CONCEPT_GRAPH_BASE_URL  = https://openrouter.ai/api/v1/chat/completions
-CONCEPT_GRAPH_API_KEY   = OPENROUTER_API_KEY
-```
+
+Then run `npm run tauri dev` directly instead of `bash dev.sh`.
 
 ## Run
 
