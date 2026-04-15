@@ -13,12 +13,15 @@ export default function ProjectTreePage() {
   const [projectName, setProjectName] = useState<string>('');
   const [inputMode, setInputMode] = useState<InputMode>('prd');
   const [prdText, setPrdText] = useState<string>('');
+  const [pdfFileName, setPdfFileName] = useState<string | null>(null);
+  const [isPdfExtracting, setIsPdfExtracting] = useState(false);
   const [githubUrl, setGithubUrl] = useState<string>('');
   const [isGenerating, setIsGenerating] = useState(false);
   const [treeKey, setTreeKey] = useState(0);
   const [prdOpen, setPrdOpen] = useState(true);
   const [hasTree, setHasTree] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
+  const pdfInputRef = React.useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (projectId) {
@@ -33,6 +36,47 @@ export default function ProjectTreePage() {
   }, [projectId, treeKey]);
 
   const canSubmit = inputMode === 'prd' ? prdText.trim().length > 0 : githubUrl.trim().length > 0;
+
+  const handlePdfUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setIsPdfExtracting(true);
+    setPdfFileName(file.name);
+    setPrdText('');
+
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const bytes = new Uint8Array(arrayBuffer);
+      let binary = '';
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+      const base64 = btoa(binary);
+
+      const response = await fetch('http://localhost:3002/fetch-pdf', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pdf_base64: base64, filename: file.name }),
+      });
+
+      if (!response.ok) {
+        const err = await response.text();
+        throw new Error(`Scraper error: ${err}`);
+      }
+
+      const data = await response.json();
+      const text: string = data.text ?? '';
+      if (!text.trim()) throw new Error('PDF extracted no text — it may be scanned/image-based.');
+
+      setPrdText(text);
+    } catch (err) {
+      alert(`PDF extraction failed: ${err}`);
+      setPdfFileName(null);
+    } finally {
+      setIsPdfExtracting(false);
+      // Reset input so the same file can be re-selected
+      if (pdfInputRef.current) pdfInputRef.current.value = '';
+    }
+  };
 
   const handleExport = async () => {
     if (!projectId || isExporting) return;
@@ -139,14 +183,79 @@ export default function ProjectTreePage() {
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
             {inputMode === 'prd' ? (
               <>
-                <label className="text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wider">
-                  Project PRD
-                </label>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="text-xs font-medium text-slate-400 uppercase tracking-wider">
+                    Project PRD
+                  </label>
+                  <div>
+                    <input
+                      ref={pdfInputRef}
+                      type="file"
+                      accept=".pdf"
+                      style={{ display: 'none' }}
+                      onChange={handlePdfUpload}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => pdfInputRef.current?.click()}
+                      disabled={isPdfExtracting}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: 4,
+                        padding: '3px 8px', borderRadius: 5, fontSize: 11,
+                        background: 'rgba(16,185,129,0.08)',
+                        border: '1px solid rgba(16,185,129,0.25)',
+                        color: isPdfExtracting ? '#475569' : '#6ee7b7',
+                        cursor: isPdfExtracting ? 'not-allowed' : 'pointer',
+                        fontFamily: 'inherit', whiteSpace: 'nowrap',
+                        transition: 'background 0.15s, border-color 0.15s',
+                      }}
+                      onMouseEnter={e => { if (!isPdfExtracting) (e.currentTarget.style.background = 'rgba(16,185,129,0.15)'); }}
+                      onMouseLeave={e => { (e.currentTarget.style.background = 'rgba(16,185,129,0.08)'); }}
+                    >
+                      {isPdfExtracting ? (
+                        <>
+                          <svg style={{ width: 11, height: 11, animation: 'spin 1s linear infinite' }} viewBox="0 0 24 24" fill="none">
+                            <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25"/>
+                            <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round"/>
+                          </svg>
+                          Extracting…
+                        </>
+                      ) : (
+                        <>
+                          <svg style={{ width: 11, height: 11 }} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                            <polyline points="14 2 14 8 20 8"/>
+                            <line x1="12" y1="18" x2="12" y2="12"/>
+                            <line x1="9" y1="15" x2="15" y2="15"/>
+                          </svg>
+                          Upload PDF
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+                {pdfFileName && !isPdfExtracting && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+                    <svg style={{ width: 11, height: 11, color: '#6ee7b7', flexShrink: 0 }} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                      <polyline points="20 6 9 17 4 12"/>
+                    </svg>
+                    <span style={{ fontSize: 11, color: '#94a3b8', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {pdfFileName}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => { setPdfFileName(null); setPrdText(''); }}
+                      style={{ background: 'none', border: 'none', color: '#475569', cursor: 'pointer', fontSize: 13, lineHeight: 1, padding: '0 2px', flexShrink: 0 }}
+                      title="Clear"
+                    >×</button>
+                  </div>
+                )}
                 <textarea
                   value={prdText}
-                  onChange={e => setPrdText(e.target.value)}
-                  placeholder={`Paste your PRD here…\n\nExample:\n# Project: Learn Quantum Computing\n## Goal\nBuild foundational understanding…\n\n## Core Topics\n- Linear algebra\n- Quantum circuits\n- Key algorithms`}
-                  className="flex-1 bg-slate-950 border border-slate-700 rounded-md p-3 text-sm text-slate-200 font-mono resize-none focus:outline-none focus:border-emerald-600"
+                  onChange={e => { setPrdText(e.target.value); if (pdfFileName) setPdfFileName(null); }}
+                  placeholder={isPdfExtracting ? 'Extracting text from PDF…' : `Paste your PRD here…\n\nExample:\n# Project: Learn Quantum Computing\n## Goal\nBuild foundational understanding…\n\n## Core Topics\n- Linear algebra\n- Quantum circuits\n- Key algorithms`}
+                  disabled={isPdfExtracting}
+                  className="flex-1 bg-slate-950 border border-slate-700 rounded-md p-3 text-sm text-slate-200 font-mono resize-none focus:outline-none focus:border-emerald-600 disabled:opacity-40"
                   style={{ minHeight: 0 }}
                 />
               </>
@@ -172,7 +281,7 @@ export default function ProjectTreePage() {
 
           <button
             onClick={handleGenerate}
-            disabled={isGenerating || !canSubmit}
+            disabled={isGenerating || isPdfExtracting || !canSubmit}
             className="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-700 disabled:text-slate-500 disabled:cursor-not-allowed text-white rounded-md font-medium text-sm transition-colors"
           >
             {isGenerating ? (

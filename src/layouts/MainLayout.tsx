@@ -1,8 +1,9 @@
 // src/layouts/MainLayout.tsx
-import { ReactNode, useState } from "react";
+import { ReactNode, useEffect, useState } from "react";
 import { NavLink } from "react-router-dom";
 import { TreePine, Home, CalendarDays, Library, Briefcase, ClipboardList, Lightbulb, FileText, Sparkles } from "lucide-react";
 import MimirChat from "../components/MimirChat";
+import { useMimirContext } from "../contexts/MimirContext";
 
 interface MainLayoutProps {
   children: ReactNode;
@@ -10,6 +11,11 @@ interface MainLayoutProps {
 
 export default function MainLayout({ children }: MainLayoutProps) {
   const [chatOpen, setChatOpen] = useState(false);
+  const { registerOpenMimir } = useMimirContext();
+
+  useEffect(() => {
+    registerOpenMimir(() => setChatOpen(true));
+  }, []);
 
   return (
     <div className="h-screen flex bg-slate-950 text-slate-100" style={{ position: "relative" }}>

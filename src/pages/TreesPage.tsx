@@ -2,13 +2,24 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { TreePine } from "lucide-react";
+import { TreePine, Trash2 } from "lucide-react";
 import { Project } from "../types";
 
 export default function TreesPage() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
   const navigate = useNavigate();
+
+  async function handleDeleteProject(e: React.MouseEvent, projectId: string) {
+    e.stopPropagation();
+    if (!confirm("Delete this project? This will remove the tree and all progress.")) return;
+    try {
+      await invoke("delete_project", { projectId });
+      setProjects((prev) => prev.filter((p) => p.id !== projectId));
+    } catch (err) {
+      console.error("Failed to delete project:", err);
+    }
+  }
 
   useEffect(() => {
     invoke<Project[]>("get_projects")
@@ -86,6 +97,13 @@ export default function TreesPage() {
                   </div>
                 )}
 
+                <button
+                  onClick={(e) => handleDeleteProject(e, project.id)}
+                  className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded text-slate-600 hover:text-red-400 hover:bg-red-950/40 flex-shrink-0"
+                  title="Delete project"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
                 <span className="text-slate-700 group-hover:text-emerald-600 transition-colors text-sm flex-shrink-0">
                   →
                 </span>

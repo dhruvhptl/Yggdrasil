@@ -7,6 +7,11 @@ use tauri::State;
 use uuid::Uuid;
 use crate::database::Database;
 
+/// Token budget for each per-skill checkpoint expansion call (Stage 2).
+/// Every call to expand_skill_checkpoints uses this constant — never a local
+/// literal — so there is one place to change and no risk of per-skill drift.
+const CHECKPOINT_EXPANSION_MAX_TOKENS: u32 = 1500;
+
 /// Accept both `"id": "abc"` and `"id": 9` from LLM output
 fn string_or_int<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
     #[derive(Deserialize)]
@@ -94,12 +99,27 @@ struct GroqMessage {
 
 // ─── Concept graph types ─────────────────────────────────────────────────────
 
+/// One concept extracted from the project. Every field forces the LLM to be
+/// evidence-grounded: it must name the concept type, cite files, and explain
+/// why it's in this specific project — not generic knowledge.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Concept {
     id: String,
     name: String,
     description: String,
     prerequisites: Vec<String>,
+    /// "algorithm" | "data_structure" | "protocol" | "pattern" | "framework" |
+    /// "language_feature" | "infrastructure" | "library"
+    #[serde(default)]
+    concept_type: String,
+    /// Source files, manifest entries, or doc sections that demonstrate this
+    /// concept is actually used in the project. Empty = LLM invented it.
+    #[serde(default)]
+    supporting_files: Vec<String>,
+    /// One sentence: how this concept manifests in this specific codebase
+    /// (e.g. "Used in mimir.rs to embed chunks via pplx-embed-v1-0.6b").
+    #[serde(default)]
+    project_relevance: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -109,12 +129,98 @@ struct ConceptGraph {
     relevant_files: Vec<String>,
 }
 
+// ─── Repo profile types ───────────────────────────────────────────────────────
+
+/// Intermediate summary of what the repo actually is, produced after the
+/// concept graph but before full tree generation. Forces a grounding step:
+/// the tree generator works from this profile, not from raw repo dumps.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct RepoProfile {
+    /// One-paragraph plain-English summary of what the project does.
+    summary: String,
+    /// Detected stack: language(s), frameworks, databases, key libraries.
+    stack: Vec<String>,
+    /// Distinct subsystems or modules (e.g. "Mimir ingestion pipeline",
+    /// "Canvas tree renderer", "GitHub repo analyser").
+    subsystems: Vec<String>,
+    /// List of concept ids from the ConceptGraph that are well-evidenced.
+    /// The tree generator should prioritise these.
+    evidenced_concept_ids: Vec<String>,
+}
+
+// ─── JSON cleanup helper ─────────────────────────────────────────────────────
+
+/// Strip markdown fences and leading/trailing whitespace from an LLM response
+/// before handing it to serde_json. Also tries to extract the first top-level
+/// JSON object if the model still emitted surrounding prose.
+fn clean_llm_json(raw: &str) -> String {
+    let s = raw.trim();
+
+    // Strip ```json ... ``` or ``` ... ``` fences
+    let s = if let Some(inner) = s.strip_prefix("```json") {
+        inner.strip_suffix("```").unwrap_or(inner).trim()
+    } else if let Some(inner) = s.strip_prefix("```") {
+        inner.strip_suffix("```").unwrap_or(inner).trim()
+    } else {
+        s
+    };
+
+    // If there's still surrounding prose, try to extract the first top-level
+    // JSON object (scan for the outermost { ... } pair).
+    if !s.starts_with('{') {
+        if let Some(start) = s.find('{') {
+            let candidate = &s[start..];
+            // Walk forward to find the matching closing brace.
+            // Must be string-aware: { and } inside string literals must not
+            // affect depth. Uses the same idiom as repair_truncated_tree_json.
+            let mut depth = 0i32;
+            let mut end = None;
+            let mut in_string = false;
+            let mut escape_next = false;
+            for (i, ch) in candidate.char_indices() {
+                if escape_next { escape_next = false; continue; }
+                if ch == '\\' && in_string { escape_next = true; continue; }
+                if ch == '"' { in_string = !in_string; continue; }
+                if in_string { continue; }
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(i + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(e) = end {
+                return candidate[..e].trim().to_string();
+            }
+        }
+    }
+
+    s.to_string()
+}
+
 // ─── Concept graph extraction ────────────────────────────────────────────────
 
 fn build_concept_graph_system_prompt() -> &'static str {
-    r#"You are a knowledge graph architect. Extract the key concepts from this codebase/project and their prerequisite relationships.
+    r#"You are a knowledge graph architect performing evidence-grounded concept extraction.
 
-If the user prompt includes a FILE PATHS section, also select up to 10 file paths that are most relevant to the extracted concepts. These files will be fetched for deeper analysis. Pick files that contain the core logic, not tests or configs.
+Your job: read the provided project context (README, dependency manifests, source files, file path list) and extract the specific concepts, algorithms, and patterns that are **demonstrably present** in this codebase.
+
+## Evidence requirement (strictly enforced)
+
+Every concept you output MUST be supported by at least one of:
+- A named dependency in package.json / Cargo.toml / requirements.txt / go.mod
+- A named import, function call, or struct in a source file shown to you
+- A section of the README that explicitly describes using this technique
+- A file path whose name strongly implies this concept (e.g. "src/rag.rs" → RAG retrieval)
+
+If you cannot name a file or manifest entry that proves a concept is used, do NOT include it.
+
+## Schema
 
 Output ONLY valid JSON:
 {
@@ -122,51 +228,71 @@ Output ONLY valid JSON:
     {
       "id": "snake_case_id",
       "name": "Concept Name",
-      "description": "One sentence — what this concept is and how it appears in this project",
-      "prerequisites": ["id_of_prerequisite"]
+      "description": "One sentence — what this concept is and how it is specifically used in this project",
+      "concept_type": "algorithm|data_structure|protocol|pattern|framework|language_feature|infrastructure|library",
+      "supporting_files": ["path/to/file.rs", "Cargo.toml"],
+      "project_relevance": "One sentence: how this concept manifests in this specific codebase (name actual files, structs, or functions)",
+      "prerequisites": ["id_of_prerequisite_concept"]
     }
   ],
   "relevant_files": ["src/main.rs", "src/lib.rs"]
 }
 
-Rules:
+## Rules
+
 - 8-20 concepts
-- Concepts must be specific to this project — name the actual techniques, patterns, and algorithms the author used
-- prerequisites must reference valid concept ids in this response
-- No circular dependencies
+- Every concept must have at least one entry in supporting_files
+- supporting_files must be paths you actually saw in the provided context — no invented paths
+- project_relevance must name at least one real file, struct, function, or library from the context
+- prerequisites must reference valid concept ids in this response, no circular deps
 - Foundational concepts have empty prerequisites array
-- Every concept must be demonstrably present in the codebase
-- relevant_files: up to 10 paths from the provided file list, most relevant to the concepts
-- If no file paths are provided, omit relevant_files or return an empty array
-Respond with ONLY the JSON."#
+- relevant_files: up to 10 paths from the FILE PATHS list that contain the most core logic
+- REJECT generic concepts like "Software Architecture", "Error Handling", "Testing", "Async Programming" unless they are the primary technical subject of a specific file
+- concept_type must be one of the 8 values listed above
+
+Respond with ONLY the JSON. No markdown, no preamble."#
 }
 
-async fn extract_concept_graph(api_key: &str, context: &str) -> Result<ConceptGraph, String> {
+async fn extract_concept_graph(client: &reqwest::Client, context: &str) -> Result<ConceptGraph, String> {
     let user_prompt = format!(
         "Extract the concept dependency graph from this project:\n\n{}\n\nGenerate the concept graph JSON:",
         context
     );
 
     let concept_model = std::env::var("CONCEPT_GRAPH_MODEL")
-        .unwrap_or_else(|_| "llama-3.3-70b-versatile".to_string());
+        .unwrap_or_else(|_| "google/gemini-2.5-flash".to_string());
     let concept_base_url = std::env::var("CONCEPT_GRAPH_BASE_URL")
-        .unwrap_or_else(|_| "https://api.groq.com/openai/v1/chat/completions".to_string());
+        .unwrap_or_else(|_| "https://openrouter.ai/api/v1/chat/completions".to_string());
     let concept_api_key = std::env::var("CONCEPT_GRAPH_API_KEY")
-        .unwrap_or_else(|_| api_key.to_string());
+        .or_else(|_| std::env::var("OPENROUTER_API_KEY"))
+        .unwrap_or_default();
     println!("🧠 Concept graph model: {} via {}", concept_model, concept_base_url);
 
-    let graph_json = call_llm(
+    let raw_graph_json = call_llm(
+        client,
         &concept_base_url,
         &concept_api_key,
         &concept_model,
         build_concept_graph_system_prompt(),
         &user_prompt,
+        4096,
+        true,
     )
     .await?;
 
+    // Log a preview before attempting to parse
+    let preview_len = raw_graph_json.len().min(600);
+    println!("🔎 Concept graph raw response ({} chars): {}{}",
+        raw_graph_json.len(),
+        &raw_graph_json[..preview_len],
+        if raw_graph_json.len() > preview_len { "…" } else { "" }
+    );
+
+    let graph_json = clean_llm_json(&raw_graph_json);
+
     // Parse via Value first to tolerate LLM quirks like duplicate keys
     let value: serde_json::Value = serde_json::from_str(&graph_json)
-        .map_err(|e| format!("Concept graph JSON is not valid JSON: {}", e))?;
+        .map_err(|e| format!("Concept graph JSON is not valid JSON: {} (raw preview: {}…)", e, &raw_graph_json[..raw_graph_json.len().min(200)]))?;
     let graph: ConceptGraph = serde_json::from_value(value)
         .map_err(|e| format!("Concept graph JSON doesn't match schema: {}", e))?;
 
@@ -284,6 +410,168 @@ fn build_graph_context(sorted_concepts: &[Concept]) -> String {
     }
 
     out
+}
+
+// ─── Repo profile (intermediate grounding stage) ─────────────────────────────
+
+fn build_repo_profile_system_prompt() -> &'static str {
+    r#"You are a codebase analyst. Given repository context (README, dependency manifests, source files) and an already-extracted concept graph, produce a concise structured profile of the project.
+
+Output ONLY valid JSON:
+{
+  "summary": "One paragraph — what this project does, who it is for, and the key technical approach",
+  "stack": ["language or framework or library, one per entry, e.g. 'Rust', 'React 19', 'pgvector', 'Groq LLaMA 3.3-70b'"],
+  "subsystems": ["Each distinct module or subsystem as a short label, e.g. 'Mimir ingestion pipeline', 'Canvas tree renderer'"],
+  "evidenced_concept_ids": ["concept_id_1", "concept_id_2"]
+}
+
+Rules:
+- summary: one dense paragraph, no bullet points. Name the actual technologies.
+- stack: list every distinct technology visible in the manifest and source files. Include specific versions or model names where shown.
+- subsystems: identify 3-8 distinct functional modules. Name them after what they DO, not what they ARE.
+- evidenced_concept_ids: include only concept ids from the provided concept graph that are directly confirmed by manifest entries or source file content. Omit any concept whose only evidence is the README description.
+- Respond with ONLY the JSON. No markdown, no preamble."#
+}
+
+async fn build_repo_profile(
+    client: &reqwest::Client,
+    repo_context: &str,
+    concept_graph: &ConceptGraph,
+    sorted_concepts: &[Concept],
+) -> Result<RepoProfile, String> {
+    // Build a compact concept list for the prompt
+    let concept_summary: String = sorted_concepts
+        .iter()
+        .map(|c| format!("  id={} name=\"{}\" files={:?}", c.id, c.name, c.supporting_files))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let user_prompt = format!(
+        "Repository context:\n{}\n\nExtracted concept graph ({} concepts):\n{}\n\nGenerate the repo profile JSON:",
+        repo_context,
+        concept_graph.concepts.len(),
+        concept_summary
+    );
+
+    let concept_model = std::env::var("CONCEPT_GRAPH_MODEL")
+        .unwrap_or_else(|_| "google/gemini-2.5-flash".to_string());
+    let concept_base_url = std::env::var("CONCEPT_GRAPH_BASE_URL")
+        .unwrap_or_else(|_| "https://openrouter.ai/api/v1/chat/completions".to_string());
+    let concept_api_key = std::env::var("CONCEPT_GRAPH_API_KEY")
+        .or_else(|_| std::env::var("OPENROUTER_API_KEY"))
+        .unwrap_or_default();
+
+    println!("🔍 Building repo profile…");
+    let profile_json = call_llm(
+        client,
+        &concept_base_url,
+        &concept_api_key,
+        &concept_model,
+        build_repo_profile_system_prompt(),
+        &user_prompt,
+        2048,
+        true,
+    )
+    .await?;
+
+    let profile_json_clean = clean_llm_json(&profile_json);
+    let value: serde_json::Value = serde_json::from_str(&profile_json_clean)
+        .map_err(|e| format!("Repo profile JSON invalid: {}", e))?;
+    let profile: RepoProfile = serde_json::from_value(value)
+        .map_err(|e| format!("Repo profile doesn't match schema: {}", e))?;
+
+    println!(
+        "  📋 Stack: {}, Subsystems: {}, Evidenced concepts: {}",
+        profile.stack.len(),
+        profile.subsystems.len(),
+        profile.evidenced_concept_ids.len()
+    );
+    Ok(profile)
+}
+
+// ─── PRD profile (grounding stage for PRD-based tree gen) ────────────────────
+
+fn build_prd_profile_system_prompt() -> &'static str {
+    r#"You are a learning-path analyst. Given a project PRD and an already-extracted concept dependency graph, produce a concise structured profile for use in skill tree generation.
+
+Output ONLY valid JSON:
+{
+  "goal": "One sentence — what this project does and who it is for",
+  "stack": ["technology or library, one per entry, e.g. 'Rust', 'React 19', 'pgvector', 'Groq LLaMA 3.3-70b'"],
+  "subsystems": ["Each distinct functional module or subsystem, e.g. 'RAG ingestion pipeline', 'Canvas tree renderer'"],
+  "key_concepts": [
+    {
+      "name": "Concept name",
+      "depends_on": ["prerequisite concept name"]
+    }
+  ]
+}
+
+Rules:
+- goal: one tight sentence. Name the specific domain or technical niche.
+- stack: extract every technology named in the PRD. Include model names, database types, protocol names.
+- subsystems: 3-8 modules named after what they DO (verbs), not what they ARE (nouns).
+- key_concepts: 6-12 entries drawn from the concept graph. Order from foundational to advanced. depends_on lists direct prerequisites by name.
+- Respond with ONLY the JSON. No markdown, no preamble."#
+}
+
+/// Lightweight PRD profile used to anchor skill expansion calls.
+/// Mirrors build_repo_profile — produces a structured summary instead of
+/// passing raw PRD text into each of the 9 checkpoint expansion calls.
+async fn build_prd_profile(
+    client: &reqwest::Client,
+    prd_text: &str,
+    sorted_concepts: &[Concept],
+) -> Result<String, String> {
+    let concept_summary: String = sorted_concepts
+        .iter()
+        .map(|c| {
+            if c.prerequisites.is_empty() {
+                format!("  {} — {} [no prerequisites]", c.name, c.description)
+            } else {
+                format!("  {} — {} [requires: {}]", c.name, c.description, c.prerequisites.join(", "))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let prd_excerpt = if prd_text.len() > 4000 { &prd_text[..4000] } else { prd_text };
+
+    let user_prompt = format!(
+        "PRD:\n{}\n\nConcept graph ({} concepts, topologically sorted):\n{}\n\nGenerate the project profile JSON:",
+        prd_excerpt,
+        sorted_concepts.len(),
+        concept_summary
+    );
+
+    let concept_model = std::env::var("CONCEPT_GRAPH_MODEL")
+        .unwrap_or_else(|_| "google/gemini-2.5-flash".to_string());
+    let concept_base_url = std::env::var("CONCEPT_GRAPH_BASE_URL")
+        .unwrap_or_else(|_| "https://openrouter.ai/api/v1/chat/completions".to_string());
+    let concept_api_key = std::env::var("CONCEPT_GRAPH_API_KEY")
+        .or_else(|_| std::env::var("OPENROUTER_API_KEY"))
+        .unwrap_or_default();
+
+    println!("🔍 Building PRD profile…");
+    let raw = call_llm(
+        client,
+        &concept_base_url,
+        &concept_api_key,
+        &concept_model,
+        build_prd_profile_system_prompt(),
+        &user_prompt,
+        1024,
+        true,
+    )
+    .await?;
+
+    let clean = clean_llm_json(&raw);
+    // Validate it's parseable JSON — if not, return error so caller can fall back
+    serde_json::from_str::<serde_json::Value>(&clean)
+        .map_err(|e| format!("PRD profile JSON invalid: {}", e))?;
+
+    println!("  ✅ PRD profile built ({} chars)", clean.len());
+    Ok(clean)
 }
 
 // ─── Database helpers ────────────────────────────────────────────────────────
@@ -438,8 +726,9 @@ async fn auto_match_tree_nodes(pool: &sqlx::PgPool, leaf_node_ids: &[String]) {
     }
 }
 
-// ─── System prompts ──────────────────────────────────────────────────────────
+// ─── Legacy monolithic system prompts (kept for reference, not currently used) ─
 
+#[allow(dead_code)]
 fn build_system_prompt() -> String {
     r#"You are a learning path architect for Yggdrasil, a skill tree app that helps developers deeply understand projects they've built.
 
@@ -538,8 +827,8 @@ Connect to a specific feature, design choice, or constraint from the PRD.
 
 ## Structure
 
-- 3-5 phases
-- 2-4 skills per phase
+- Exactly 3 phases (no more, no fewer)
+- Exactly 3 skills per phase
 - Exactly 3 checkpoints per skill
 - Every phase must map to real concepts in the PRD — no filler phases
 
@@ -628,6 +917,7 @@ Respond with ONLY the JSON object. No markdown, no explanation.
 "#.to_string()
 }
 
+#[allow(dead_code)]
 fn build_repo_system_prompt() -> String {
     r#"You are a learning path architect for Yggdrasil, a skill tree app that helps developers deeply understand projects they've built.
 
@@ -739,8 +1029,8 @@ Name a specific class, function, file, or behavior from THIS codebase.
 
 ## Structure
 
-- 3-5 phases
-- 2-4 skills per phase
+- Exactly 3 phases (no more, no fewer)
+- Exactly 3 skills per phase
 - Exactly 3 checkpoints per skill
 - Every skill must be derived from actual evidence in the repository data
 
@@ -913,7 +1203,7 @@ async fn fetch_repo_tree(gh: &reqwest::Client, base: &str) -> Result<Vec<String>
         .await
         .map_err(|e| format!("Failed to parse tree response: {}", e))?;
 
-    let skip_prefixes = ["node_modules/", "target/", ".git/", "dist/", "build/", ".sqlx/", "__pycache__/", ".venv/"];
+    let skip_prefixes = ["node_modules/", "target/", ".git/", "dist/", "build/", ".sqlx/", "__pycache__/", ".venv/", "sidecar/"];
 
     let mut paths: Vec<String> = body["tree"]
         .as_array()
@@ -979,7 +1269,6 @@ fn select_fallback_files(all_paths: &[String], max: usize) -> Vec<String> {
     // Layers with their path prefixes and allowed extensions
     let layers: &[(&str, &[&str])] = &[
         ("src-tauri/src/", &[".rs"]),
-        ("sidecar/src/", &[".ts"]),
         ("src/components/", &[".tsx", ".ts"]),
         ("src/pages/", &[".tsx", ".ts"]),
     ];
@@ -1022,6 +1311,7 @@ fn select_fallback_files(all_paths: &[String], max: usize) -> Vec<String> {
             }
             let lower = path.to_lowercase();
             if general_exts.iter().any(|ext| lower.ends_with(ext))
+                && !lower.starts_with("sidecar/")
                 && !lower.contains("test")
                 && !lower.contains("spec")
                 && !selected.contains(path)
@@ -1044,27 +1334,606 @@ fn select_fallback_files(all_paths: &[String], max: usize) -> Vec<String> {
     selected
 }
 
+// ─── Two-stage tree generation types ─────────────────────────────────────────
+
+/// Outline-only skill (no checkpoints) — Stage 1 output
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct OutlineSkill {
+    #[serde(default, deserialize_with = "string_or_int_default")]
+    id: String,
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    order: i32,
+}
+
+/// Outline-only phase — Stage 1 output
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct OutlinePhase {
+    #[serde(default, deserialize_with = "string_or_int_default")]
+    id: String,
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    order: i32,
+    skills: Vec<OutlineSkill>,
+}
+
+/// Full outline — Stage 1 output
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct OutlineTree {
+    #[serde(default, deserialize_with = "string_or_int_default")]
+    project_id: String,
+    phases: Vec<OutlinePhase>,
+}
+
+/// Checkpoint expansion — Stage 2 output (one call per skill)
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct CheckpointExpansion {
+    checkpoints: Vec<Checkpoint>,
+}
+
+// ─── Outline system prompts ───────────────────────────────────────────────────
+
+fn build_outline_system_prompt() -> &'static str {
+    r#"You are a learning path architect for Yggdrasil.
+
+Given a project description, generate a SKELETON learning tree — phases and skills only, no checkpoints.
+
+## Structure (strictly enforced)
+- Exactly 3 phases
+- Exactly 3 skills per phase (9 skills total)
+- NO checkpoints field
+
+## Phase design
+Phase 1 — Technology Foundations: one skill per major technology group. Every main library/framework must appear.
+Phases 2–3 — Project Patterns: skills named after this project's specific concepts, algorithms, and subsystems.
+
+## Output format — ONLY valid JSON, no markdown
+
+{
+  "project_id": "provided_below",
+  "phases": [
+    {
+      "id": "phase_1",
+      "name": "Phase name",
+      "description": "What this phase covers (1 sentence)",
+      "order": 1,
+      "skills": [
+        {
+          "id": "skill_1_1",
+          "name": "Skill name",
+          "description": "What you'll learn (1 sentence)",
+          "order": 1
+        }
+      ]
+    }
+  ]
+}
+
+Respond with ONLY the JSON. No markdown, no explanation."#
+}
+
+fn build_repo_outline_system_prompt() -> &'static str {
+    r#"You are a learning path architect for Yggdrasil.
+
+Given GitHub repository data (README, dependencies, source files, commit history), generate a SKELETON learning tree — phases and skills only, no checkpoints.
+
+## Structure (strictly enforced)
+- Exactly 3 phases
+- Exactly 3 skills per phase (9 skills total)
+- NO checkpoints field
+
+## Phase design
+Phase 1 — Technology Foundations: group major libraries and language features into skill clusters. Every main dependency must appear.
+Phases 2–3 — Project Patterns: skills named after actual patterns, algorithms, and subsystems visible in the source files.
+
+## Output format — ONLY valid JSON, no markdown
+
+{
+  "project_id": "provided_below",
+  "phases": [
+    {
+      "id": "phase_1",
+      "name": "Phase name",
+      "description": "What this phase covers (1 sentence)",
+      "order": 1,
+      "skills": [
+        {
+          "id": "skill_1_1",
+          "name": "Skill name — specific to this repo",
+          "description": "What you'll learn from this codebase (1 sentence)",
+          "order": 1
+        }
+      ]
+    }
+  ]
+}
+
+Respond with ONLY the JSON. No markdown, no explanation."#
+}
+
+// ─── Checkpoint expansion prompt ──────────────────────────────────────────────
+
+fn build_checkpoint_expansion_system_prompt() -> &'static str {
+    r#"You are a learning path architect for Yggdrasil.
+
+Given one skill from a learning tree, generate EXACTLY 3 concept checkpoints for it.
+
+## The Checkpoint Model
+
+A checkpoint is a CONCEPT, not a task. The learner reaches it by genuinely understanding the concept — not by completing a chore.
+
+Each checkpoint:
+- **title**: A noun phrase naming the concept (e.g. "PostgreSQL MVCC Concurrency Model")
+- **mastery_criteria**: What genuine understanding looks like (start with "You can explain..." or "You can predict...")
+- **exercises**: Exactly 2 specific, actionable activities to confirm understanding
+- **order**: 1, 2, or 3
+
+## BANNED title patterns
+- Imperative verbs: "Learn X", "Study X", "Read X", "Watch X"
+- "Introduction to X", "Overview of X", "Basics of X"
+- Two libraries without a concept: "NumPy and Matplotlib"
+
+## Checkpoint progression (strictly enforced)
+Checkpoint 1 — Core property: a specific, interesting property of the concept. NEVER "Basics of X".
+Checkpoint 2 — Internal mechanism: the algorithm, data structure, or mechanism that makes it work.
+Checkpoint 3 — Application in this project: connect to a specific file, function, struct, or behavior from this codebase.
+
+## Output format — ONLY valid JSON, no markdown
+
+{
+  "checkpoints": [
+    {
+      "id": "checkpoint_X_Y_1",
+      "title": "Concept name as a noun phrase",
+      "mastery_criteria": "You can explain why...",
+      "exercises": [
+        "Specific actionable activity 1",
+        "Specific actionable activity 2"
+      ],
+      "order": 1
+    }
+  ]
+}
+
+Respond with ONLY the JSON. No markdown, no explanation."#
+}
+
+// ─── Checkpoint expansion call ────────────────────────────────────────────────
+
+async fn expand_skill_checkpoints(
+    client: &reqwest::Client,
+    tree_model: &str,
+    tree_base_url: &str,
+    tree_api_key: &str,
+    phase_name: &str,
+    skill: &OutlineSkill,
+    project_context: &str,
+    skill_index: usize,
+    total_skills: usize,
+    json_mode: bool,
+) -> Result<Vec<Checkpoint>, String> {
+    let expansion_tokens = CHECKPOINT_EXPANSION_MAX_TOKENS;
+
+    // Defensive guard: if the constant ever becomes unreasonably small (e.g.
+    // due to a future edit mistake), abort before wasting an API call.
+    if expansion_tokens < 200 {
+        return Err(format!(
+            "CHECKPOINT_EXPANSION_MAX_TOKENS={} is too small (< 200) — refusing to call model for skill '{}'",
+            expansion_tokens, skill.name
+        ));
+    }
+
+    println!(
+        "  🔧 Expanding skill {}/{}: '{}' (max_tokens={})",
+        skill_index, total_skills, skill.name, expansion_tokens
+    );
+
+    let user_prompt = format!(
+        "Project context:\n{}\n\nPhase: {}\nSkill: {}\nDescription: {}\n\nGenerate exactly 3 checkpoints for this skill.",
+        project_context, phase_name, skill.name, skill.description
+    );
+
+    let raw = call_llm(
+        client,
+        tree_base_url,
+        tree_api_key,
+        tree_model,
+        build_checkpoint_expansion_system_prompt(),
+        &user_prompt,
+        expansion_tokens,
+        json_mode,
+    )
+    .await?;
+
+    let cleaned = clean_llm_json(&raw);
+    let (repaired, was_repaired) = repair_truncated_tree_json(&cleaned);
+    if was_repaired {
+        println!("    ⚠️  Checkpoint JSON repaired for skill: {}", skill.name);
+    }
+
+    let expansion: CheckpointExpansion = serde_json::from_str(&repaired)
+        .map_err(|e| format!("Checkpoint expansion parse failed for '{}': {} (raw: {}…)", skill.name, e, &raw[..raw.len().min(200)]))?;
+
+    if expansion.checkpoints.is_empty() {
+        return Err(format!("Skill '{}' expansion returned zero checkpoints", skill.name));
+    }
+
+    println!("    ✅ {} checkpoints generated", expansion.checkpoints.len());
+    Ok(expansion.checkpoints)
+}
+
+// ─── Two-stage tree assembly ──────────────────────────────────────────────────
+
+/// Run Stage 1 (outline) then Stage 2 (per-skill checkpoint expansion) and
+/// assemble into a SkillTree. Used by both generate_skill_tree and analyze_repo.
+async fn generate_tree_two_stage(
+    client: &reqwest::Client,
+    tree_model: &str,
+    tree_base_url: &str,
+    tree_api_key: &str,
+    outline_system_prompt: &str,
+    outline_user_prompt: &str,
+    project_context: &str, // compact summary passed to each expansion call
+    project_id: &str,
+    json_mode: bool,
+) -> Result<SkillTree, String> {
+    // ── Stage 1: Outline ──────────────────────────────────────────────────────
+    println!("🌿 Stage 1: generating outline (3×3 skeleton)…");
+    let raw_outline = call_llm(
+        client,
+        tree_base_url,
+        tree_api_key,
+        tree_model,
+        outline_system_prompt,
+        outline_user_prompt,
+        3000,
+        json_mode,
+    )
+    .await?;
+
+    // Log raw preview before any cleanup
+    let raw_preview_len = raw_outline.len().min(600);
+    println!("🔎 Outline raw ({} chars): {}{}",
+        raw_outline.len(),
+        &raw_outline[..raw_preview_len],
+        if raw_outline.len() > raw_preview_len { "…" } else { "" }
+    );
+
+    if raw_outline.trim().is_empty() {
+        return Err("Outline JSON is empty — model returned no content".to_string());
+    }
+
+    // Step 1: strip fences / extract first JSON object
+    let cleaned_outline = clean_llm_json(&raw_outline);
+
+    // Step 2: fix `[ { {` duplicate-open-brace pattern
+    let (deduped_outline, was_deduped) = repair_duplicate_open_braces(&cleaned_outline);
+    if was_deduped {
+        let deduped_preview = &deduped_outline[..deduped_outline.len().min(400)];
+        println!("⚠️  Outline: duplicate-brace repair applied. After repair: {}…", deduped_preview);
+    }
+
+    // Step 3: close any truncation (unmatched braces/brackets)
+    let (repaired_outline, was_truncation_repaired) = repair_truncated_tree_json(&deduped_outline);
+    if was_truncation_repaired {
+        println!("⚠️  Outline: truncation repair applied");
+    }
+
+    let mut outline: OutlineTree = serde_json::from_str(&repaired_outline)
+        .map_err(|e| format!(
+            "Outline JSON malformed after cleanup/repair: {} (raw preview: {}…)",
+            e,
+            &raw_outline[..raw_outline.len().min(300)]
+        ))?;
+    outline.project_id = project_id.to_string();
+
+    println!(
+        "✅ Outline complete: {} phases, {} total skills",
+        outline.phases.len(),
+        outline.phases.iter().map(|p| p.skills.len()).sum::<usize>()
+    );
+
+    // Fix 4: validate 3×3 structure — warn but continue
+    if outline.phases.len() != 3 {
+        println!(
+            "⚠️  Outline has {} phases (expected 3) — continuing with what was generated",
+            outline.phases.len()
+        );
+    }
+    for (pi, phase) in outline.phases.iter().enumerate() {
+        if phase.skills.len() != 3 {
+            println!(
+                "⚠️  Phase {} ('{}') has {} skills (expected 3) — continuing",
+                pi + 1, phase.name, phase.skills.len()
+            );
+        }
+    }
+
+    // ── Stage 2: Per-skill checkpoint expansion ───────────────────────────────
+    let total_skills: usize = outline.phases.iter().map(|p| p.skills.len()).sum();
+    println!("🌲 Stage 2: expanding {} skills…", total_skills);
+
+    let mut skill_index = 0usize;
+    let mut assembled_phases: Vec<Phase> = Vec::new();
+
+    for outline_phase in &outline.phases {
+        let mut assembled_skills: Vec<Skill> = Vec::new();
+
+        for outline_skill in &outline_phase.skills {
+            skill_index += 1;
+            // Fix 5: single retry with 5s delay before aborting the whole tree
+            let checkpoints = match expand_skill_checkpoints(
+                client,
+                tree_model,
+                tree_base_url,
+                tree_api_key,
+                &outline_phase.name,
+                outline_skill,
+                project_context,
+                skill_index,
+                total_skills,
+                json_mode,
+            )
+            .await
+            {
+                Ok(cps) => cps,
+                Err(first_err) => {
+                    println!(
+                        "  ⚠️  Skill '{}' expansion failed (attempt 1/2): {} — retrying in 5s…",
+                        outline_skill.name, first_err
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    expand_skill_checkpoints(
+                        client,
+                        tree_model,
+                        tree_base_url,
+                        tree_api_key,
+                        &outline_phase.name,
+                        outline_skill,
+                        project_context,
+                        skill_index,
+                        total_skills,
+                        json_mode,
+                    )
+                    .await
+                    .map_err(|e| format!("Stage 2 failed at skill '{}' after 2 attempts: {}", outline_skill.name, e))?
+                }
+            };
+
+            assembled_skills.push(Skill {
+                id: outline_skill.id.clone(),
+                name: outline_skill.name.clone(),
+                description: outline_skill.description.clone(),
+                order: outline_skill.order,
+                checkpoints,
+            });
+        }
+
+        assembled_phases.push(Phase {
+            id: outline_phase.id.clone(),
+            name: outline_phase.name.clone(),
+            description: outline_phase.description.clone(),
+            order: outline_phase.order,
+            skills: assembled_skills,
+        });
+    }
+
+    Ok(SkillTree {
+        project_id: project_id.to_string(),
+        phases: assembled_phases,
+    })
+}
+
+// ─── Outline structure repair ────────────────────────────────────────────────
+
+/// Fix the LLM habit of doubling the opening brace after an array bracket:
+///   `"phases": [ { { "id": ...`  →  `"phases": [ { "id": ...`
+///   `"skills": [ { { "id": ...`  →  `"skills": [ { "id": ...`
+///
+/// The model emits `[ {` (correct) then immediately emits another `{` before
+/// the first key. This removes the spurious second `{` (and a matching extra
+/// closing `}`) so the resulting JSON is structurally valid.
+///
+/// Strategy: scan for the byte sequence `[ { {` (with any whitespace) and
+/// collapse the two consecutive `{` tokens into one. We also remove the
+/// matching surplus closing `}` by decrementing the brace count on the way
+/// back — but that's handled naturally by the `repair_truncated_tree_json`
+/// helper if needed; here we only fix the OPEN side, which is what prevents
+/// serde_json from parsing at all.
+fn repair_duplicate_open_braces(s: &str) -> (String, bool) {
+    // We use a simple state machine rather than regex to avoid a dependency.
+    // Look for the pattern: '[' → optional-whitespace → '{' → optional-whitespace → '{'
+    // and collapse the two '{' into one.
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    let mut repaired = false;
+
+    while i < bytes.len() {
+        // Detect '[' followed (through whitespace) by '{' followed (through whitespace) by '{'
+        if bytes[i] == b'[' {
+            out.push(bytes[i]);
+            i += 1;
+            // Skip whitespace
+            let ws_start = i;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == b'{' {
+                // Emit everything up to and including this first '{'
+                out.extend_from_slice(&bytes[ws_start..i]);
+                out.push(b'{');
+                i += 1;
+                // Skip whitespace after first '{'
+                let ws2_start = i;
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == b'{' {
+                    // This is the spurious duplicate — skip it (and any trailing whitespace)
+                    i += 1;
+                    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    // Also drop one surplus closing '}' from the end to keep balance.
+                    // We do this by marking that we need to remove the last bare '}'.
+                    repaired = true;
+                    // Don't emit ws2 — restart loop with i pointing at first key
+                    continue;
+                } else {
+                    // No duplicate — emit the whitespace we consumed and continue
+                    out.extend_from_slice(&bytes[ws2_start..i]);
+                    continue;
+                }
+            } else {
+                // Not a '{ {' pattern — emit the whitespace and continue
+                out.extend_from_slice(&bytes[ws_start..i]);
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+
+    if !repaired {
+        return (s.to_string(), false);
+    }
+
+    // We removed N opening braces without removing matching closing braces,
+    // so the JSON may now be unbalanced (extra '}'). Remove the last bare '}'
+    // for each repair we made. A single scan from the end is sufficient for
+    // the common case (1–3 duplicate pairs).
+    //
+    // Count how many extra '}' we need to drop: we removed exactly one '{' per
+    // repair event, so we need to drop one '}' from the end.
+    // We already set repaired=true once per '[{ {' occurrence; but the loop
+    // above only sets it once (the flag, not a counter). Count properly:
+    let removals_needed = {
+        // Re-count occurrences in original string
+        let orig = s.as_bytes();
+        let mut count = 0usize;
+        let mut j = 0usize;
+        while j < orig.len() {
+            if orig[j] == b'[' {
+                let mut k = j + 1;
+                while k < orig.len() && orig[k].is_ascii_whitespace() { k += 1; }
+                if k < orig.len() && orig[k] == b'{' {
+                    k += 1;
+                    while k < orig.len() && orig[k].is_ascii_whitespace() { k += 1; }
+                    if k < orig.len() && orig[k] == b'{' {
+                        count += 1;
+                    }
+                }
+            }
+            j += 1;
+        }
+        count
+    };
+
+    // Remove `removals_needed` closing '}' from the end of `out`
+    let mut removed = 0usize;
+    let mut end = out.len();
+    while removed < removals_needed && end > 0 {
+        end -= 1;
+        while end > 0 && out[end].is_ascii_whitespace() { end -= 1; }
+        if out[end] == b'}' {
+            out.remove(end);
+            removed += 1;
+            end = out.len();
+        } else {
+            break; // nothing left to safely remove
+        }
+    }
+
+    match String::from_utf8(out) {
+        Ok(fixed) => (fixed, true),
+        Err(_) => (s.to_string(), false), // shouldn't happen — input was valid UTF-8
+    }
+}
+
+// ─── Tree JSON repair helper ─────────────────────────────────────────────────
+
+/// Attempt minimal repair of a truncated tree JSON string.
+/// Handles the common case where the model output is cut off near the end and
+/// is only missing the final closing brackets.
+/// Returns (repaired_string, was_repaired).
+fn repair_truncated_tree_json(s: &str) -> (String, bool) {
+    if s.ends_with('}') {
+        return (s.to_string(), false);
+    }
+
+    // Count brace/bracket imbalance
+    let mut brace_depth = 0i32;
+    let mut bracket_depth = 0i32;
+    let mut in_string = false;
+    let mut escape_next = false;
+    for ch in s.chars() {
+        if escape_next { escape_next = false; continue; }
+        if ch == '\\' && in_string { escape_next = true; continue; }
+        if ch == '"' { in_string = !in_string; continue; }
+        if in_string { continue; }
+        match ch {
+            '{' => brace_depth += 1,
+            '}' => brace_depth -= 1,
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth -= 1,
+            _ => {}
+        }
+    }
+
+    if brace_depth <= 0 && bracket_depth <= 0 {
+        // Already balanced — no repair needed
+        return (s.to_string(), false);
+    }
+
+    // Build closing suffix: close any open string, then close arrays and objects
+    let mut suffix = String::new();
+    // If we're mid-string (odd number of unescaped quotes), close it
+    if in_string {
+        suffix.push('"');
+    }
+    // Close open arrays
+    for _ in 0..bracket_depth.max(0) {
+        suffix.push(']');
+    }
+    // Close open objects
+    for _ in 0..brace_depth.max(0) {
+        suffix.push('}');
+    }
+
+    let repaired = format!("{}{}", s.trim_end_matches(',').trim_end(), suffix);
+    (repaired, true)
+}
+
 // ─── LLM call helper (OpenAI-compatible API) ────────────────────────────────
 
 async fn call_llm(
+    client: &reqwest::Client,
     base_url: &str,
     api_key: &str,
     model: &str,
     system_prompt: &str,
     user_prompt: &str,
+    max_tokens: u32,
+    json_mode: bool,
 ) -> Result<String, String> {
-    let client = reqwest::Client::new();
-
-    let request_body = json!({
+    println!("📡 call_llm: model={} max_tokens={} json_mode={} url={}", model, max_tokens, json_mode, base_url);
+    let mut request_body = json!({
         "model": model,
         "messages": [
             { "role": "system", "content": system_prompt },
             { "role": "user",   "content": user_prompt }
         ],
         "temperature": 0.7,
-        "max_tokens": 8192,
-        "response_format": { "type": "json_object" }
+        "max_tokens": max_tokens,
     });
+    if json_mode {
+        request_body["response_format"] = json!({ "type": "json_object" });
+    }
 
     let mut attempts = 0u32;
     let max_retries = 3u32;
@@ -1085,11 +1954,12 @@ async fn call_llm(
             .await
             .map_err(|e| format!("Failed to read response: {}", e))?;
 
-        if st == 429 && attempts < max_retries {
+        let retryable = (st == 429 || st.is_server_error()) && attempts < max_retries;
+        if retryable {
             let wait = attempts * 10;
             println!(
-                "⏳ Rate limited (429), retrying in {}s (attempt {}/{})…",
-                wait, attempts, max_retries
+                "⏳ API returned {} — retrying in {}s (attempt {}/{})…",
+                st, wait, attempts, max_retries
             );
             tokio::time::sleep(std::time::Duration::from_secs(wait as u64)).await;
             continue;
@@ -1119,11 +1989,11 @@ pub async fn generate_skill_tree(
     println!("Project ID: {}", project_id);
     println!("PRD length: {} chars\n", prd_text.len());
 
-    let groq_key = std::env::var("GROQ_API_KEY")
-        .map_err(|_| "GROQ_API_KEY environment variable not set".to_string())?;
+    let client = reqwest::Client::new();
 
     // Phase 1: Extract concept dependency graph
-    let graph_context = match extract_concept_graph(&groq_key, &prd_text).await {
+    // Keep sorted concepts alive so we can build a PRD profile in phase 1b.
+    let (graph_context, prd_profile_section) = match extract_concept_graph(&client, &prd_text).await {
         Ok(graph) => {
             println!(
                 "🧠 Concept graph extracted: {} concepts",
@@ -1133,39 +2003,106 @@ pub async fn generate_skill_tree(
             for (i, c) in sorted.iter().enumerate() {
                 println!("  {}. {} — {}", i + 1, c.name, c.description);
             }
-            Some(build_graph_context(&sorted))
+            let gc = build_graph_context(&sorted);
+
+            // Fix 2: PRD profile — grounding step identical to repo path's build_repo_profile
+            let profile = match build_prd_profile(&client, &prd_text, &sorted).await {
+                Ok(p) => {
+                    let section = format!(
+                        "## PROJECT PROFILE (authoritative — use this to anchor checkpoints)\n\n{}\n",
+                        p
+                    );
+                    section
+                }
+                Err(e) => {
+                    println!("⚠️  PRD profile failed (non-fatal): {}", e);
+                    String::new()
+                }
+            };
+
+            (Some(gc), profile)
         }
         Err(e) => {
             println!("⚠️  Concept graph extraction failed: {} — falling back to single-phase generation", e);
-            None
+            (None, String::new())
         }
     };
 
-    // Phase 2: Generate tree (with or without graph context)
-    let user_prompt = if let Some(ref gc) = graph_context {
+    // Fix 3: Cap PRD text at 6000 chars for the outline input
+    let prd_excerpt = if prd_text.len() > 6000 { &prd_text[..6000] } else { &prd_text };
+
+    // Phase 2: Two-stage tree generation
+    let outline_user_prompt = if let Some(ref gc) = graph_context {
         format!(
-            "Project ID: {}\n\n{}\n\nPRD:\n{}\n\nGenerate the skill tree JSON:",
-            project_id, gc, prd_text
+            "Project ID: {}\n\n{}\n\nPRD:\n{}\n\nGenerate the skeleton outline JSON:",
+            project_id, gc, prd_excerpt
         )
     } else {
         format!(
-            "Project ID: {}\n\nPRD:\n{}\n\nGenerate the skill tree JSON:",
-            project_id, prd_text
+            "Project ID: {}\n\nPRD:\n{}\n\nGenerate the skeleton outline JSON:",
+            project_id, prd_excerpt
         )
     };
 
+    // Fix 1 + Fix 2: Expansion context includes concept graph order AND profile.
+    // This mirrors what the repo path passes into expansion (profile_section + repo info).
+    let expansion_context = if !prd_profile_section.is_empty() {
+        if let Some(ref gc) = graph_context {
+            format!(
+                "Project ID: {}\n\n{}\n\n{}\nPRD excerpt:\n{}",
+                project_id,
+                gc,
+                prd_profile_section,
+                if prd_text.len() > 1500 { &prd_text[..1500] } else { &prd_text }
+            )
+        } else {
+            format!(
+                "Project ID: {}\n\n{}\nPRD excerpt:\n{}",
+                project_id,
+                prd_profile_section,
+                if prd_text.len() > 2000 { &prd_text[..2000] } else { &prd_text }
+            )
+        }
+    } else {
+        // Fallback: graph context + raw PRD if profile failed
+        if let Some(ref gc) = graph_context {
+            format!(
+                "Project ID: {}\n\n{}\n\nPRD:\n{}",
+                project_id,
+                gc,
+                if prd_text.len() > 2000 { &prd_text[..2000] } else { &prd_text }
+            )
+        } else {
+            format!(
+                "Project ID: {}\n\nProject description:\n{}",
+                project_id,
+                if prd_text.len() > 3000 { &prd_text[..3000] } else { &prd_text }
+            )
+        }
+    };
+
     let tree_model = std::env::var("TREE_GEN_MODEL")
-        .unwrap_or_else(|_| "moonshotai/kimi-k2".to_string());
+        .unwrap_or_else(|_| "google/gemini-2.5-flash".to_string());
     let tree_api_key = std::env::var("TREE_GEN_API_KEY")
         .unwrap_or_else(|_| std::env::var("OPENROUTER_API_KEY").unwrap_or_default());
     let tree_base_url = std::env::var("TREE_GEN_BASE_URL")
         .unwrap_or_else(|_| "https://openrouter.ai/api/v1/chat/completions".to_string());
+    // Kimi K2 does not support response_format: json_object via OpenRouter
+    let json_mode = !tree_model.contains("kimi");
 
-    println!("🌲 Tree gen model: {}", tree_model);
-    let tree_json = call_llm(&tree_base_url, &tree_api_key, &tree_model, &build_system_prompt(), &user_prompt).await?;
+    println!("🌲 Tree gen (PRD two-stage): model={} json_mode={}", tree_model, json_mode);
 
-    let mut skill_tree: SkillTree = serde_json::from_str(&tree_json)
-        .map_err(|e| format!("Generated JSON doesn't match SkillTree schema: {}", e))?;
+    let mut skill_tree = generate_tree_two_stage(
+        &client,
+        &tree_model,
+        &tree_base_url,
+        &tree_api_key,
+        build_outline_system_prompt(),
+        &outline_user_prompt,
+        &expansion_context,
+        &project_id,
+        json_mode,
+    ).await?;
     skill_tree.project_id = project_id;
 
     println!(
@@ -1197,8 +2134,8 @@ pub async fn analyze_repo(
 
     println!("\n=== Analyze Repo: {}/{} ===", owner, repo);
 
-    let groq_key = std::env::var("GROQ_API_KEY")
-        .map_err(|_| "GROQ_API_KEY environment variable not set".to_string())?;
+    // Shared LLM client (reused for concept graph + tree gen)
+    let llm_client = reqwest::Client::new();
 
     // Build GitHub HTTP client
     let mut header_map = reqwest::header::HeaderMap::new();
@@ -1276,7 +2213,7 @@ pub async fn analyze_repo(
         });
         if let Some(name) = readme_name {
             let url = format!("{}/contents/{}", base, name);
-            fetch_github_file(&gh, &url, 1000).await.unwrap_or_default()
+            fetch_github_file(&gh, &url, 8000).await.unwrap_or_default()
         } else {
             String::new()
         }
@@ -1434,25 +2371,35 @@ pub async fn analyze_repo(
     println!("  Merged PRs: {}", merged_prs.len());
 
     // 9. Phase 1: Extract concept graph + relevant files (lightweight context)
-    let (graph_context, relevant_file_paths) = match extract_concept_graph(&groq_key, &phase1_context).await {
+    // Keep graph + sorted alive so the repo profile stage can reference them.
+    let (raw_graph, graph_context, relevant_file_paths) = match extract_concept_graph(&llm_client, &phase1_context).await {
         Ok(graph) => {
             println!(
                 "🧠 Concept graph extracted: {} concepts, {} relevant files",
                 graph.concepts.len(),
                 graph.relevant_files.len()
             );
-            let sorted = topological_sort(graph.concepts);
+            let sorted = topological_sort(graph.concepts.clone());
             for (i, c) in sorted.iter().enumerate() {
-                println!("  {}. {} — {}", i + 1, c.name, c.description);
+                println!(
+                    "  {}. [{}] {} — {} (files: {})",
+                    i + 1,
+                    c.concept_type,
+                    c.name,
+                    c.description,
+                    c.supporting_files.join(", ")
+                );
             }
             if !graph.relevant_files.is_empty() {
                 println!("  📂 Relevant files: {:?}", graph.relevant_files);
             }
-            (Some(build_graph_context(&sorted)), graph.relevant_files)
+            let gc = build_graph_context(&sorted);
+            let rf = graph.relevant_files.clone();
+            (Some((graph, sorted)), Some(gc), rf)
         }
         Err(e) => {
             println!("⚠️  Concept graph extraction failed: {} — falling back to single-phase generation", e);
-            (None, vec![])
+            (None, None, vec![])
         }
     };
 
@@ -1524,32 +2471,74 @@ pub async fn analyze_repo(
 
     println!("📦 Phase 2 context: {} chars", context.len());
 
-    // 12. Generate tree (with or without graph context)
-    let user_prompt = if let Some(ref gc) = graph_context {
+    // 11b. Build repo profile (grounding stage) — best-effort, non-fatal
+    let profile_section = if let Some((ref graph, ref sorted)) = raw_graph {
+        match build_repo_profile(&llm_client, &context, graph, sorted).await {
+            Ok(profile) => {
+                let mut s = String::from("## REPO PROFILE (authoritative — use this to anchor the tree)\n\n");
+                s.push_str(&format!("**Summary:** {}\n\n", profile.summary));
+                s.push_str(&format!("**Stack:** {}\n\n", profile.stack.join(", ")));
+                s.push_str(&format!("**Subsystems:** {}\n\n", profile.subsystems.join(", ")));
+                if !profile.evidenced_concept_ids.is_empty() {
+                    s.push_str(&format!("**Well-evidenced concepts:** {}\n\n", profile.evidenced_concept_ids.join(", ")));
+                }
+                s
+            }
+            Err(e) => {
+                println!("⚠️  Repo profile failed (non-fatal): {}", e);
+                String::new()
+            }
+        }
+    } else {
+        String::new()
+    };
+
+    // 12. Two-stage tree generation (outline then per-skill expansion)
+    let outline_user_prompt = if let Some(ref gc) = graph_context {
         format!(
-            "Project ID: {}\n\n{}\n\nRepository context:\n{}\n\nGenerate the learning skill tree JSON:",
-            project_id, gc, context
+            "Project ID: {}\n\n{}\n\n{}\nRepository context:\n{}\n\nGenerate the skeleton outline JSON:",
+            project_id, gc, profile_section, context
         )
     } else {
         format!(
-            "Project ID: {}\n\nRepository context:\n{}\n\nGenerate the learning skill tree JSON:",
-            project_id, context
+            "Project ID: {}\n\n{}\nRepository context:\n{}\n\nGenerate the skeleton outline JSON:",
+            project_id, profile_section, context
+        )
+    };
+
+    // Compact context for skill expansion — repo profile + short context summary
+    let expansion_context = if !profile_section.is_empty() {
+        format!("{}\n\nRepository: {}/{}", profile_section, owner, repo)
+    } else {
+        format!(
+            "Repository: {}/{}\n\n{}",
+            owner, repo,
+            if context.len() > 3000 { &context[..3000] } else { &context }
         )
     };
 
     let tree_model = std::env::var("TREE_GEN_MODEL")
-        .unwrap_or_else(|_| "moonshotai/kimi-k2".to_string());
+        .unwrap_or_else(|_| "google/gemini-2.5-flash".to_string());
     let tree_api_key = std::env::var("TREE_GEN_API_KEY")
         .unwrap_or_else(|_| std::env::var("OPENROUTER_API_KEY").unwrap_or_default());
     let tree_base_url = std::env::var("TREE_GEN_BASE_URL")
         .unwrap_or_else(|_| "https://openrouter.ai/api/v1/chat/completions".to_string());
+    // Kimi K2 does not support response_format: json_object via OpenRouter
+    let json_mode = !tree_model.contains("kimi");
 
-    println!("🌲 Tree gen model: {}", tree_model);
-    let tree_json =
-        call_llm(&tree_base_url, &tree_api_key, &tree_model, &build_repo_system_prompt(), &user_prompt).await?;
+    println!("🌲 Tree gen (repo two-stage): model={} json_mode={}", tree_model, json_mode);
 
-    let mut skill_tree: SkillTree = serde_json::from_str(&tree_json)
-        .map_err(|e| format!("Generated JSON doesn't match SkillTree schema: {}", e))?;
+    let mut skill_tree = generate_tree_two_stage(
+        &llm_client,
+        &tree_model,
+        &tree_base_url,
+        &tree_api_key,
+        build_repo_outline_system_prompt(),
+        &outline_user_prompt,
+        &expansion_context,
+        &project_id,
+        json_mode,
+    ).await?;
     skill_tree.project_id = project_id;
 
     println!("✅ Repo analysis complete: {} phases", skill_tree.phases.len());

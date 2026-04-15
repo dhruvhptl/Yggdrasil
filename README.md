@@ -2,9 +2,38 @@
 
 A personal learning OS. Paste a project repo or PRD, get an AI-generated skill tree of everything behind what you built. Co-op experience, job applications, and learning progress all feed into a Universal Skill Tree — your living proof of expertise.
 
-## Prerequisites
+## Architecture
 
-Install the following on a fresh machine:
+```
+React frontend (Vite, port 1420)
+       ↓
+Rust backend (Tauri commands)  ←→  Neon Postgres (pgvector, vector(1024))
+                                ←→  OpenRouter (tree gen: Kimi K2 + Gemini Flash)
+                                ←→  Groq (chat synthesis + reranking: LLaMA 3.3-70b)
+
+Python scraper (port 3002)     ←→  OpenRouter (embeddings: pplx-embed-v1-0.6b)
+```
+
+Mimir (resource ingestion, RAG, embeddings) runs as **native Rust** inside the Tauri process — no separate sidecar.
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Frontend | React 19 + TypeScript + Vite + Tailwind |
+| Desktop | Tauri 2.0 |
+| Backend | Rust + sqlx |
+| Database | Postgres on Neon (pgvector, `vector(1024)`) |
+| Tree generation | Kimi K2 via OpenRouter (outline + checkpoint expansion) |
+| Concept graph | Gemini Flash via OpenRouter |
+| Chat + extraction | Groq — LLaMA 3.3-70b-versatile + 3.1-8b-instant (reranker) |
+| Embeddings | Perplexity pplx-embed-v1-0.6b (1024-dim) via OpenRouter |
+| Tree renderer | Custom HTML Canvas (tapered filled branches, polar layout, atmospheric roots) |
+| Visualizations | D3 force simulation |
+| Mimir | Native Rust in `mimir.rs` — no sidecar |
+| Scraper | Python FastAPI (port 3002) — URL scraping, PDF extraction (pymupdf), playlists |
+
+## Prerequisites
 
 | Tool | Install | Version |
 |------|---------|---------|
@@ -32,9 +61,8 @@ xcode-select --install
 git clone https://github.com/your-username/Yggdrasil.git
 cd Yggdrasil
 
-# Install frontend + sidecar dependencies
+# Install frontend dependencies
 npm install
-npm --prefix sidecar install
 
 # Install Python scraper dependencies
 cd scraper
@@ -46,39 +74,28 @@ cd ..
 
 ## Environment Variables
 
-Yggdrasil uses Bitwarden CLI to inject secrets at runtime. The `dev.sh` script handles this automatically.
-
-### Required Bitwarden entries
+All secrets are stored in Bitwarden and exported into the process by `dev.sh` — no `.env` file is read at runtime.
 
 Store the following as **password** items in your Bitwarden vault:
 
 | Bitwarden Item Name | What It Is |
 |---------------------|------------|
-| `DATABASE_URL` | Postgres connection string (e.g. Neon: `postgresql://user:pass@host.neon.tech/neondb?sslmode=require`) |
-| `GROQ_API_KEY` | [Groq API key](https://console.groq.com/) — used for Mimir chat + skill extraction |
-| `OPENROUTER_API_KEY` | [OpenRouter API key](https://openrouter.ai/) — used for tree generation (Kimi K2 + Gemini Flash) |
-| `YOUTUBE_API_KEY` | [YouTube Data API key](https://console.cloud.google.com/) — for playlist ingestion |
-| `GITHUB_TOKEN` | [GitHub personal access token](https://github.com/settings/tokens) — for repo analysis |
+| `DATABASE_URL` | Postgres connection string (e.g. `postgresql://user:pass@host.neon.tech/neondb?sslmode=require`) |
+| `GROQ_API_KEY` | [Groq API key](https://console.groq.com/) — Mimir chat + skill extraction |
+| `OPENROUTER_API_KEY` | [OpenRouter API key](https://openrouter.ai/) — tree generation + embeddings |
+| `YOUTUBE_API_KEY` | [YouTube Data API key](https://console.cloud.google.com/) — playlist ingestion |
+| `GITHUB_TOKEN` | [GitHub personal access token](https://github.com/settings/tokens) — repo analysis |
 
-### Alternative: manual `.env` file
+`dev.sh` derives the following from the above automatically:
 
-If you prefer not to use Bitwarden, create `src-tauri/.env`:
-
-```bash
-DATABASE_URL=postgresql://user:pass@host.neon.tech/neondb?sslmode=require
-GROQ_API_KEY=gsk_...
-OPENROUTER_API_KEY=sk-or-...
-TREE_GEN_API_KEY=sk-or-...  # same as OPENROUTER_API_KEY
-TREE_GEN_BASE_URL=https://openrouter.ai/api/v1/chat/completions
-TREE_GEN_MODEL=moonshotai/kimi-k2
-CONCEPT_GRAPH_MODEL=google/gemini-2.5-flash
-CONCEPT_GRAPH_BASE_URL=https://openrouter.ai/api/v1/chat/completions
-CONCEPT_GRAPH_API_KEY=sk-or-...  # same as OPENROUTER_API_KEY
-YOUTUBE_API_KEY=...
-GITHUB_TOKEN=ghp_...
 ```
-
-Then run `npm run tauri dev` directly instead of `bash dev.sh`.
+TREE_GEN_API_KEY        = OPENROUTER_API_KEY
+TREE_GEN_BASE_URL       = https://openrouter.ai/api/v1/chat/completions
+TREE_GEN_MODEL          = google/gemini-2.5-flash
+CONCEPT_GRAPH_MODEL     = google/gemini-2.5-flash
+CONCEPT_GRAPH_BASE_URL  = https://openrouter.ai/api/v1/chat/completions
+CONCEPT_GRAPH_API_KEY   = OPENROUTER_API_KEY
+```
 
 ## Run
 
@@ -88,36 +105,20 @@ bash dev.sh
 
 This will:
 1. Prompt for your Bitwarden master password
-2. Export all environment variables
-3. Start three services concurrently:
+2. Export all environment variables into the process
+3. Start two services concurrently:
    - **Vite** dev server (port 1420)
-   - **Mimir** sidecar (port 3001)
-   - **Scraper** service (port 3002)
+   - **Python scraper** (port 3002)
 4. Build and launch the Tauri desktop app
 5. Run all database migrations automatically on startup
 
-## Tech Stack
-
-| Layer | Technology |
-|---|---|
-| Frontend | React 19 + TypeScript + Vite + Tailwind |
-| Desktop | Tauri 2.0 |
-| Backend | Rust + sqlx |
-| Database | Postgres on Neon (pgvector) |
-| AI | OpenRouter (Kimi K2, Gemini Flash) + Groq (LLaMA 3.3-70b) |
-| Tree renderer | Custom HTML Canvas (L-system) |
-| Visualizations | D3 force simulation |
-| Mimir sidecar | Node.js + TypeScript |
-| Embeddings | Transformers.js (all-MiniLM-L6-v2, 384d) |
-| Scraper | Python FastAPI |
-
 ## Features
 
-- **Skill Trees** — AI generates learning trees from project PRDs or GitHub repos
-- **Checkpoints** — Track progress through quests with mastery criteria and exercises
+- **Skill Trees** — AI generates learning trees from project PRDs or GitHub repos (two-stage: concept graph → outline → per-skill checkpoint expansion)
+- **Checkpoints** — Track progress with mastery criteria, exercises, and notes
 - **Daily Matrix** — Eisenhower 2x2 triage for daily learning priorities
-- **Resource Library** — Ingest URLs, PDFs, text; auto-tag; track completion; match to tree nodes
-- **Mimir Chat** — RAG assistant grounded in your personal resource library
+- **Resource Library** — Ingest URLs, PDFs, YouTube playlists; auto-tag; track completion; auto-match to tree nodes via pgvector
+- **Mimir Chat** — RAG assistant grounded in your personal resource library, with section + page citations
 - **Work Tracker** — Co-op experience with D3 galaxy visualization and AI skill extraction
 - **Job Tracker** — Kanban board with JD analysis and skill demand analytics
 - **Ideas** — Scratchpad with tagging, pinning, and promote-to-project

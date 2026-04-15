@@ -5,6 +5,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import { MimirResource } from '../types';
 import { useMimirContext } from '../contexts/MimirContext';
 
@@ -37,15 +38,16 @@ interface YggdrasilTreeProps {
   projectId: string;
 }
 
-// ─── L-System types ──────────────────────────────────────────────────────────
+// ─── Branch type (tapered filled segments) ───────────────────────────────────
 
 interface Branch {
   x1: number; y1: number;
   x2: number; y2: number;
-  cp1x: number; cp1y: number;
-  cp2x: number; cp2y: number;
-  thickness: number;
-  depth: number;
+  w1: number; w2: number;      // start/end widths for tapered fill
+  color: string;               // hex fill color
+  depth: number;               // 0=trunk, 1=bough, 2=limb, 3=twig, 4=atmospheric
+  curveBias: number;           // lateral offset fraction for quadratic CP
+  domainColor: string | null;  // domain accent for bough/limb/twig
 }
 
 interface Tip {
@@ -65,10 +67,6 @@ interface NodePlacement {
   nodeType: 'checkpoint' | 'skill' | 'phase';
 }
 
-interface PlaceNodesResult {
-  placements: NodePlacement[];
-  unusedTips: Tip[];
-}
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -80,211 +78,184 @@ const PHASE_COLORS = [
   '#10b981',  // emerald
 ];
 
-// Dynamic tree config — computed from canvas size so tree fills viewport naturally.
-// No pan/zoom transform needed: tree coordinates ARE screen coordinates.
-interface TreeConfig {
-  baseX: number;
-  baseY: number;
-  topY: number;
-  initialThickness: number;
-  thicknessScale: number;
-  branchLen: number;
-  lengthScale: number;
-  seed: number;
+// ─── Tree layout ─────────────────────────────────────────────────────────────
+// Polar coordinate layout matching the playground design.
+// Trunk → domain boughs → skill limbs → checkpoint twigs (all tapered filled).
+
+
+interface LayoutResult {
+  branches: Branch[];
+  placements: NodePlacement[];
+  unusedTips: Tip[];
 }
 
-function makeTreeConfig(w: number, h: number): TreeConfig {
-  // Scale tree to fill the viewport — trunk takes ~35% of height,
-  // branches scale proportionally so the canopy fills the rest.
-  const trunkHeight = h * 0.35;
-  const scale = Math.min(w, h) / 900; // reference size 900px
-  return {
-    baseX: w / 2,
-    baseY: h * 0.95,
-    topY: h * 0.95 - trunkHeight,
-    initialThickness: 24 * scale,
-    thicknessScale: 0.64,
-    branchLen: 145 * scale,
-    lengthScale: 0.72,
-    seed: 113,
-  };
-}
-
-// ─── Seeded Random ───────────────────────────────────────────────────────────
-
-class SeededRandom {
-  private s: number;
-  constructor(seed: number) {
-    this.s = seed % 2147483647;
-    if (this.s <= 0) this.s += 2147483646;
-  }
-  next(): number {
-    this.s = (this.s * 16807) % 2147483647;
-    return (this.s - 1) / 2147483646;
-  }
-  range(min: number, max: number): number {
-    return min + this.next() * (max - min);
-  }
-}
-
-// ─── Tree generation — recursive L-system branching ─────────────────────────
-
-function generateTree(targetTips: number, seed: number, cfg: TreeConfig): { branches: Branch[]; tips: Tip[] } {
-  // Binary-search minThickness so tip count ≥ targetTips (never fewer)
-  let lo = 0.3, hi = 4.0;
-  let bestResult: { branches: Branch[]; tips: Tip[] } = { branches: [], tips: [] };
-  let bestDiff = Infinity;
-
-  for (let iter = 0; iter < 16; iter++) {
-    const mid = (lo + hi) / 2;
-    const result = growTree(mid, seed, cfg);
-    const tipCount = result.tips.length;
-
-    // Only accept results with enough tips; prefer smallest surplus
-    if (tipCount >= targetTips) {
-      const surplus = tipCount - targetTips;
-      if (surplus < bestDiff) {
-        bestDiff = surplus;
-        bestResult = result;
-      }
-      if (surplus <= 8) break; // close enough above target
-      lo = mid; // raise threshold → fewer tips
-    } else {
-      hi = mid; // lower threshold → more tips
-    }
-  }
-
-  // Fallback: if binary search never found enough, use last best
-  if (bestResult.tips.length === 0) {
-    bestResult = growTree(lo, seed, cfg);
-  }
-
-  return bestResult;
-}
-
-function growTree(minThickness: number, seed: number, cfg: TreeConfig): { branches: Branch[]; tips: Tip[] } {
-  const rng = new SeededRandom(seed);
+function layoutTree(nodes: TreeNode[], w: number, h: number): LayoutResult {
   const branches: Branch[] = [];
-  const tips: Tip[] = [];
+  const placements: NodePlacement[] = [];
 
-  function grow(
-    x: number, y: number,
-    angle: number,
-    thickness: number,
-    length: number,
-    depth: number,
-  ) {
-    if (thickness < minThickness) {
-      tips.push({ x, y, angle, depth });
-      return;
+  // ── Playground polar coordinate layout ─────────────────────────────────────
+  // Origin: trunk top at cx = W*0.43, trunkTopY = H*0.58.
+  // Domain spines at fixed angles from vertical (positive = right).
+  // Skills fanned ±20° around each spine at 3 radii (160/280/390 px scaled).
+  // Nodes fanned ±16° around each skill arm at cluster + offset.
+  // All radii scaled by Math.min(w, h) / 900.
+
+  const scale  = Math.min(w, h) / 900;
+  const cx     = w * 0.43;          // trunk center-X (slightly left of center)
+  const baseY  = h * 0.97;          // trunk base near bottom
+  const trunkTopY = h * 0.58;       // trunk top / domain junction
+
+  // Tapered trunk segments (3 segments for natural taper)
+  branches.push({ x1: cx,   y1: baseY,                            x2: cx+8, y2: baseY*0.85+trunkTopY*0.15, w1: 28*scale, w2: 22*scale, color: '#3d2510', depth: 0, curveBias: 0,    domainColor: null });
+  branches.push({ x1: cx+8, y1: baseY*0.85+trunkTopY*0.15,       x2: cx+4, y2: baseY*0.55+trunkTopY*0.45, w1: 22*scale, w2: 17*scale, color: '#3a2210', depth: 0, curveBias: 0,    domainColor: null });
+  branches.push({ x1: cx+4, y1: baseY*0.55+trunkTopY*0.45,       x2: cx,   y2: trunkTopY,                 w1: 17*scale, w2: 12*scale, color: '#362010', depth: 0, curveBias: 0,    domainColor: null });
+
+  // Trunk side twigs for organic feel
+  for (let i = 0; i < 5; i++) {
+    const frac = 0.2 + i * 0.15;
+    const ty   = trunkTopY + (baseY - trunkTopY) * frac;
+    const side = i % 2 === 0 ? 1 : -1;
+    const len  = (18 + i * 5) * scale;
+    branches.push({
+      x1: cx, y1: ty,
+      x2: cx + side * len * 0.9, y2: ty - len * 0.45,
+      w1: 2.5*scale, w2: 0.7*scale,
+      color: '#3d2510', depth: 4, curveBias: side * 0.12, domainColor: null,
+    });
+  }
+
+  // Collect & group checkpoints
+  const checkpoints = collectCheckpoints(nodes);
+  if (checkpoints.length === 0) return { branches, placements, unusedTips: [] };
+
+  // Assign a phase color per phase index
+  const byPhase = new Map<number, typeof checkpoints>();
+  checkpoints.forEach(cp => {
+    if (!byPhase.has(cp.phaseIndex)) byPhase.set(cp.phaseIndex, []);
+    byPhase.get(cp.phaseIndex)!.push(cp);
+  });
+  const phaseIndices = [...byPhase.keys()].sort((a, b) => a - b);
+
+  // Up to 5 domain spine angles (degrees from vertical, +right)
+  const SPINE_ANGLES_DEG = [-45, 0, 45, -22, 22];
+  // Skill cluster radii (base px, scaled): near / mid / far
+  const SKILL_RADII = [160, 280, 390].map(r => r * scale);
+  // Skill fan: ±20° around spine
+  const SKILL_FAN_DEG  = [-20, 0, 20];
+  // Node fan: ±16° around each skill arm
+  const NODE_FAN_DEG   = [-16, 0, 16];
+  const NODE_OFFSET_PX = 52 * scale;   // radial offset from skill cluster to node
+
+  phaseIndices.forEach((phaseIdx, pOrdinal) => {
+    const cpList       = byPhase.get(phaseIdx)!;
+    const color        = PHASE_COLORS[phaseIdx % PHASE_COLORS.length];
+    const spineAngleDeg = SPINE_ANGLES_DEG[pOrdinal] ?? (pOrdinal - 2) * 45;
+    const spineAngle   = (spineAngleDeg * Math.PI) / 180;
+
+    // Polar → Cartesian helpers (up = −cos, right = +sin)
+    const polar = (r: number, angle: number) => ({
+      x: cx + r * Math.sin(angle),
+      y: trunkTopY - r * Math.cos(angle),
+    });
+
+    // Bough end (short reach from trunk junction)
+    const boughR   = 130 * scale;
+    const boughEnd = polar(boughR, spineAngle);
+    const boughCurveBias = spineAngleDeg < 0 ? -0.1 : spineAngleDeg > 0 ? 0.1 : 0.0;
+
+    branches.push({
+      x1: cx, y1: trunkTopY,
+      x2: boughEnd.x, y2: boughEnd.y,
+      w1: 11*scale, w2: 8*scale,
+      color, depth: 1, curveBias: boughCurveBias, domainColor: color,
+    });
+
+    // Atmospheric twigs along bough
+    for (let t = 0; t < 3; t++) {
+      const tFrac = 0.3 + t * 0.25;
+      const tx    = cx    + boughR * tFrac * Math.sin(spineAngle);
+      const ty    = trunkTopY - boughR * tFrac * Math.cos(spineAngle);
+      const tAng  = spineAngle + (t - 1) * 0.25;
+      const tLen  = (25 + t * 8) * scale;
+      branches.push({
+        x1: tx, y1: ty,
+        x2: tx + tLen * Math.sin(tAng + 0.3),
+        y2: ty - tLen * Math.cos(tAng + 0.3),
+        w1: 2*scale, w2: 0.6*scale,
+        color: '#5c3820', depth: 4, curveBias: 0.1, domainColor: null,
+      });
     }
 
-    const numChildren = depth === 0
-      ? Math.round(rng.range(3, 5))
-      : Math.round(rng.range(2, 3));
+    // Group checkpoints by skill
+    const bySkill = new Map<number, typeof cpList>();
+    cpList.forEach(cp => {
+      if (!bySkill.has(cp.skillIndex)) bySkill.set(cp.skillIndex, []);
+      bySkill.get(cp.skillIndex)!.push(cp);
+    });
+    const skillIndices = [...bySkill.keys()].sort((a, b) => a - b);
 
-    const spreadDeg = depth === 0 ? 110
-      : depth === 1 ? 70
-      : depth === 2 ? 50
-      : 35;
-    const spreadRad = spreadDeg * (Math.PI / 180);
+    skillIndices.forEach((skillIdx, sOrdinal) => {
+      const cpSubList  = bySkill.get(skillIdx)!;
+      const fanDeg     = SKILL_FAN_DEG[sOrdinal] ?? (sOrdinal - 1) * 20;
+      const fanRad     = (fanDeg * Math.PI) / 180;
+      const skillAngle = spineAngle + fanRad;
+      const r          = SKILL_RADII[sOrdinal] ?? SKILL_RADII[SKILL_RADII.length - 1];
+      const skillEnd   = polar(r, skillAngle);
+      const limbCurveBias = fanDeg < 0 ? -0.12 : fanDeg > 0 ? 0.12 : 0.0;
 
-    for (let i = 0; i < numChildren; i++) {
-      const t = numChildren === 1 ? 0.5 : i / (numChildren - 1);
-      const baseAngle = angle - spreadRad / 2 + t * spreadRad;
-      const wanderRad = rng.range(-0.12, 0.12);
-      let childAngle = baseAngle + wanderRad;
-
-      // Keep branches growing upward
-      childAngle = Math.max(-Math.PI * 0.97, Math.min(-Math.PI * 0.03, childAngle));
-
-      const childLength = length * cfg.lengthScale * rng.range(0.88, 1.12);
-      const endX = x + childLength * Math.cos(childAngle);
-      const endY = y + childLength * Math.sin(childAngle);
-
-      // Bezier control points with perpendicular wander
-      const perp = childAngle + Math.PI / 2;
-      const w1 = rng.range(-18, 18);
-      const w2 = rng.range(-12, 12);
-      const cp1x = x + childLength * 0.35 * Math.cos(childAngle) + w1 * Math.cos(perp);
-      const cp1y = y + childLength * 0.35 * Math.sin(childAngle) + w1 * Math.sin(perp);
-      const cp2x = endX - childLength * 0.25 * Math.cos(childAngle) + w2 * Math.cos(perp);
-      const cp2y = endY - childLength * 0.25 * Math.sin(childAngle) + w2 * Math.sin(perp);
-
-      const childThickness = thickness * cfg.thicknessScale;
-
+      // Limb: bough end → skill cluster
       branches.push({
-        x1: x, y1: y, x2: endX, y2: endY,
-        cp1x, cp1y, cp2x, cp2y,
-        thickness: childThickness,
-        depth,
+        x1: boughEnd.x, y1: boughEnd.y,
+        x2: skillEnd.x, y2: skillEnd.y,
+        w1: 7*scale, w2: 4*scale,
+        color, depth: 2, curveBias: limbCurveBias, domainColor: color,
       });
 
-      grow(endX, endY, childAngle, childThickness, childLength, depth + 1);
-    }
-  }
+      cpSubList.forEach((cp, cpOrdinal) => {
+        const nodeFanDeg   = NODE_FAN_DEG[cpOrdinal] ?? (cpOrdinal - 1) * 16;
+        const nodeFanRad   = (nodeFanDeg * Math.PI) / 180;
+        const nodeAngle    = skillAngle + nodeFanRad;
+        const nodeR        = r + NODE_OFFSET_PX + cpOrdinal * 8 * scale;
+        const nodePos      = polar(nodeR, nodeAngle);
 
-  // Trunk bezier
-  const trunkMidX = cfg.baseX + rng.range(-6, 6);
-  branches.push({
-    x1: cfg.baseX, y1: cfg.baseY,
-    x2: cfg.baseX, y2: cfg.topY,
-    cp1x: trunkMidX + 8, cp1y: cfg.baseY - 100,
-    cp2x: trunkMidX - 6, cp2y: cfg.topY + 90,
-    thickness: cfg.initialThickness,
-    depth: -1,
+        // Twig: skill cluster → node
+        branches.push({
+          x1: skillEnd.x, y1: skillEnd.y,
+          x2: nodePos.x,  y2: nodePos.y,
+          w1: 3.5*scale, w2: 1.5*scale,
+          color, depth: 3, curveBias: (cpOrdinal - 1) * 0.08, domainColor: color,
+        });
+
+        // Decorative branch split off twig midpoint
+        const midX      = (skillEnd.x + nodePos.x) * 0.5;
+        const midY      = (skillEnd.y + nodePos.y) * 0.5;
+        branches.push({
+          x1: midX, y1: midY,
+          x2: midX + 22 * scale * Math.sin(nodeAngle + 0.4),
+          y2: midY - 22 * scale * Math.cos(nodeAngle + 0.4),
+          w1: 2*scale, w2: 0.8*scale,
+          color, depth: 4, curveBias: 0.08, domainColor: null,
+        });
+
+        // Canvas rotation angle for drawLeaf (spine direction → canvas convention)
+        const leafCanvasAngle = nodeAngle - Math.PI / 2;
+
+        placements.push({
+          node: cp.checkpoint,
+          x: nodePos.x,
+          y: nodePos.y,
+          angle: leafCanvasAngle,
+          branchAngle: leafCanvasAngle,
+          phaseIndex: phaseIdx,
+          nodeType: 'checkpoint',
+        });
+      });
+    });
   });
 
-  // Grow from trunk top
-  grow(
-    cfg.baseX,
-    cfg.topY,
-    -Math.PI / 2,
-    cfg.initialThickness * cfg.thicknessScale,
-    cfg.branchLen,
-    0,
-  );
-
-  // Sort tips: by depth then left-to-right
-  tips.sort((a, b) => a.depth - b.depth || a.x - b.x);
-
-  return { branches, tips };
+  return { branches, placements, unusedTips: [] };
 }
 
-// ─── Tip sorting — angular sweep from trunk top ─────────────────────────────
-
-function sortTips(tips: Tip[], cfg: TreeConfig): Tip[] {
-  const cx = cfg.baseX;
-  const cy = cfg.topY;
-  return [...tips].sort((a, b) => {
-    const angleA = Math.atan2(a.y - cy, a.x - cx);
-    const angleB = Math.atan2(b.y - cy, b.x - cx);
-    return angleA - angleB;
-  });
-}
-
-// ─── Bezier utilities ────────────────────────────────────────────────────────
-
-function bezierPoint(
-  x1: number, y1: number, cp1x: number, cp1y: number,
-  cp2x: number, cp2y: number, x2: number, y2: number, t: number,
-): { x: number; y: number } {
-  const u = 1 - t;
-  return {
-    x: u*u*u*x1 + 3*u*u*t*cp1x + 3*u*t*t*cp2x + t*t*t*x2,
-    y: u*u*u*y1 + 3*u*u*t*cp1y + 3*u*t*t*cp2y + t*t*t*y2,
-  };
-}
-
-function bezierAngle(
-  x1: number, y1: number, cp1x: number, cp1y: number,
-  cp2x: number, cp2y: number, x2: number, y2: number, t: number,
-): number {
-  const u = 1 - t;
-  const dx = 3*u*u*(cp1x - x1) + 6*u*t*(cp2x - cp1x) + 3*t*t*(x2 - cp2x);
-  const dy = 3*u*u*(cp1y - y1) + 6*u*t*(cp2y - cp1y) + 3*t*t*(y2 - cp2y);
-  return Math.atan2(dy, dx);
-}
 
 // ─── Checkpoint collection — phase → skill → checkpoint order ────────────────
 // Handles any tree depth: trunk → phases → skills → checkpoints
@@ -357,214 +328,199 @@ function collectCheckpoints(nodes: TreeNode[]): {
   return result;
 }
 
-// ─── Node placement — leaf distribution across canopy ────────────────────────
-
-const LEAF_CONFIG = {
-  innerDensity: 0.5,
-  minSpacing: 35,
-  repulsionIters: 15,
-  tetherStrength: 0.3,
-  depthSpread: 0.6,
-  leafAngleVar: 30,
-};
-
-function placeNodes(nodes: TreeNode[], tips: Tip[], branches: Branch[], cfg: TreeConfig): PlaceNodesResult {
-  const sortedTips = sortTips(tips, cfg);
-  const checkpoints = collectCheckpoints(nodes);
-  if (checkpoints.length === 0 || sortedTips.length === 0) return { placements: [], unusedTips: [] };
-
-  const cx = cfg.baseX;
-  const cy = cfg.topY;
-  const rng = new SeededRandom(cfg.seed + 777);
-
-  const relocRng = new SeededRandom(cfg.seed + 888);
-  const innerBranches = branches.filter(b => b.depth >= 0 && b.depth <= 2 && b.thickness > 1.5);
-
-  const allPoints = sortedTips.map(tip => {
-    if (LEAF_CONFIG.innerDensity <= 0 || innerBranches.length === 0 || relocRng.next() > LEAF_CONFIG.innerDensity) {
-      return { x: tip.x, y: tip.y, angle: tip.angle, depth: tip.depth };
-    }
-    const b = innerBranches[Math.floor(relocRng.range(0, innerBranches.length))];
-    const t = relocRng.range(0.25, 0.85);
-    const pt = bezierPoint(b.x1, b.y1, b.cp1x, b.cp1y, b.cp2x, b.cp2y, b.x2, b.y2, t);
-    const angle = bezierAngle(b.x1, b.y1, b.cp1x, b.cp1y, b.cp2x, b.cp2y, b.x2, b.y2, t);
-    const perpAngle = angle + (relocRng.next() > 0.5 ? Math.PI / 2 : -Math.PI / 2);
-    const offset = relocRng.range(4, 12);
-    return {
-      x: pt.x + Math.cos(perpAngle) * offset,
-      y: pt.y + Math.sin(perpAngle) * offset,
-      angle,
-      depth: b.depth,
-    };
-  });
-
-  const byDist = allPoints.map((pt, idx) => {
-    const dx = pt.x - cx, dy = pt.y - cy;
-    return { pt, idx, dist: Math.sqrt(dx * dx + dy * dy), depth: pt.depth, progressScore: 0 };
-  });
-  const ds = LEAF_CONFIG.depthSpread;
-  const maxDist = Math.max(...byDist.map(t => t.dist)) || 1;
-  const maxDepth = Math.max(...byDist.map(t => t.depth)) || 1;
-  byDist.forEach(t => {
-    t.progressScore = (1 - ds) * (t.depth / maxDepth) + ds * (t.dist / maxDist);
-  });
-  byDist.sort((a, b) => a.progressScore - b.progressScore);
-
-  const totalCPs = checkpoints.length;
-  const totalPts = byDist.length;
-  const stride = totalPts / totalCPs;
-
-  const placements: NodePlacement[] = [];
-  const leafPositions: { x: number; y: number; origX: number; origY: number; angle: number }[] = [];
-  const usedIndices = new Set<number>();
-
-  checkpoints.forEach((_cp, i) => {
-    const ptIdx = Math.min(totalPts - 1, Math.round(i * stride));
-    usedIndices.add(ptIdx);
-    const pt = byDist[ptIdx].pt;
-    const angleVar = LEAF_CONFIG.leafAngleVar * Math.PI / 180;
-    const leafAngle = pt.angle + rng.range(-angleVar, angleVar);
-    leafPositions.push({ x: pt.x, y: pt.y, origX: pt.x, origY: pt.y, angle: leafAngle });
-  });
-
-  for (let iter = 0; iter < LEAF_CONFIG.repulsionIters; iter++) {
-    for (let i = 0; i < leafPositions.length; i++) {
-      for (let j = i + 1; j < leafPositions.length; j++) {
-        const dx = leafPositions[j].x - leafPositions[i].x;
-        const dy = leafPositions[j].y - leafPositions[i].y;
-        const dist = Math.sqrt(dx * dx + dy * dy) || 0.1;
-        if (dist < LEAF_CONFIG.minSpacing) {
-          const force = (LEAF_CONFIG.minSpacing - dist) / 2 * 0.4;
-          for (const [leaf, sign] of [[leafPositions[i], -1], [leafPositions[j], 1]] as const) {
-            const rdx = leaf.x - cx, rdy = leaf.y - cy;
-            const rLen = Math.sqrt(rdx * rdx + rdy * rdy) || 1;
-            const tangentX = -rdy / rLen;
-            const tangentY = rdx / rLen;
-            const repDx = sign * dx / dist;
-            const repDy = sign * dy / dist;
-            const dot = repDx * tangentX + repDy * tangentY;
-            const dir = dot >= 0 ? 1 : -1;
-            leaf.x += dir * tangentX * force;
-            leaf.y += dir * tangentY * force;
-          }
-        }
-      }
-      if (LEAF_CONFIG.tetherStrength > 0) {
-        leafPositions[i].x += (leafPositions[i].origX - leafPositions[i].x) * LEAF_CONFIG.tetherStrength;
-        leafPositions[i].y += (leafPositions[i].origY - leafPositions[i].y) * LEAF_CONFIG.tetherStrength;
-      }
-    }
-  }
-
-  checkpoints.forEach(({ checkpoint, phaseIndex }, i) => {
-    const lp = leafPositions[i];
-    placements.push({
-      node: checkpoint, x: lp.x, y: lp.y,
-      angle: lp.angle, branchAngle: lp.angle,
-      phaseIndex, nodeType: 'checkpoint',
-    });
-  });
-
-  const unusedTips: Tip[] = byDist
-    .filter((_, idx) => !usedIndices.has(idx))
-    .map(entry => ({ x: entry.pt.x, y: entry.pt.y, angle: entry.pt.angle, depth: entry.pt.depth }));
-
-  return { placements, unusedTips };
-}
 
 // ─── Canvas rendering ───────────────────────────────────────────────────────
 
+// ─── Background + atmosphere ──────────────────────────────────────────────────
+
 function drawBackground(ctx: CanvasRenderingContext2D, w: number, h: number) {
-  // Deep night sky gradient — vertical, darkest at top
+  // Deep night sky
   const skyGrad = ctx.createLinearGradient(0, 0, 0, h);
-  skyGrad.addColorStop(0, '#010208');
-  skyGrad.addColorStop(0.35, '#020406');
-  skyGrad.addColorStop(0.65, '#04080a');
-  skyGrad.addColorStop(1, '#060d08');
+  skyGrad.addColorStop(0, '#04050a');
+  skyGrad.addColorStop(0.4, '#07090f');
+  skyGrad.addColorStop(0.7, '#0a0c14');
+  skyGrad.addColorStop(1, '#0d1008');
   ctx.fillStyle = skyGrad;
   ctx.fillRect(0, 0, w, h);
 
-  // Subtle radial glow behind the canopy — warm green, very faint
-  const canopyGlow = ctx.createRadialGradient(w * 0.5, h * 0.4, 0, w * 0.5, h * 0.4, w * 0.55);
-  canopyGlow.addColorStop(0, 'rgba(14, 30, 14, 0.35)');
-  canopyGlow.addColorStop(0.6, 'rgba(8, 16, 8, 0.15)');
-  canopyGlow.addColorStop(1, 'rgba(0, 0, 0, 0)');
+  // Canopy glow — faint green radial behind the canopy
+  const cx = w * 0.43;
+  const canopyGlow = ctx.createRadialGradient(cx, h * 0.35, 0, cx, h * 0.35, w * 0.45);
+  canopyGlow.addColorStop(0, 'rgba(74,140,92,0.045)');
+  canopyGlow.addColorStop(0.35, 'rgba(45,107,66,0.025)');
+  canopyGlow.addColorStop(1, 'rgba(0,0,0,0)');
   ctx.fillStyle = canopyGlow;
   ctx.fillRect(0, 0, w, h);
-
-  // Ground plane — soft gradient at the base
-  const groundY = h * 0.88;
-  const groundGrad = ctx.createLinearGradient(0, groundY, 0, h);
-  groundGrad.addColorStop(0, 'rgba(0, 0, 0, 0)');
-  groundGrad.addColorStop(0.3, 'rgba(8, 12, 6, 0.2)');
-  groundGrad.addColorStop(1, 'rgba(10, 16, 8, 0.35)');
-  ctx.fillStyle = groundGrad;
-  ctx.fillRect(0, groundY, w, h - groundY);
-
-  // Ground line — very subtle mossy horizon
-  ctx.beginPath();
-  ctx.moveTo(0, h * 0.93);
-  // Slightly wavy ground line
-  for (let x = 0; x <= w; x += 40) {
-    const yOff = Math.sin(x * 0.008) * 3 + Math.sin(x * 0.023) * 1.5;
-    ctx.lineTo(x, h * 0.93 + yOff);
-  }
-  ctx.lineTo(w, h);
-  ctx.lineTo(0, h);
-  ctx.closePath();
-  ctx.fillStyle = 'rgba(6, 14, 6, 0.25)';
-  ctx.fill();
-
-  // Scattered ambient particles — fireflies / spores
-  const particleRng = new SeededRandom(42);
-  const particleCount = Math.floor(w * h / 18000);
-  for (let i = 0; i < particleCount; i++) {
-    const px = particleRng.range(0, w);
-    const py = particleRng.range(h * 0.05, h * 0.85);
-    const pr = particleRng.range(0.3, 1.2);
-    const alpha = particleRng.range(0.08, 0.25);
-    // Warm tones for fireflies, cool tones for distant stars
-    const isWarm = py > h * 0.4;
-    const r = isWarm ? Math.round(particleRng.range(140, 200)) : Math.round(particleRng.range(120, 180));
-    const g = isWarm ? Math.round(particleRng.range(160, 220)) : Math.round(particleRng.range(140, 190));
-    const b = isWarm ? Math.round(particleRng.range(80, 120)) : Math.round(particleRng.range(170, 230));
-    ctx.beginPath();
-    ctx.arc(px, py, pr, 0, Math.PI * 2);
-    ctx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
-    ctx.fill();
-  }
 }
 
-function drawTree(ctx: CanvasRenderingContext2D, branches: Branch[]) {
-  const sorted = [...branches].sort((a, b) => b.thickness - a.thickness);
+function drawGroundRoots(ctx: CanvasRenderingContext2D, w: number, h: number) {
+  const scale = Math.min(w, h) / 900;
+  const cx    = w * 0.43;
+  const baseY = h * 0.97;
 
-  sorted.forEach(branch => {
-    const t = branch.thickness;
-    const darkness = Math.max(10, 35 - branch.depth * 3);
-    const r = darkness;
-    const g = Math.round(darkness * 0.65);
-    const bl = Math.round(darkness * 0.25);
+  // Ground fog ellipse
+  const fogGrad = ctx.createRadialGradient(cx, baseY, 0, cx, baseY, 120 * scale);
+  fogGrad.addColorStop(0, 'rgba(40,25,10,0.25)');
+  fogGrad.addColorStop(0.5, 'rgba(20,12,5,0.1)');
+  fogGrad.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.beginPath();
+  ctx.ellipse(cx, baseY, 120 * scale, 40 * scale, 0, 0, Math.PI * 2);
+  ctx.fillStyle = fogGrad;
+  ctx.fill();
 
+  // Surface roots fanning from base
+  const rootConfigs = [
+    { angle: -0.6, len: 80, wobble:  0.15 },
+    { angle: -0.25,len: 65, wobble: -0.1  },
+    { angle:  0.1, len: 55, wobble:  0.08 },
+    { angle:  0.35,len: 70, wobble: -0.12 },
+    { angle:  0.65,len: 60, wobble:  0.1  },
+  ];
+  rootConfigs.forEach(rc => {
+    const ex = cx + rc.len * scale * Math.sin(rc.angle);
+    const ey = baseY + rc.len * scale * Math.cos(rc.angle) * 0.35;
+    taperedBranch(ctx, cx, baseY - 4 * scale, ex, ey, 10 * scale, 2 * scale, rc.wobble);
+    const rootGrad = ctx.createLinearGradient(cx, baseY, ex, ey);
+    rootGrad.addColorStop(0, 'rgba(61,37,16,0.7)');
+    rootGrad.addColorStop(1, 'rgba(30,18,8,0.1)');
+    ctx.fillStyle = rootGrad;
+    ctx.fill();
+  });
+}
+
+function drawRoot(ctx: CanvasRenderingContext2D, w: number, h: number, animTime: number) {
+  const scale     = Math.min(w, h) / 900;
+  const cx        = w * 0.43;
+  const trunkTopY = h * 0.58;
+
+  ctx.save();
+  ctx.translate(cx, trunkTopY);
+
+  const pulseFrac = 0.5 + 0.5 * Math.sin(animTime * 0.8);
+  const outerR    = 18 * scale * (1 + pulseFrac * 0.08);
+
+  // Outer glow ring
+  const ringGrad = ctx.createRadialGradient(0, 0, outerR * 0.6, 0, 0, outerR * 1.8);
+  ringGrad.addColorStop(0, 'rgba(200,130,26,0.15)');
+  ringGrad.addColorStop(1, 'rgba(200,130,26,0)');
+  ctx.beginPath();
+  ctx.arc(0, 0, outerR * 1.8, 0, Math.PI * 2);
+  ctx.fillStyle = ringGrad;
+  ctx.fill();
+
+  // Domain junction ring
+  ctx.beginPath();
+  ctx.arc(0, 0, outerR, 0, Math.PI * 2);
+  ctx.strokeStyle = `rgba(200,130,26,${0.25 + pulseFrac * 0.15})`;
+  ctx.lineWidth = 1.5 * scale;
+  ctx.stroke();
+
+  // Center amber dot
+  ctx.beginPath();
+  ctx.arc(0, 0, 5 * scale, 0, Math.PI * 2);
+  const dg = ctx.createRadialGradient(0, 0, 0, 0, 0, 5 * scale);
+  dg.addColorStop(0, '#e8a832');
+  dg.addColorStop(1, '#8b5e1a');
+  ctx.fillStyle = dg;
+  ctx.fill();
+
+  ctx.restore();
+}
+
+function drawAtmosphere(ctx: CanvasRenderingContext2D, w: number, h: number, animTime: number) {
+  const scale = Math.min(w, h) / 900;
+  ctx.save();
+  const moteCount = 18;
+  for (let i = 0; i < moteCount; i++) {
+    const seedX  = ((i * 137.5 + 50) % (w * 0.7)) + w * 0.1;
+    const seedY  = ((i * 97.3  + 80) % (h * 0.6)) + h * 0.05;
+    const floatY = seedY + Math.sin(animTime * 0.3 + i * 1.7) * 12 * scale;
+    const floatX = seedX + Math.cos(animTime * 0.22 + i * 1.3) * 8 * scale;
+    const alpha  = 0.04 + 0.06 * Math.sin(animTime * 0.5 + i * 2.3);
     ctx.beginPath();
-    ctx.moveTo(branch.x1, branch.y1);
-    ctx.bezierCurveTo(branch.cp1x, branch.cp1y, branch.cp2x, branch.cp2y, branch.x2, branch.y2);
-    ctx.strokeStyle = `rgb(${r},${g},${bl})`;
-    ctx.lineWidth = Math.max(0.5, t);
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-    ctx.stroke();
+    ctx.arc(floatX, floatY, 1.2 * scale, 0, Math.PI * 2);
+    if      (i % 3 === 0) ctx.fillStyle = `rgba(200,130,26,${alpha})`;
+    else if (i % 3 === 1) ctx.fillStyle = `rgba(58,122,184,${alpha})`;
+    else                   ctx.fillStyle = `rgba(124,77,189,${alpha})`;
+    ctx.fill();
+  }
+  ctx.restore();
+}
 
-    // Bark texture for thick branches
-    if (t > 4) {
-      ctx.beginPath();
-      ctx.moveTo(branch.x1 + 1, branch.y1);
-      ctx.bezierCurveTo(
-        branch.cp1x + 2, branch.cp1y,
-        branch.cp2x - 1, branch.cp2y,
-        branch.x2 + 1, branch.y2,
-      );
-      ctx.strokeStyle = `rgba(${r + 8},${g + 5},${bl + 2},0.35)`;
-      ctx.lineWidth = Math.max(1, t * 0.4);
+// ─── Hex → RGB helper ────────────────────────────────────────────────────────
+
+function hexToRgb(hex: string): { r: number; g: number; b: number } {
+  if (!hex || hex.length < 7) return { r: 100, g: 100, b: 100 };
+  return {
+    r: parseInt(hex.slice(1, 3), 16),
+    g: parseInt(hex.slice(3, 5), 16),
+    b: parseInt(hex.slice(5, 7), 16),
+  };
+}
+
+// ─── Tapered filled branch path ───────────────────────────────────────────────
+
+function taperedBranch(
+  ctx: CanvasRenderingContext2D,
+  x1: number, y1: number, x2: number, y2: number,
+  w1: number, w2: number,
+  curveBias = 0,
+) {
+  const dx = x2 - x1, dy = y2 - y1;
+  const len = Math.hypot(dx, dy);
+  if (len < 0.5) return;
+  const nx = -dy / len, ny = dx / len;            // perpendicular unit vector
+  const perpDir = Math.atan2(dy, dx) + Math.PI / 2;
+  const cpOff   = curveBias * len;
+  const cpX = (x1 + x2) / 2 + cpOff * Math.cos(perpDir);
+  const cpY = (y1 + y2) / 2 + cpOff * Math.sin(perpDir);
+  const hw1 = w1 / 2, hw2 = w2 / 2;
+
+  ctx.beginPath();
+  ctx.moveTo(x1 + hw1 * nx, y1 + hw1 * ny);
+  ctx.quadraticCurveTo(cpX + hw1 * nx * 0.5, cpY + hw1 * ny * 0.5, x2 + hw2 * nx, y2 + hw2 * ny);
+  ctx.lineTo(x2 - hw2 * nx, y2 - hw2 * ny);
+  ctx.quadraticCurveTo(cpX - hw1 * nx * 0.5, cpY - hw1 * ny * 0.5, x1 - hw1 * nx, y1 - hw1 * ny);
+  ctx.closePath();
+}
+
+// ─── Draw all branches sorted back-to-front by depth ─────────────────────────
+
+function drawTree(ctx: CanvasRenderingContext2D, branches: Branch[]) {
+  const sorted = [...branches].sort((a, b) => a.depth - b.depth);
+
+  sorted.forEach(b => {
+    taperedBranch(ctx, b.x1, b.y1, b.x2, b.y2, b.w1, b.w2, b.curveBias);
+
+    const baseColor = b.color || '#3d2510';
+    const grad = ctx.createLinearGradient(b.x1, b.y1, b.x2, b.y2);
+
+    if (b.depth === 0) {
+      // Trunk — warm bark gradient
+      grad.addColorStop(0, '#4a2e14');
+      grad.addColorStop(0.4, '#3d2510');
+      grad.addColorStop(1, '#2e1c0c');
+    } else if (b.depth === 1) {
+      // Domain boughs — domain color at low opacity
+      const c = hexToRgb(baseColor);
+      grad.addColorStop(0, `rgba(${c.r},${c.g},${c.b},0.5)`);
+      grad.addColorStop(0.5, `rgba(${c.r},${c.g},${c.b},0.35)`);
+      grad.addColorStop(1, `rgba(${c.r},${c.g},${c.b},0.2)`);
+    } else {
+      // Limbs, twigs, atmospheric — fading domain color
+      const c = hexToRgb(baseColor);
+      grad.addColorStop(0, `rgba(${c.r},${c.g},${c.b},0.3)`);
+      grad.addColorStop(1, `rgba(${c.r},${c.g},${c.b},0.12)`);
+    }
+
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Subtle bark highlight on trunk
+    if (b.depth === 0) {
+      taperedBranch(ctx, b.x1, b.y1, b.x2, b.y2, b.w1, b.w2, b.curveBias);
+      ctx.strokeStyle = 'rgba(255,200,120,0.04)';
+      ctx.lineWidth = 1;
       ctx.stroke();
     }
   });
@@ -578,7 +534,15 @@ const LEAF_SHAPE = {
   pointiness: 0.3,
   curve: 0.15,
   glowRadius: 12,
-  lockedOpacity: 0.2,
+  lockedOpacity: 0.35,        // stone-dark but legible silhouette
+  buddingPulseSpeed: 2.2,     // sin oscillation rad/s
+  buddingPulseMin: 0.55,
+  buddingPulseMax: 0.85,
+  progressRingRadius: 18,     // px, arc centered at leaf visual center
+  progressRingWidth: 1.8,
+  sparkleCount: 5,
+  sparkleRadius: 20,
+  sparkleDotSize: 1.2,
 };
 
 // ─── Draw a single botanical leaf ────────────────────────────────────────────
@@ -589,6 +553,8 @@ function drawLeaf(
   size: number, color: string,
   state: 'dormant' | 'budding' | 'growing' | 'bloomed',
   isHovered: boolean, isSelected: boolean,
+  animTime: number,
+  progress: number,
 ) {
   const w = size * LEAF_SHAPE.width;
   const len = size;
@@ -601,24 +567,62 @@ function drawLeaf(
 
   let fillColor: string, strokeColor: string, alpha: number;
   if (state === 'bloomed') {
-    fillColor = color; strokeColor = '#ffffffaa'; alpha = 1;
+    fillColor = color;
+    strokeColor = '#ffffffcc';
+    alpha = 1;
   } else if (state === 'dormant') {
-    fillColor = '#111'; strokeColor = '#333'; alpha = LEAF_SHAPE.lockedOpacity;
+    fillColor = '#1e1e1e';     // stone-grey silhouette
+    strokeColor = '#3a3a3a';   // visible edge
+    alpha = LEAF_SHAPE.lockedOpacity;
   } else if (state === 'growing') {
-    fillColor = color + '99'; strokeColor = color + 'cc'; alpha = 0.85;
+    fillColor = color;         // full color — vibrant
+    strokeColor = color + 'ff';
+    alpha = 1.0;
   } else {
-    fillColor = color + '55'; strokeColor = color + '88'; alpha = 0.7;
+    // budding — breathing pulse
+    const pulse = LEAF_SHAPE.buddingPulseMin +
+      (LEAF_SHAPE.buddingPulseMax - LEAF_SHAPE.buddingPulseMin) *
+      (0.5 + 0.5 * Math.sin(animTime * LEAF_SHAPE.buddingPulseSpeed));
+    fillColor = color + 'bb';  // moderate saturation
+    strokeColor = color + 'ff'; // strong outline signals "ready"
+    alpha = pulse;
   }
 
   ctx.globalAlpha = alpha;
 
   if (state === 'bloomed' && LEAF_SHAPE.glowRadius > 0) {
-    const glow = ctx.createRadialGradient(len * 0.4, 0, 2, len * 0.4, 0, LEAF_SHAPE.glowRadius + size);
-    glow.addColorStop(0, color + '44');
-    glow.addColorStop(1, color + '00');
+    // Outer soft halo
+    const halo = ctx.createRadialGradient(len * 0.4, 0, 4, len * 0.4, 0, LEAF_SHAPE.glowRadius + size * 1.4);
+    halo.addColorStop(0, color + '55');
+    halo.addColorStop(0.5, color + '22');
+    halo.addColorStop(1, color + '00');
     ctx.beginPath();
-    ctx.arc(len * 0.4, 0, LEAF_SHAPE.glowRadius + size, 0, Math.PI * 2);
-    ctx.fillStyle = glow;
+    ctx.arc(len * 0.4, 0, LEAF_SHAPE.glowRadius + size * 1.4, 0, Math.PI * 2);
+    ctx.fillStyle = halo;
+    ctx.fill();
+    // Tight bright core glow
+    const core = ctx.createRadialGradient(len * 0.4, 0, 1, len * 0.4, 0, size * 0.9);
+    core.addColorStop(0, color + 'aa');
+    core.addColorStop(1, color + '00');
+    ctx.beginPath();
+    ctx.arc(len * 0.4, 0, size * 0.9, 0, Math.PI * 2);
+    ctx.fillStyle = core;
+    ctx.fill();
+  }
+
+  // Budding: pulsing annular ring to signal "ready to start"
+  if (state === 'budding') {
+    const ringAlpha = Math.round(
+      (0.2 + 0.3 * (0.5 + 0.5 * Math.sin(animTime * LEAF_SHAPE.buddingPulseSpeed + Math.PI)))
+      * 255
+    ).toString(16).padStart(2, '0');
+    const buddingGlow = ctx.createRadialGradient(len * 0.4, 0, size * 0.8, len * 0.4, 0, size * 1.8);
+    buddingGlow.addColorStop(0, color + '00');
+    buddingGlow.addColorStop(0.5, color + ringAlpha);
+    buddingGlow.addColorStop(1, color + '00');
+    ctx.beginPath();
+    ctx.arc(len * 0.4, 0, size * 1.8, 0, Math.PI * 2);
+    ctx.fillStyle = buddingGlow;
     ctx.fill();
   }
 
@@ -653,10 +657,32 @@ function drawLeaf(
   ctx.lineWidth = isHovered ? 1.8 : 1;
   ctx.stroke();
 
+  // Growing: progress arc ring around leaf center
+  if (state === 'growing' && progress > 0) {
+    const rcx = len * 0.4;
+    const r = LEAF_SHAPE.progressRingRadius;
+    const startAngle = -Math.PI / 2;
+    const endAngle = startAngle + (progress / 100) * Math.PI * 2;
+    // Background track
+    ctx.beginPath();
+    ctx.arc(rcx, 0, r, 0, Math.PI * 2);
+    ctx.strokeStyle = color + '33';
+    ctx.lineWidth = LEAF_SHAPE.progressRingWidth;
+    ctx.stroke();
+    // Filled arc showing completion %
+    ctx.beginPath();
+    ctx.arc(rcx, 0, r, startAngle, endAngle);
+    ctx.strokeStyle = color + 'ee';
+    ctx.lineWidth = LEAF_SHAPE.progressRingWidth;
+    ctx.lineCap = 'round';
+    ctx.stroke();
+    ctx.lineCap = 'butt';
+  }
+
   ctx.beginPath();
   ctx.moveTo(1, 0);
   ctx.lineTo(len * 0.85, 0);
-  ctx.strokeStyle = state === 'dormant' ? '#222' : (state === 'bloomed' ? '#ffffff44' : color + '55');
+  ctx.strokeStyle = state === 'dormant' ? '#2e2e2e' : (state === 'bloomed' ? '#ffffff44' : color + '55');
   ctx.lineWidth = 0.6;
   ctx.stroke();
 
@@ -665,7 +691,7 @@ function drawLeaf(
     const t = v / (veinCount + 1);
     const vx = len * t * 0.85;
     const vw = w * (1 - t * 0.6) * 0.6;
-    const veinStroke = state === 'dormant' ? '#1a1a1a' : (state === 'bloomed' ? '#ffffff22' : color + '33');
+    const veinStroke = state === 'dormant' ? '#262626' : (state === 'bloomed' ? '#ffffff22' : color + '33');
     ctx.beginPath();
     ctx.moveTo(vx, 0);
     ctx.quadraticCurveTo(vx + len * 0.06, -vw * 0.6, vx + len * 0.12, -vw);
@@ -676,6 +702,26 @@ function drawLeaf(
     ctx.moveTo(vx, 0);
     ctx.quadraticCurveTo(vx + len * 0.06, vw * 0.6, vx + len * 0.12, vw);
     ctx.stroke();
+  }
+
+  // Bloomed: slowly orbiting sparkle dots
+  if (state === 'bloomed') {
+    const scx = len * 0.4;
+    const baseAngle = animTime * 0.6;
+    const savedAlpha = ctx.globalAlpha;
+    for (let i = 0; i < LEAF_SHAPE.sparkleCount; i++) {
+      const theta = baseAngle + (i / LEAF_SHAPE.sparkleCount) * Math.PI * 2;
+      const dist = LEAF_SHAPE.sparkleRadius * (0.7 + 0.3 * (Math.sin(animTime * 1.3 + i * 2.1) * 0.5 + 0.5));
+      const sx = scx + Math.cos(theta) * dist;
+      const sy = Math.sin(theta) * dist * 0.6;
+      const sa = 0.4 + 0.4 * (Math.sin(animTime * 2.7 + i * 1.8) * 0.5 + 0.5);
+      ctx.beginPath();
+      ctx.arc(sx, sy, LEAF_SHAPE.sparkleDotSize, 0, Math.PI * 2);
+      ctx.fillStyle = '#ffffff';
+      ctx.globalAlpha = sa;
+      ctx.fill();
+    }
+    ctx.globalAlpha = savedAlpha;
   }
 
   ctx.beginPath();
@@ -738,6 +784,7 @@ function drawLeaves(
   selectedId: string | null,
   hoveredId: string | null,
   centerX: number,
+  animTime: number,
 ) {
   // Draw decorative leaves at unused tips first (behind interactive leaves)
   unusedTips.forEach(tip => {
@@ -758,7 +805,7 @@ function drawLeaves(
       : progress < 100 ? 'growing'
       : 'bloomed';
 
-    drawLeaf(ctx, x, y, angle, LEAF_SHAPE.size, color, state, isHovered, isSelected);
+    drawLeaf(ctx, x, y, angle, LEAF_SHAPE.size, color, state, isHovered, isSelected, animTime, progress);
 
     if (isHovered || isSelected) {
       const label = node.title.length > 22 ? node.title.slice(0, 22) + '\u2026' : node.title;
@@ -797,6 +844,7 @@ function NodePanel({ node, skillLocked, onSave, onClose, onAddChild, onDelete }:
   );
   const [mimiResources, setMimiResources] = useState<MimirResource[]>([]);
   const [matching, setMatching] = useState(false);
+  const { setMimirContext, openMimir } = useMimirContext();
   const checkpoint = node.type === 'leaf'
     ? (Array.isArray(node.tasks)
         ? { mastery_criteria: node.tasks[0]?.description ?? '', exercises: [] as string[], notes: node.tasks[0]?.notes ?? '', completed: node.tasks[0]?.completed ?? false }
@@ -856,6 +904,28 @@ function NodePanel({ node, skillLocked, onSave, onClose, onAddChild, onDelete }:
     } finally {
       setMatching(false);
     }
+  }
+
+  async function handleResourceClick(r: MimirResource) {
+    if (r.url) {
+      await openUrl(r.url);
+    } else {
+      // PDF — open Mimir chat pre-seeded with section context
+      const contextHint = r.matchedSectionTitle
+        ? `${r.title} — ${r.matchedSectionTitle}${r.matchedPageStart != null ? ` (pp. ${r.matchedPageStart}–${r.matchedPageEnd ?? r.matchedPageStart})` : ''}`
+        : r.title;
+      setMimirContext({ nodeTitle: contextHint });
+      openMimir();
+    }
+  }
+
+  async function handleToggleCompletion(r: MimirResource) {
+    try {
+      const newVal = await invoke<boolean>('toggle_resource_completion', { resourceId: r.id });
+      setMimiResources(prev =>
+        prev.map(res => res.id === r.id ? { ...res, isCompleted: newVal } : res)
+      );
+    } catch { /* silently ignore */ }
   }
 
   function handleSave() {
@@ -1194,34 +1264,89 @@ function NodePanel({ node, skillLocked, onSave, onClose, onAddChild, onDelete }:
               No library resources linked. Run "Find matches" or ingest content in the Library page.
             </p>
           ) : (
-            mimiResources.map(r => (
-              <div key={r.id} style={{ marginBottom: 4 }}>
-                {r.url ? (
-                  <a
-                    href={r.url} target="_blank" rel="noopener noreferrer"
+            mimiResources.map(r => {
+              const isPdf = r.resourceType === 'pdf';
+              const score = r.relevanceScore ?? 1;
+              const dotColor = score < 0.3 ? '#10b981' : score < 0.45 ? '#f59e0b' : '#475569';
+              const hasSection = isPdf && r.matchedSectionTitle;
+              const pageRange = r.matchedPageStart != null
+                ? r.matchedPageStart === r.matchedPageEnd
+                  ? `p. ${r.matchedPageStart}`
+                  : `pp. ${r.matchedPageStart}–${r.matchedPageEnd}`
+                : null;
+
+              return (
+                <div key={r.id} style={{
+                  display: 'flex', alignItems: 'flex-start', gap: 4, marginBottom: 4,
+                  opacity: r.isCompleted ? 0.6 : 1,
+                }}>
+                  {/* Clickable resource card */}
+                  <button
+                    onClick={() => handleResourceClick(r)}
+                    title={r.url ?? (isPdf ? 'Open in Mimir chat' : r.title)}
                     style={{
-                      display: 'block', padding: '4px 8px',
+                      flex: 1, minWidth: 0, textAlign: 'left',
+                      padding: '5px 8px', cursor: 'pointer',
                       background: '#0c1a2e', border: '1px solid #1e3a5f',
-                      borderRadius: 5, color: '#60a5fa',
-                      textDecoration: 'none', fontSize: 10,
-                      overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                      borderRadius: 5, display: 'flex', flexDirection: 'column', gap: 2,
                     }}
-                    title={r.url}
                   >
-                    🔗 {r.title}
-                  </a>
-                ) : (
-                  <div style={{
-                    padding: '4px 8px',
-                    background: '#0c1a2e', border: '1px solid #1e3a5f',
-                    borderRadius: 5, color: '#94a3b8', fontSize: 10,
-                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                  }}>
-                    📄 {r.title}
-                  </div>
-                )}
-              </div>
-            ))
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 5, minWidth: 0 }}>
+                      {/* Type badge */}
+                      <span style={{
+                        flexShrink: 0,
+                        fontSize: 9, fontWeight: 600, letterSpacing: '0.04em',
+                        padding: '1px 4px', borderRadius: 3,
+                        background: isPdf ? 'rgba(239,68,68,0.12)' : 'rgba(96,165,250,0.1)',
+                        color: isPdf ? '#f87171' : '#60a5fa',
+                      }}>
+                        {isPdf ? 'PDF' : 'URL'}
+                      </span>
+                      {/* Title */}
+                      <span style={{
+                        flex: 1, fontSize: 10, minWidth: 0,
+                        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                        color: r.isCompleted ? '#475569' : isPdf ? '#94a3b8' : '#93c5fd',
+                        textDecoration: r.isCompleted ? 'line-through' : 'none',
+                      }}>
+                        {r.title}
+                      </span>
+                      {/* Relevance dot */}
+                      <span style={{
+                        flexShrink: 0, width: 6, height: 6, borderRadius: '50%',
+                        background: dotColor, display: 'inline-block',
+                      }} title={`Relevance: ${score.toFixed(2)}`} />
+                    </div>
+                    {/* Section + page hint */}
+                    {hasSection && (
+                      <div style={{
+                        fontSize: 9, color: '#64748b', paddingLeft: 2,
+                        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                      }}>
+                        {r.matchedSectionTitle}{pageRange ? ` · ${pageRange}` : ''}
+                      </div>
+                    )}
+                  </button>
+
+                  {/* Completion toggle */}
+                  <button
+                    onClick={() => handleToggleCompletion(r)}
+                    title={r.isCompleted ? 'Mark incomplete' : 'Mark complete'}
+                    style={{
+                      flexShrink: 0, width: 20, height: 20,
+                      borderRadius: 4, border: `1px solid ${r.isCompleted ? '#059669' : '#334155'}`,
+                      background: r.isCompleted ? 'rgba(5,150,105,0.15)' : 'transparent',
+                      color: r.isCompleted ? '#10b981' : '#475569',
+                      cursor: 'pointer', fontSize: 11, lineHeight: 1,
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      marginTop: 2,
+                    }}
+                  >
+                    {r.isCompleted ? '✓' : ''}
+                  </button>
+                </div>
+              );
+            })
           )}
         </div>
       </div>
@@ -1306,26 +1431,10 @@ export default function YggdrasilTree({ projectId }: YggdrasilTreeProps) {
   const [renderTick, setRenderTick] = useState(0);
   const triggerRender = useCallback(() => setRenderTick(t => t + 1), []);
 
-  // Dynamic tree config — recomputed when canvas size changes
-  const treeConfig = useMemo(() => makeTreeConfig(size.w, size.h), [size.w, size.h]);
-
-  // Count leaf nodes for tree generation (terminal nodes = no children)
-  const leafCount = useMemo(() => {
-    const hasChildren = new Set<string>();
-    nodes.forEach(n => { if (n.parent_id) hasChildren.add(n.parent_id); });
-    return nodes.filter(n => !hasChildren.has(n.id) && n.type !== 'trunk').length;
-  }, [nodes]);
-
-  // Generate procedural tree — deterministic from seed + leaf count + canvas size
-  const { branches, tips } = useMemo(
-    () => generateTree(Math.max(leafCount, 8), treeConfig.seed + leafCount, treeConfig),
-    [leafCount, treeConfig],
-  );
-
-  // Place data nodes onto branch tips
-  const { placements, unusedTips } = useMemo(
-    () => placeNodes(nodes, tips, branches, treeConfig),
-    [nodes, tips, branches, treeConfig],
+  // Deterministic layout — branches and leaf placements computed from node hierarchy
+  const { branches, placements, unusedTips } = useMemo(
+    () => layoutTree(nodes, size.w, size.h),
+    [nodes, size.w, size.h],
   );
 
   // Sync selected node to Mimir context
@@ -1376,8 +1485,12 @@ export default function YggdrasilTree({ projectId }: YggdrasilTreeProps) {
     canvas.height = size.h * dpr;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    // Background fills the full canvas (not transformed)
+    const animTime = performance.now() / 1000;
+
+    // Background + atmosphere fill the full canvas (not pan/zoom transformed)
     drawBackground(ctx, size.w, size.h);
+    drawAtmosphere(ctx, size.w, size.h, animTime);
+    drawGroundRoots(ctx, size.w, size.h);
 
     // Tree + leaves drawn in world space via pan/zoom transform
     const t = transform.current;
@@ -1385,10 +1498,28 @@ export default function YggdrasilTree({ projectId }: YggdrasilTreeProps) {
     ctx.translate(t.x, t.y);
     ctx.scale(t.scale, t.scale);
     drawTree(ctx, branches);
-    drawLeaves(ctx, placements, unusedTips, selectedNode?.id ?? null, hoveredNode, treeConfig.baseX);
+    drawRoot(ctx, size.w, size.h, animTime);
+    drawLeaves(ctx, placements, unusedTips, selectedNode?.id ?? null, hoveredNode, size.w * 0.43, animTime);
     ctx.restore();
 
-  }, [branches, placements, unusedTips, selectedNode, hoveredNode, size, treeConfig, renderTick]);
+  }, [branches, placements, unusedTips, selectedNode, hoveredNode, size, renderTick]);
+
+  // ── Animation loop — drives budding pulse, growing ring, bloomed sparkles ───
+  const hasAnimatedNodes = useMemo(
+    () => placements.some(p => !(p.node.is_locked ?? false)),
+    [placements],
+  );
+
+  useEffect(() => {
+    if (!hasAnimatedNodes) return;
+    let rafId: number;
+    const tick = () => {
+      triggerRender();
+      rafId = requestAnimationFrame(tick);
+    };
+    rafId = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafId);
+  }, [hasAnimatedNodes, triggerRender]);
 
   // ── Wheel zoom (native listener for preventDefault) ────────────────────────
   useEffect(() => {

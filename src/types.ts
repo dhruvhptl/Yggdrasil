@@ -77,6 +77,9 @@ export interface MimirResource {
   tags: string[];
   nodeCount: number;
   isCompleted: boolean;
+  matchedSectionTitle?: string | null;
+  matchedPageStart?: number | null;
+  matchedPageEnd?: number | null;
 }
 
 // Universal Skill Tree types

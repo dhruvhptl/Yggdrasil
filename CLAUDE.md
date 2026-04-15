@@ -89,8 +89,8 @@ Read `PRD.md` for the full vision. This file is your technical bible.
 | Desktop | Tauri 2.0 |
 | Main backend | Rust + sqlx |
 | Database | Postgres on Neon (pgvector enabled) |
-| AI generation | OpenRouter (Kimi K2 for trees, Gemini Flash for concept graphs) + Groq (LLaMA for chat/skills) |
-| Tree renderer | Custom HTML Canvas (L-system procedural branches) |
+| AI generation | OpenRouter (Gemini Flash for both tree gen + concept graphs) + Groq (LLaMA for chat/skills) |
+| Tree renderer | Custom HTML Canvas (tapered filled branches, polar layout — trunk/boughs/limbs/twigs + atmospheric roots) |
 | Work/Skills galaxy | D3 force simulation |
 | Mimir | Native Rust in mimir.rs — no sidecar process |
 | Scraper | Python FastAPI (port 3002) — URL scraping, PDF extraction (pymupdf), playlist |
@@ -270,7 +270,7 @@ YOUTUBE_API_KEY=...
 # Derived in dev.sh
 TREE_GEN_BASE_URL=https://openrouter.ai/api/v1/chat/completions
 TREE_GEN_API_KEY=$OPENROUTER_API_KEY
-TREE_GEN_MODEL=moonshotai/kimi-k2
+TREE_GEN_MODEL=google/gemini-2.5-flash
 CONCEPT_GRAPH_MODEL=google/gemini-2.5-flash
 CONCEPT_GRAPH_BASE_URL=https://openrouter.ai/api/v1/chat/completions
 CONCEPT_GRAPH_API_KEY=$OPENROUTER_API_KEY
@@ -291,7 +291,7 @@ Tree generation uses a two-phase pipeline via OpenRouter:
 - If extraction fails, falls back to single-phase generation gracefully
 
 **Phase 2: Tree Generation with Graph Context**
-- Uses Kimi K2 via OpenRouter
+- Uses Gemini Flash via OpenRouter
 - The sorted concept dependency order is prepended to the user prompt
 - The tree generation LLM uses this to determine phase ordering, skill sequencing, and quest progression
 - Every quest should connect back to a concept in the dependency graph

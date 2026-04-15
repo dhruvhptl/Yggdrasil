@@ -9,6 +9,7 @@ sys.stdout.reconfigure(encoding='utf-8')
 # env vars are loaded by dev.sh before this process starts
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from scrapling.fetchers import AsyncFetcher, StealthyFetcher, DynamicFetcher
 import re
@@ -19,6 +20,13 @@ from googleapiclient.discovery import build as googleapi_build
 import fitz  # pymupdf
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:1420", "tauri://localhost"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 

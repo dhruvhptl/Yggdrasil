@@ -4,6 +4,7 @@ import ProjectInput from "../components/ProjectInput";
 import { Project } from "../types";
 import { invoke } from "@tauri-apps/api/core";
 import { useNavigate, useSearchParams } from "react-router-dom";
+import { Trash2 } from "lucide-react";
 
 interface Discipline {
   id: string;
@@ -44,6 +45,17 @@ export default function HomePage() {
 
   function handleProjectCreated(project: Project) {
     setProjects((prev) => [project, ...prev]);
+  }
+
+  async function handleDeleteProject(e: React.MouseEvent, projectId: string) {
+    e.stopPropagation();
+    if (!confirm("Delete this project? This will remove the tree and all progress.")) return;
+    try {
+      await invoke("delete_project", { projectId });
+      setProjects((prev) => prev.filter((p) => p.id !== projectId));
+    } catch (err) {
+      console.error("Failed to delete project:", err);
+    }
   }
 
   return (
@@ -115,6 +127,13 @@ export default function HomePage() {
                         ? new Date(project.createdAt).toLocaleDateString()
                         : ""}
                     </span>
+                    <button
+                      onClick={(e) => handleDeleteProject(e, project.id)}
+                      className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded text-slate-600 hover:text-red-400 hover:bg-red-950/40"
+                      title="Delete project"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
                     <span className="text-xs text-slate-600 group-hover:text-emerald-600 transition-colors mt-0.5">
                       →
                     </span>

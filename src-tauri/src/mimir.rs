@@ -38,6 +38,12 @@ pub struct MimirResource {
     pub node_count: i32,
     #[serde(default)]
     pub is_completed: bool,
+    #[serde(default)]
+    pub matched_section_title: Option<String>,
+    #[serde(default)]
+    pub matched_page_start: Option<i32>,
+    #[serde(default)]
+    pub matched_page_end: Option<i32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -627,6 +633,9 @@ pub async fn get_mimir_resources(
             is_completed: row.try_get("is_completed").unwrap_or(false),
             node_count: row.try_get("node_count").unwrap_or(0),
             relevance_score: None,
+            matched_section_title: None,
+            matched_page_start: None,
+            matched_page_end: None,
         });
     }
 
@@ -641,7 +650,8 @@ pub async fn get_node_resources(
     let rows = sqlx::query(
         "SELECT mr.id, mr.title, mr.url, mr.type, mr.status, mr.user_notes, \
                 mr.created_at::text, mr.parent_id, mr.tags, mr.is_completed, \
-                mnl.relevance_score \
+                mnl.relevance_score, mnl.matched_section_title, \
+                mnl.matched_page_start, mnl.matched_page_end \
          FROM mimir_resources mr \
          JOIN mimir_node_links mnl ON mnl.resource_id = mr.id \
          WHERE mnl.node_id = $1 \
@@ -667,6 +677,9 @@ pub async fn get_node_resources(
             is_completed: row.try_get("is_completed").unwrap_or(false),
             node_count: 0,
             relevance_score: row.try_get("relevance_score").ok(),
+            matched_section_title: row.try_get("matched_section_title").ok().flatten(),
+            matched_page_start: row.try_get("matched_page_start").ok().flatten(),
+            matched_page_end: row.try_get("matched_page_end").ok().flatten(),
         });
     }
 
@@ -1008,42 +1021,71 @@ pub async fn match_node_impl(
     let embedding = get_embedding(client, &search_text).await?;
     let vec_str = vector_str(&embedding);
 
+    // Per-resource: find the single best chunk (lowest distance) and carry its metadata
     let similar = sqlx::query(
-        "SELECT mc.resource_id, \
-                MIN(me.embedding <=> $1::vector) AS distance \
+        "SELECT DISTINCT ON (mc.resource_id) \
+                mc.resource_id, mc.id AS chunk_id, \
+                mc.section_title, mc.page_start, mc.page_end, \
+                (me.embedding <=> $1::vector) AS distance \
          FROM mimir_embeddings me \
          JOIN mimir_chunks mc ON mc.id = me.chunk_id \
-         GROUP BY mc.resource_id \
-         ORDER BY distance ASC \
-         LIMIT 10"
+         ORDER BY mc.resource_id, distance ASC"
     )
     .bind(&vec_str)
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
 
-    // Filter by threshold
-    let matches: Vec<(String, f64)> = similar
+    // Filter by threshold — same 0.55 cutoff, take top 10
+    struct ChunkMatch {
+        resource_id: String,
+        chunk_id: String,
+        section_title: Option<String>,
+        page_start: Option<i32>,
+        page_end: Option<i32>,
+        distance: f64,
+    }
+    let mut matches: Vec<ChunkMatch> = similar
         .iter()
         .filter_map(|row| {
             let rid: String = row.try_get("resource_id").ok()?;
             let dist: f64 = row.try_get("distance").ok()?;
-            if dist < 0.55 { Some((rid, dist)) } else { None }
+            if dist >= 0.55 { return None; }
+            Some(ChunkMatch {
+                resource_id: rid,
+                chunk_id: row.try_get("chunk_id").unwrap_or_default(),
+                section_title: row.try_get("section_title").ok().flatten(),
+                page_start: row.try_get("page_start").ok().flatten(),
+                page_end: row.try_get("page_end").ok().flatten(),
+                distance: dist,
+            })
         })
         .collect();
+    matches.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal));
+    matches.truncate(10);
 
-    // Upsert node links
-    for (rid, dist) in &matches {
+    // Upsert node links with chunk metadata
+    for m in &matches {
         let link_id = uuid::Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO mimir_node_links (id, resource_id, node_id, relevance_score) \
-             VALUES ($1, $2, $3, $4) \
-             ON CONFLICT (resource_id, node_id) DO UPDATE SET relevance_score = EXCLUDED.relevance_score"
+            "INSERT INTO mimir_node_links \
+               (id, resource_id, node_id, relevance_score, matched_chunk_id, matched_section_title, matched_page_start, matched_page_end) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             ON CONFLICT (resource_id, node_id) DO UPDATE SET \
+               relevance_score = EXCLUDED.relevance_score, \
+               matched_chunk_id = EXCLUDED.matched_chunk_id, \
+               matched_section_title = EXCLUDED.matched_section_title, \
+               matched_page_start = EXCLUDED.matched_page_start, \
+               matched_page_end = EXCLUDED.matched_page_end"
         )
         .bind(&link_id)
-        .bind(rid)
+        .bind(&m.resource_id)
         .bind(node_id)
-        .bind(*dist as f32)
+        .bind(m.distance as f32)
+        .bind(&m.chunk_id)
+        .bind(&m.section_title)
+        .bind(m.page_start)
+        .bind(m.page_end)
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -1053,15 +1095,19 @@ pub async fn match_node_impl(
         return Ok(vec![]);
     }
 
-    // Return matched resources
-    let resource_ids: Vec<String> = matches.iter().map(|(rid, _)| rid.clone()).collect();
+    // Return matched resources with chunk metadata from the link row
+    let resource_ids: Vec<String> = matches.iter().map(|m| m.resource_id.clone()).collect();
     let rows = sqlx::query(
-        "SELECT id, title, url, type, status, created_at::text \
-         FROM mimir_resources \
-         WHERE id = ANY($1::text[]) \
-         ORDER BY array_position($1::text[], id)"
+        "SELECT mr.id, mr.title, mr.url, mr.type, mr.status, mr.created_at::text, \
+                mr.tags, mr.is_completed, \
+                mnl.relevance_score, mnl.matched_section_title, mnl.matched_page_start, mnl.matched_page_end \
+         FROM mimir_resources mr \
+         JOIN mimir_node_links mnl ON mnl.resource_id = mr.id AND mnl.node_id = $2 \
+         WHERE mr.id = ANY($1::text[]) \
+         ORDER BY mnl.relevance_score ASC NULLS LAST"
     )
     .bind(&resource_ids)
+    .bind(node_id)
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
@@ -1077,10 +1123,13 @@ pub async fn match_node_impl(
             user_notes: None,
             created_at: row.try_get("created_at").unwrap_or_default(),
             parent_id: None,
-            tags: vec![],
-            is_completed: false,
+            tags: row.try_get::<Vec<String>, _>("tags").unwrap_or_default(),
+            is_completed: row.try_get("is_completed").unwrap_or(false),
             node_count: 0,
-            relevance_score: None,
+            relevance_score: row.try_get("relevance_score").ok(),
+            matched_section_title: row.try_get("matched_section_title").ok().flatten(),
+            matched_page_start: row.try_get("matched_page_start").ok().flatten(),
+            matched_page_end: row.try_get("matched_page_end").ok().flatten(),
         })
         .collect();
 

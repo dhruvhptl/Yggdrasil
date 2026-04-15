@@ -77,7 +77,7 @@ Yggdrasil puts it all in one place.
 | Embeddings | ✅ Done | pplx-embed-v1-0.6b (1024-dim) via OpenRouter |
 | Tree Generation — PRD | ✅ Done | Kimi-k2, concept graph, topo sort |
 | Tree Generation — GitHub repo | ✅ Done | GitHub API, source file analysis, concept graph |
-| Tree Rendering | ✅ Done | Custom Canvas (YggdrasilTree.tsx), trunk/branch/leaf organic layout, node panel, checkpoint completion |
+| Tree Rendering | ✅ Done | Custom Canvas (YggdrasilTree.tsx), tapered filled branches, polar layout (boughs/limbs/twigs), atmospheric roots, node panel, checkpoint completion |
 | Auto-matching checkpoints to resources | ✅ Done | pgvector cosine match on checkpoint title + description |
 | Universal Skill Tree — Galaxy | ✅ Done | Skills, dependencies, gap analysis |
 | Jobs Page | ✅ Done | Kanban + skill gap detection |
@@ -97,9 +97,9 @@ Yggdrasil puts it all in one place.
 | Desktop | Tauri 2.0 | ✅ |
 | Main backend | Rust + sqlx | ✅ |
 | Database | Postgres on Neon (pgvector enabled) | ✅ |
-| AI generation | Kimi K2 + Gemini Flash via OpenRouter | ✅ |
+| AI generation | Gemini Flash via OpenRouter (tree gen + concept graphs) | ✅ |
 | AI chat / extraction | Groq — LLaMA 3.3-70b-versatile + 3.1-8b-instant | ✅ |
-| Tree visualization | Custom HTML Canvas (L-system) | ✅ |
+| Tree visualization | Custom HTML Canvas (tapered filled branches, polar layout) | ✅ |
 | Work/Skills galaxy | D3 force simulation | ✅ |
 | Mimir | Native Rust in mimir.rs — no sidecar | ✅ |
 | PDF extraction | Python scraper /fetch-pdf with pymupdf (TOC-aware) | ✅ |
@@ -316,13 +316,13 @@ The job tracker's skill demand scores flow into the graph as edge weights. Branc
 
 **Visual design**
 
-Dark organic canvas tree — the same aesthetic as the project tree renderer, scaled up:
-- Warm amber/deep green gradient background
-- Twisted procedural branches from a single root node (you)
-- Glowing circular nodes: dim for locked, softly lit for in-progress, bright for mastered
-- Domain nodes are larger, brighter, higher in the canopy
-- Skill nodes cluster around their domain branch
-- Resource nodes appear as small satellites orbiting skill nodes
+Dark organic canvas tree — the project tree renderer (`YggdrasilTree.tsx`) already ships this aesthetic:
+- Deep night-sky gradient background, canopy glow, floating pollen motes
+- Tapered filled branches (trunk → domain boughs → skill limbs → checkpoint twigs) with bark gradients
+- Surface roots fanning from trunk base with ground fog
+- Pulsing amber glow at the domain junction
+- Leaf nodes: botanical bezier shape, 4 states (dormant/budding/growing/bloomed), orbiting sparkles on mastered
+- For the Universal Skill Tree: same renderer scaled up, circular nodes replacing leaf shapes, domain clusters replacing phase spines
 
 ### V2 — Personal Knowledge Graph as Librarian
 
