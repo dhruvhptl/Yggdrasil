@@ -147,6 +147,8 @@ fn main() {
             skill_commands::merge_skills,
             skill_commands::mark_skill_reviewed,
             skill_commands::backfill_skill_slugs,
+            skill_commands::classify_skill_domains,
+            skill_commands::reset_skill_domains,
             read_models::get_active_tree_for_project,
             read_models::get_node_chat_context,
             read_models::get_project_tree_summary,

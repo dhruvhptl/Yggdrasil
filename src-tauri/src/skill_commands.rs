@@ -874,6 +874,220 @@ pub async fn mark_skill_reviewed(
     Ok(())
 }
 
+// ─── Domain classification ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassificationResult {
+    pub total: usize,
+    pub classified: usize,
+    pub failed: usize,
+}
+
+#[tauri::command]
+pub async fn classify_skill_domains(
+    database: State<'_, Database>,
+) -> Result<ClassificationResult, String> {
+    let api_key = std::env::var("GROQ_API_KEY").map_err(|_| "GROQ_API_KEY not set".to_string())?;
+    let client = reqwest::Client::new();
+
+    // Load all domains with descriptions
+    let domain_rows = sqlx::query(
+        "SELECT id, name, COALESCE(description, '') AS description FROM skill_domains ORDER BY name ASC"
+    )
+    .fetch_all(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if domain_rows.is_empty() {
+        return Err("No skill_domains found — run migrations first".to_string());
+    }
+
+    let domains: Vec<(String, String, String)> = domain_rows.iter().map(|r| {
+        let id: String = r.try_get("id").unwrap_or_default();
+        let name: String = r.try_get("name").unwrap_or_default();
+        let desc: String = r.try_get("description").unwrap_or_default();
+        (id, name, desc)
+    }).collect();
+
+    // One line per domain: "  Machine Learning (dom-ml): algorithms that learn from data..."
+    let domain_list: String = domains.iter()
+        .map(|(id, name, desc)| {
+            if desc.is_empty() {
+                format!("  {} (id={})", name, id)
+            } else {
+                format!("  {} (id={}): {}", name, id, desc)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Load unclassified skills
+    let skill_rows = sqlx::query(
+        "SELECT id, name FROM universal_skills
+         WHERE domain_id IS NULL OR status = 'unclassified'
+         ORDER BY name ASC"
+    )
+    .fetch_all(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let skills: Vec<(String, String)> = skill_rows.iter().map(|r| {
+        let id: String = r.try_get("id").unwrap_or_default();
+        let name: String = r.try_get("name").unwrap_or_default();
+        (id, name)
+    }).collect();
+
+    let total = skills.len();
+    if total == 0 {
+        return Ok(ClassificationResult { total: 0, classified: 0, failed: 0 });
+    }
+
+    let mut classified = 0usize;
+    let mut failed = 0usize;
+
+    for chunk in skills.chunks(20) {
+        let skill_list: String = chunk.iter()
+            .map(|(id, name)| format!("  \"{}\": \"{}\"", name, id))
+            .collect::<Vec<_>>()
+            .join(",\n");
+
+        let prompt = format!(
+            "You are classifying skills into specific learning domains.\n\n\
+             Available domains (id: name — description):\n{domain_list}\n\n\
+             Skills to classify (skill_id: skill_name):\n{skill_list}\n\n\
+             Return ONLY a JSON object mapping each skill_id to the single best-fitting domain_id:\n\
+             {{\"<skill_id>\": \"<domain_id>\", ...}}\n\n\
+             Rules:\n\
+             - Assign the MOST SPECIFIC domain that fits (e.g. prefer 'Machine Learning' over 'Computing' for 'gradient descent')\n\
+             - Every skill must appear in the output exactly once\n\
+             - Use the most general fitting domain only if no specific domain fits\n\
+             - Return only the JSON object — no markdown fences, no explanation, no extra text"
+        );
+
+        let t0 = std::time::Instant::now();
+        let body = serde_json::json!({
+            "model": "llama-3.3-70b-versatile",
+            "messages": [
+                { "role": "user", "content": prompt }
+            ],
+            "temperature": 0.1,
+            "max_tokens": 1024,
+        });
+
+        let resp = client
+            .post(GROQ_API_URL)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await;
+
+        let elapsed = t0.elapsed().as_millis() as i64;
+
+        let raw = match resp {
+            Err(e) => {
+                crate::brain::log_prompt_call(
+                    database.pool.clone(), "skill_domain_classification",
+                    "llama-3.3-70b-versatile", "skill_domain_class_v2",
+                    elapsed, false, Some(e.to_string()), None,
+                );
+                failed += chunk.len();
+                continue;
+            }
+            Ok(r) => match r.text().await {
+                Err(e) => {
+                    crate::brain::log_prompt_call(
+                        database.pool.clone(), "skill_domain_classification",
+                        "llama-3.3-70b-versatile", "skill_domain_class_v2",
+                        elapsed, false, Some(e.to_string()), None,
+                    );
+                    failed += chunk.len();
+                    continue;
+                }
+                Ok(t) => t,
+            }
+        };
+
+        let json_val: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+        let content = json_val["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+
+        let clean = content
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+
+        let mapping: std::collections::HashMap<String, String> =
+            serde_json::from_str(clean).unwrap_or_default();
+
+        let input_tokens = json_val["usage"]["prompt_tokens"].as_i64();
+        let output_tokens = json_val["usage"]["completion_tokens"].as_i64();
+        crate::brain::log_prompt_call(
+            database.pool.clone(), "skill_domain_classification",
+            "llama-3.3-70b-versatile", "skill_domain_class_v2",
+            elapsed, true, None,
+            Some(serde_json::json!({ "input_tokens": input_tokens, "output_tokens": output_tokens })),
+        );
+
+        for (skill_id, domain_id) in &mapping {
+            let res = sqlx::query(
+                "UPDATE universal_skills
+                 SET domain_id = $1, status = 'active', review_needed = false, last_updated = NOW()
+                 WHERE id = $2"
+            )
+            .bind(domain_id)
+            .bind(skill_id)
+            .execute(&database.pool)
+            .await;
+
+            match res {
+                Ok(r) if r.rows_affected() > 0 => classified += 1,
+                Ok(_) => failed += 1,
+                Err(e) => {
+                    eprintln!("⚠️ Failed to update skill {}: {}", skill_id, e);
+                    failed += 1;
+                }
+            }
+        }
+
+        // Any skills from this chunk not in mapping count as failed
+        let mapped_ids: std::collections::HashSet<&String> = mapping.keys().collect();
+        for (id, _) in chunk {
+            if !mapped_ids.contains(id) {
+                failed += 1;
+            }
+        }
+    }
+
+    println!("🏷️ classify_skill_domains: {classified}/{total} classified, {failed} failed");
+    Ok(ClassificationResult { total, classified, failed })
+}
+
+// ─── Reset domain assignments ─────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn reset_skill_domains(
+    database: State<'_, Database>,
+) -> Result<usize, String> {
+    let result = sqlx::query(
+        "UPDATE universal_skills
+         SET domain_id = NULL, status = 'unclassified', review_needed = true, last_updated = NOW()
+         WHERE status = 'active'"
+    )
+    .execute(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let count = result.rows_affected() as usize;
+    println!("🔄 reset_skill_domains: cleared domain_id for {count} skills");
+    Ok(count)
+}
+
 #[tauri::command]
 pub async fn backfill_skill_slugs(
     database: State<'_, Database>,

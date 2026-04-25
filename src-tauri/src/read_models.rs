@@ -414,8 +414,12 @@ pub async fn get_skill_graph_snapshot(
     // All four queries run concurrently
     let (skills_rows, deps_rows, aliases_rows, gaps_row, counts_row) = tokio::try_join!(
         sqlx::query(
-            "SELECT id, name, domain, level, evidence, last_updated, review_needed, status
-             FROM universal_skills ORDER BY review_needed DESC, level DESC, name ASC"
+            "SELECT us.id, us.name,
+                    COALESCE(sd.name, us.domain) AS domain,
+                    us.level, us.evidence, us.last_updated, us.review_needed, us.status
+             FROM universal_skills us
+             LEFT JOIN skill_domains sd ON sd.id = us.domain_id
+             ORDER BY us.review_needed DESC, us.level DESC, us.name ASC"
         ).fetch_all(&database.pool),
         sqlx::query(
             "SELECT id, source_skill_id, target_skill_id, relationship FROM skill_dependencies"
