@@ -3,6 +3,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod constants;
 mod database;
 mod tree_commands;
 mod brain;
@@ -14,11 +15,38 @@ mod resume_commands;
 mod skill_commands;
 mod export_commands;
 mod daily_commands;
+mod read_models;
+mod orchestrator;
 
 use database::Database;
 use tauri::Manager;
 
+fn load_env_file() {
+    // In production, env vars aren't inherited from a shell.
+    // Read them from %APPDATA%/com.universal.skilltree/.env written by build.sh.
+    #[cfg(not(debug_assertions))]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let env_path = std::path::Path::new(&appdata)
+                .join("com.universal.skilltree")
+                .join(".env");
+            if let Ok(contents) = std::fs::read_to_string(&env_path) {
+                for line in contents.lines() {
+                    if let Some((key, value)) = line.split_once('=') {
+                        let key = key.trim();
+                        let value = value.trim();
+                        if !key.is_empty() && !key.starts_with('#') {
+                            std::env::set_var(key, value);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn main() {
+    load_env_file();
     tauri::Builder::default()
         .setup(|app| {
             let app_handle = app.handle().clone();
@@ -26,7 +54,10 @@ fn main() {
                 let database = Database::new()
                     .await
                     .expect("Failed to initialize database");
+                let pool = database.pool.clone();
                 app_handle.manage(database);
+                let queue = orchestrator::start_worker(pool, app_handle.clone());
+                app_handle.manage(queue);
             });
             Ok(())
         })
@@ -73,6 +104,9 @@ fn main() {
             mimir::on_resource_completed,
             mimir::get_linked_node_titles,
             mimir::reembed_pdfs,
+            mimir::get_chat_session,
+            mimir::clear_chat_session,
+            mimir::get_retrieval_stats,
             work_commands::create_coop,
             work_commands::get_coops,
             work_commands::create_topic,
@@ -109,6 +143,18 @@ fn main() {
             skill_commands::get_skill_dependencies,
             skill_commands::get_skill_gaps,
             skill_commands::infer_skill_dependencies,
+            skill_commands::get_skill_aliases,
+            skill_commands::merge_skills,
+            skill_commands::mark_skill_reviewed,
+            skill_commands::backfill_skill_slugs,
+            read_models::get_active_tree_for_project,
+            read_models::get_node_chat_context,
+            read_models::get_project_tree_summary,
+            read_models::get_skill_graph_snapshot,
+            orchestrator::enqueue_rematch,
+            orchestrator::enqueue_reembed,
+            orchestrator::enqueue_autotag,
+            brain::get_prompt_stats,
             export_commands::export_tree,
             daily_commands::get_daily_log,
             daily_commands::upsert_daily_notes,

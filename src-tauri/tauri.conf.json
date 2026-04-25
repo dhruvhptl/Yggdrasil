@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2.0",
-  "productName": "Univerisal Skill Tree",
+  "productName": "Universal Skill Tree",
   "version": "0.1.0",
   "identifier": "com.universal.skilltree",
   "build": {

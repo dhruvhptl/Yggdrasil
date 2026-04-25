@@ -1,5 +1,5 @@
 # Yggdrasil — Product Requirements Document
-**Version:** 2.2  
+**Version:** 2.4  
 **Updated:** April 2026
 
 ---
@@ -58,7 +58,7 @@ Yggdrasil puts it all in one place.
 
 ---
 
-## Current State (v2.1)
+## Current State (v2.3)
 
 ### What's Built & Working
 
@@ -71,15 +71,28 @@ Yggdrasil puts it all in one place.
 | Mimir Library — External links modal | ✅ Done | Links from resource-list pages ingested as children |
 | Mimir Library — Rescrape All | ✅ Done | Bulk rescrape with real-time progress events; YouTube videos excluded |
 | Mimir Library — Re-embed PDFs | ✅ Done | Re-embeds from sections_json or raw_text without re-uploading |
-| Mimir Chat — RAG | ✅ Done | pgvector cosine search, Groq LLaMA 3.3-70b synthesis, section+page citations |
+| Mimir Chat — Hybrid RAG | ✅ Done | RRF over pgvector cosine + Postgres FTS; Groq LLaMA 3.3-70b synthesis, section+page citations |
 | Mimir Chat — Reranking | ✅ Done | llama-3.1-8b-instant reranker, top-3 selection |
+| Mimir Chat — Session memory | ✅ Done | Persisted per (tree_id, node_id); last 10 messages injected into context |
+| Mimir Chat — Pre-matched chunk loading | ✅ Done | Node context bypasses cold retrieval; pre-loads chunks from mimir_node_links |
 | Mimir — Native Rust | ✅ Done | No Node.js sidecar — all ingest/RAG/rescrape in mimir.rs |
+| Mimir — Retrieval logging | ✅ Done | Every RAG call writes full stats to mimir_retrieval_logs |
 | Embeddings | ✅ Done | pplx-embed-v1-0.6b (1024-dim) via OpenRouter |
-| Tree Generation — PRD | ✅ Done | Kimi-k2, concept graph, topo sort |
-| Tree Generation — GitHub repo | ✅ Done | GitHub API, source file analysis, concept graph |
-| Tree Rendering | ✅ Done | Custom Canvas (YggdrasilTree.tsx), tapered filled branches, polar layout (boughs/limbs/twigs), atmospheric roots, node panel, checkpoint completion |
-| Auto-matching checkpoints to resources | ✅ Done | pgvector cosine match on checkpoint title + description |
+| Tree Generation — PRD | ✅ Done | Gemini Flash, concept graph, topo sort, PRD profile stage |
+| Tree Generation — GitHub repo | ✅ Done | GitHub API, source file analysis, concept graph, repo profile stage |
+| Tree Generation — Paper context | ✅ Done | Optional paper URL or PDF (arXiv supported); fed into Phase 1 concept graph + Phase 2 repo profile + per-skill expansion |
+| Tree Generation — Two-stage pipeline | ✅ Done | Phase 1 concept graph → Phase 2 tree gen with graph-ordered context; stable with graceful fallback |
+| Tree Rendering | ✅ Done | Custom Canvas (YggdrasilTree.tsx), tapered filled branches, polar coordinate layout (boughs/limbs/twigs), atmospheric roots, checkpoint completion |
+| Tree Rendering — Leaf states | ✅ Done | Bud / sprout / leaf / bloomed states with breathing pulse, progress ring, orbiting sparkles |
+| Node panel — Source citations | ✅ Done | Shows section title + page range for every matched chunk from Mimir resources |
+| Auto-matching checkpoints to resources | ✅ Done | pgvector cosine match on checkpoint title + description; persists matched chunk + section + page range |
+| Background job queue | ✅ Done | orchestrator.rs JobQueue (tokio mpsc); RematchAllNodes, ReembedResources, InferSkillDeps, AutoTagResources; emits ygg-* events |
+| Event-driven frontend | ✅ Done | UI subscribes to ygg-* Tauri events; Rust owns long-running state machines |
+| Read-model helpers | ✅ Done | 4 purpose-built Tauri commands in read_models.rs replacing ad-hoc frontend joins |
+| Prompt & model version logging | ✅ Done | prompt_logs table; all call_llm sites instrumented; get_prompt_stats command; dev-only Model logs tab |
 | Universal Skill Tree — Galaxy | ✅ Done | Skills, dependencies, gap analysis |
+| Universal Skills — Domain-agnostic schema | ✅ Done | skill_domains table seeded; kind widened to 6 values; review_needed + status columns; skill_evidence first-class rows |
+| Universal Skills — Canonicalization | ✅ Done | skill_aliases table + merge UI; alias lookups case-insensitive |
 | Jobs Page | ✅ Done | Kanban + skill gap detection |
 | Resume Page | ✅ Done | Auto-parse, skill extraction |
 | Work Page | ✅ Done | Co-op tracker, skill extraction |
@@ -102,6 +115,10 @@ Yggdrasil puts it all in one place.
 | Tree visualization | Custom HTML Canvas (tapered filled branches, polar layout) | ✅ |
 | Work/Skills galaxy | D3 force simulation | ✅ |
 | Mimir | Native Rust in mimir.rs — no sidecar | ✅ |
+| Hybrid retrieval | RRF over pgvector cosine + Postgres FTS (GIN tsvector) | ✅ |
+| Chat session memory | mimir_chat_sessions + mimir_chat_messages tables | ✅ |
+| Background jobs | tokio mpsc JobQueue in orchestrator.rs; ygg-* Tauri events | ✅ |
+| Observability | prompt_logs + mimir_retrieval_logs tables; dev UI in MimirChat | ✅ |
 | PDF extraction | Python scraper /fetch-pdf with pymupdf (TOC-aware) | ✅ |
 | Embeddings | Perplexity pplx-embed-v1-0.6b (1024-dim) via OpenRouter | ✅ |
 | Vector search | pgvector on Neon — vector(1024) | ✅ |
@@ -163,11 +180,15 @@ Expand the job tracker. Target: 50+ jobs before reviewing skill gap analysis.
 
 In order — each depends on the previous being stable:
 
-1. **Smarter retrieval** — usage_weight column, feedback signals, dynamic context injection
-2. **Chat history persistence** — mimir_chat_sessions + mimir_chat_messages tables
-3. **Knowledge graph schema** — typed edges, prerequisite traversal, resource attachment to skill nodes
-4. **Universal Skill Tree visual rebuild** — canvas renderer, organic tree layout, glowing nodes
-5. **Graph-aware Mimir retrieval** — graph traversal before cosine search
+1. ~~**Chat history persistence**~~ ✅ Done — mimir_chat_sessions + mimir_chat_messages; session memory in Groq context
+2. ~~**Hybrid retrieval**~~ ✅ Done — RRF over cosine + FTS; retrieval logging
+3. **Smarter retrieval** — usage_weight column on mimir_chunks, feedback signals (mimir_feedback table), dynamic context injection
+4. **Knowledge graph schema** — typed edges, prerequisite traversal, resource attachment to skill nodes
+5. **Universal Skill Tree visual rebuild** — canvas renderer, organic tree layout, glowing nodes
+6. **Graph-aware Mimir retrieval** — graph traversal before cosine search
+7. **Mimir chat improvements** — knowledge graph augmentation, per-checkpoint session memory, agentic suggestions
+8. **Browser extension** — one-click ingest of the current page into Mimir, auto-tag by domain, optional link-to-checkpoint picker
+9. **Tree versioning + diff-based updates** — snapshot trees per revision, regenerate against latest repo/paper, surface a diff view so accepted changes preserve notes + completion state
 
 ---
 
@@ -249,6 +270,28 @@ Data feeds:
 - Work page — extracted skills from co-op resources
 - Job tracker — demand shapes which branches to grow toward
 - Resume — pre-populates existing skills
+
+### 2.4 Browser Extension
+
+A lightweight Chrome/Firefox extension that turns any page into a Mimir resource in one click:
+
+- Toolbar button on every tab — click to send the current URL to the desktop app
+- Desktop app exposes a localhost ingest endpoint (or a registered deep link) that accepts URLs from the extension
+- Optional: pick a tree + checkpoint on click, so the resource is pre-linked on ingest
+- Auto-tag by domain (arxiv.org → `paper`, youtube.com → `video`, github.com → `repo`)
+- Paste-and-send text selection — for short passages that don't warrant a full page scrape
+- Works offline — queues URLs if the desktop app isn't running, flushes on reconnect
+
+### 2.5 Tree Versioning & Diff-Based Updates
+
+Trees today are one-shot — regenerating discards everything. V2 treats each generation as a revision:
+
+- `tree_versions (id, tree_id, generation, source_fingerprint, created_at)` — one row per generation
+- Every node has a stable `concept_id` independent of its surrogate row id; regeneration reconciles by concept, not by position
+- **Diff view** when a new version is generated: added concepts, removed concepts, renamed/rescoped concepts, reordered prerequisites
+- User accepts changes per-concept — accepted additions land as new leaves, accepted removals are archived (not deleted), renames carry forward the user's notes and completion state
+- Source fingerprint = hash of (repo commit SHA, paper URL, PRD text) so re-runs against unchanged input are no-ops
+- Enables: update a tree when the repo gains new features, swap the paper, revise the PRD — without losing your climb
 
 ---
 
@@ -341,13 +384,9 @@ Query: "explain backpropagation"
                You have these resources in your library..."
 ```
 
-**Chat history persistence**
+**Chat history persistence** ✅ Done
 
-Chat history currently lives only in React state and is lost on refresh. V2 persists it:
-
-- New table: `mimir_chat_sessions (id, created_at)` and `mimir_chat_messages (id, session_id, role, content, created_at)`
-- Sessions are resumed automatically on the same tree/node context
-- History window: last 10 messages injected into context for continuity
+Chat history is persisted in `mimir_chat_sessions` (unique on `(tree_id, node_id)`) and `mimir_chat_messages`. Sessions resume automatically; last 10 messages are injected into context. `get_chat_session` and `clear_chat_session` Tauri commands manage lifecycle.
 
 **Dynamic context**
 
@@ -358,23 +397,57 @@ Mimir always knows:
 
 The system prompt is rebuilt on each query incorporating this dynamic context, not just a static template.
 
+### V2 — Mimir Chat Improvements
+
+A cluster of upgrades that turn Mimir chat from a stateless Q&A surface into a learning companion that knows where you are in the tree.
+
+**Knowledge graph augmentation**
+
+Every chat query first consults the personal knowledge graph (from V2 Skills Page Rebuild) and enriches the retrieved chunks with adjacent concept context — prerequisites, successors, and sibling skills. Responses reference the graph position explicitly: "This concept sits between X (which you've mastered) and Y (next up)."
+
+**Session memory per checkpoint**
+
+Chat history is scoped to `(tree_id, node_id)` — opening the same checkpoint resumes the prior conversation, not a blank slate.
+
+- New table: `mimir_chat_sessions (id, tree_id, node_id, created_at, last_active_at)` — unique on (tree_id, node_id)
+- `mimir_chat_messages (id, session_id, role, content, sources JSONB, created_at)`
+- Last 10 messages of the checkpoint's session are injected into context on every query for continuity
+- Switching checkpoints switches conversations; the previous one is preserved and resumable
+
+**Checkpoint-aware context pre-loading**
+
+When a checkpoint panel opens, Mimir pre-warms retrieval in the background — embedding the title + description, fetching the top-k chunks, and caching them. First question is answered without a cold retrieval round-trip.
+
+- Pre-loaded chunks surfaced as "Starter references" inside the panel before any question is asked
+- Cache invalidates when the linked resource set changes
+
+**Agentic suggestions**
+
+Mimir proactively surfaces next actions inside the chat panel, not just answers to typed questions:
+
+- "You've read 3 of 5 sources on this checkpoint. Want me to quiz you on what's left?"
+- "This concept's prerequisite (Chain Rule) hasn't been touched in 4 weeks — review first?"
+- "You asked about backpropagation three times today. Want me to draft study notes from your prior conversations?"
+
+Suggestions come from a lightweight trigger set — time since last visit, unread linked resources, repeat question detection, upcoming prerequisite decay.
+
 ---
 
 ## V3 Features
 
-### 3.1 Fine-Tuning on Personal Learning History
+### 3.1 Fine-Tuning on User Notes
 
-Fine-tune a small local model on everything Yggdrasil knows about how you learn:
+Fine-tune a small local model on everything Yggdrasil knows about how you learn — with checkpoint notes as the primary signal:
 
 **Training data sources**
-- Quest checkpoint notes — what you wrote while climbing trees
+- **Checkpoint notes** (primary) — what you wrote while climbing trees, paired with the concept title, mastery criteria, and linked resources
 - Mimir chat history — questions you asked and responses you rated helpful
 - Completed checkpoints — which concepts you mastered and in what order
 - Resource highlights (future) — passages you flagged while reading
 
 **What it enables**
 
-True personalisation — the model knows how you learn, what analogies click for you, which prerequisites you actually have vs nominally have, and where you typically get stuck.
+True personalisation — the model knows your vocabulary, which analogies click, which prerequisites you actually have vs nominally have, and where you typically get stuck.
 
 - Generates checkpoint mastery criteria calibrated to your actual level
 - Writes exercises that match your learning style
@@ -382,9 +455,39 @@ True personalisation — the model knows how you learn, what analogies click for
 
 **Infrastructure**
 
-Runs locally via the Python sidecar (port 3002) — a fine-tuned 1-3B parameter model (Phi-3 Mini, Qwen-2, or similar) loaded via llama.cpp or MLX on Apple Silicon. No cloud inference cost.
+Runs locally — a fine-tuned 1-3B parameter model (Phi-3 Mini, Qwen-2, or similar) loaded via llama.cpp or MLX on Apple Silicon. No cloud inference cost.
 
-### 3.2 MCP Integration & Deployment
+### 3.2 Anki / Spaced Repetition Export
+
+Every checkpoint becomes a spaced-repetition candidate:
+
+- Export a tree (or a set of completed checkpoints) as an `.apkg` Anki deck
+- Card front = concept name + mastery criteria; card back = your notes + linked resources
+- Cloze-deletion cards auto-generated from checkpoint notes where you marked key phrases
+- Re-export round-trips review history back into `daily_quest_links` as "schedule" quadrant items when a card's interval lapses
+- Decouples long-term retention from keeping the desktop app open
+
+### 3.3 Collaborative Trees
+
+Trees stop being strictly personal:
+
+- Share a tree snapshot via a stable URL — read-only by default, with notes/progress hidden
+- "Fork" a shared tree — clone it into your own account with a fresh climb state
+- Compare mode — side-by-side view of your tree vs another user's, with a diff over concept coverage and completion
+- Tree-level comments — attach questions or corrections to specific checkpoints; the author can merge them back
+- Use cases: study groups, mentor-authored curricula, course TAs handing out scaffolded trees, public portfolios of mastered domains
+
+### 3.4 Mobile Companion
+
+Read-only mobile app for the two activities that don't need a desktop:
+
+- **Review** — pull up any checkpoint, read notes, read linked resources (browser hand-off for PDFs)
+- **Capture** — voice or text notes that sync back into the desktop app's inbox, later triaged into checkpoints
+- Daily Matrix widget — today's "do" quadrant on the lock screen / home screen
+- Offline-first — queue mutations, sync on reconnect
+- Not a tree editor — generation and canvas interaction stay on desktop
+
+### 3.5 MCP Integration & Deployment
 
 Expose Mimir tools via MCP server so external tools (Claude Code, other agents) can query your personal knowledge library:
 
@@ -395,6 +498,39 @@ mimir.status(skill)      → your current level + evidence
 ```
 
 Deploy Python scraper to Railway or Oracle Cloud for always-on ingest without the desktop app running.
+
+---
+
+## Technical Roadmap
+
+Infrastructure and architecture work that isn't a user-facing feature but unblocks or amplifies one. Organized by when it makes sense to do the work, not by what it is.
+
+### Do Soon
+
+Foundation work that every V2 feature benefits from. Worth doing before the next major build pass so later features don't pile more weight onto shaky ground.
+
+- ~~**Rust-owned orchestrator + event-driven UI**~~ ✅ Done — `orchestrator.rs` JobQueue + `ygg-*` events; frontend is event-driven.
+- **Local cache for hot desktop state** — a small SQLite or sled cache in `%APPDATA%` for frequently-read data (project list, active tree summary, skill totals). Cold-start feels instant; Postgres reads only on explicit invalidation.
+- ~~**Alias/canonicalization layer for skills**~~ ✅ Done — `skill_aliases` table + merge UI + case-insensitive lookups.
+- ~~**Boundary validation**~~ ✅ Done — Zod schemas at Tauri invoke call-sites.
+- **pgvector profiling and threshold tuning** — measure cosine score distributions across real resources, tune the auto-match threshold per-domain (PDFs vs videos vs web pages have different score floors), add an `ivfflat` index if query latency warrants it.
+
+### Do As You Build Next Features
+
+Work that doesn't need to happen upfront but should land alongside the next major feature that would benefit. Think of these as "when you're already in this area."
+
+- ~~**Hybrid retrieval**~~ ✅ Done — RRF over pgvector cosine + Postgres FTS (migration 030); retrieval logging in `mimir_retrieval_logs`.
+- ~~**Read-model helpers in Rust**~~ ✅ Done — `read_models.rs` with 4 purpose-built commands.
+- ~~**Background async jobs for scraper/rematch/inference**~~ ✅ Done — `orchestrator.rs` JobQueue; `ygg-*` progress events.
+- ~~**Prompt/model version logging**~~ ✅ Done — `prompt_logs` table (migration 031); all LLM call sites instrumented; `get_prompt_stats` command + dev UI.
+
+### Later
+
+Foundational upgrades that are only worth doing once the core product is battle-tested and the user base or usage pattern demands it.
+
+- **Fuller local-first sync model** — CRDT or log-based sync between local cache and Postgres so the app works fully offline, not just on cache hits. Only matters if mobile companion (V3) or multi-device use materialises.
+- **Richer eval dashboard** — an internal page that tracks retrieval precision@k, tree generation quality scores, skill extraction accuracy on a held-out set. Needed once there's enough usage history for the numbers to be meaningful.
+- **More advanced graph analytics** — centrality, clustering, shortest-path queries over the knowledge graph. Powers features like "which skill unlocks the most downstream nodes" or "what's your critical path to a target role." Valuable once the graph is dense enough for the analytics to be non-trivial.
 
 ---
 

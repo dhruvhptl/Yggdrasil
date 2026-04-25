@@ -157,6 +157,8 @@ pub async fn update_tree_node(
     tasks: Option<serde_json::Value>,
     resources: Option<serde_json::Value>,
     position: Option<(f32, f32)>,
+    app: tauri::AppHandle,
+    queue: State<'_, crate::orchestrator::JobQueue>,
     database: State<'_, Database>
 ) -> Result<(), String> {
     let row = sqlx::query!(
@@ -184,6 +186,28 @@ pub async fn update_tree_node(
         new_y,
         node_id
     ).execute(&database.pool).await.map_err(|e| e.to_string())?;
+
+    // Trigger checkpoint cascade when a leaf node reaches 100%
+    if new_progress == 100 {
+        let type_row = sqlx::query(
+            "SELECT type, tree_id FROM tree_nodes WHERE id = $1"
+        )
+        .bind(&node_id)
+        .fetch_optional(&database.pool)
+        .await
+        .ok()
+        .flatten();
+
+        if let Some(r) = type_row {
+            let node_type: String = r.try_get("type").unwrap_or_default();
+            let tree_id: String = r.try_get("tree_id").unwrap_or_default();
+            if node_type == "leaf" && !tree_id.is_empty() {
+                crate::orchestrator::on_checkpoint_completed(
+                    &database.pool, &app, &node_id, &tree_id, &queue,
+                ).await;
+            }
+        }
+    }
 
     Ok(())
 }

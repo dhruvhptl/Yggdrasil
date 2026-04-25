@@ -7,6 +7,7 @@ use sqlx::Row;
 use tauri::State;
 use uuid::Uuid;
 
+use crate::constants::GROQ_API_URL;
 use crate::database::Database;
 
 // ─── Structs ─────────────────────────────────────────────────────────────────
@@ -117,7 +118,7 @@ async fn do_extract_skills(
 
     let client = reqwest::Client::new();
     let response = client
-        .post("https://api.groq.com/openai/v1/chat/completions")
+        .post(GROQ_API_URL)
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
         .json(&serde_json::json!({

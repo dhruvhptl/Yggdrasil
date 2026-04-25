@@ -231,15 +231,44 @@ pub async fn remove_from_day(
 #[tauri::command]
 pub async fn toggle_task_complete(
     link_id: String,
+    app: tauri::AppHandle,
+    queue: State<'_, crate::orchestrator::JobQueue>,
     database: State<'_, Database>,
 ) -> Result<bool, String> {
     let row = sqlx::query(
-        "UPDATE daily_quest_links SET completed = NOT completed WHERE id = $1 RETURNING completed"
+        "UPDATE daily_quest_links SET completed = NOT completed WHERE id = $1 \
+         RETURNING completed, node_id"
     )
     .bind(&link_id)
     .fetch_one(&database.pool)
     .await
     .map_err(|e| e.to_string())?;
 
-    row.try_get::<bool, _>("completed").map_err(|e| e.to_string())
+    let completed: bool = row.try_get("completed").map_err(|e| e.to_string())?;
+    let node_id: Option<String> = row.try_get("node_id").unwrap_or(None);
+
+    // When a quest task is marked complete, cascade through the orchestrator
+    if completed {
+        if let Some(nid) = node_id {
+            let tree_row = sqlx::query(
+                "SELECT tn.tree_id FROM tree_nodes tn WHERE tn.id = $1"
+            )
+            .bind(&nid)
+            .fetch_optional(&database.pool)
+            .await
+            .ok()
+            .flatten();
+
+            if let Some(r) = tree_row {
+                let tree_id: String = r.try_get("tree_id").unwrap_or_default();
+                if !tree_id.is_empty() {
+                    crate::orchestrator::on_checkpoint_completed(
+                        &database.pool, &app, &nid, &tree_id, &queue,
+                    ).await;
+                }
+            }
+        }
+    }
+
+    Ok(completed)
 }

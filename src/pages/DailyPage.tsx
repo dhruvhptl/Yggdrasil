@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { ChevronLeft, ChevronRight, Search, Trash2, GitBranch } from "lucide-react";
 import type { CheckpointData, DailyLog, DailyQuestLink } from "../types";
 
@@ -223,6 +224,12 @@ export default function DailyPage() {
 
   useEffect(() => { loadLog(); setTaskText(""); setShowQuestPicker(false); }, [loadLog]);
 
+  // Reload log when a checkpoint is completed from any source
+  useEffect(() => {
+    const unlisten = listen('ygg-checkpoint-completed', () => { loadLog(); });
+    return () => { unlisten.then(fn => fn()); };
+  }, [loadLog]);
+
   function showToast(msg: string) { setToast(msg); setTimeout(() => setToast(null), 3200); }
 
   function shiftDate(d: number) {
@@ -257,10 +264,9 @@ export default function DailyPage() {
           const newDone     = !link.completed && link.nodeProgress !== 100;
           const prevProg    = link.nodeProgress ?? 0;
           const newProgress = newDone ? 100 : (prevProg === 100 ? 0 : prevProg);
+          // recalculate_tree_progress, skill sync done server-side by orchestrator
           await invoke("update_tree_node", { nodeId:link.nodeId, title:null, description:null, progress:newProgress, tasks:{...cp,completed:newDone}, resources:null, position:null });
-          await invoke("recalculate_tree_progress", { treeId: nd.treeId });
-          await invoke("update_project_progress",   { projectId: nd.projectId });
-          invoke("sync_skills_from_trees").then(() => invoke("recalculate_skill_levels")).catch(console.warn);
+          await invoke("update_project_progress", { projectId: nd.projectId });
         }
       }
 

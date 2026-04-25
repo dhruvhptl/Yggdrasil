@@ -7,6 +7,7 @@ use sqlx::Row;
 use std::collections::HashMap;
 use tauri::State;
 use uuid::Uuid;
+use crate::constants::GROQ_API_URL;
 
 use crate::database::Database;
 
@@ -305,6 +306,7 @@ pub async fn toggle_resource_completed(
 #[tauri::command]
 pub async fn extract_skills(
     resource_id: String,
+    app: tauri::AppHandle,
     database: State<'_, Database>,
 ) -> Result<Vec<WorkResourceSkill>, String> {
     // Load resource
@@ -338,7 +340,7 @@ pub async fn extract_skills(
 
     let client = reqwest::Client::new();
     let response = client
-        .post("https://api.groq.com/openai/v1/chat/completions")
+        .post(GROQ_API_URL)
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
         .json(&serde_json::json!({
@@ -428,6 +430,9 @@ pub async fn extract_skills(
     }
 
     println!("🏷️  Extracted {} skills for resource {}", result.len(), resource_id);
+
+    crate::orchestrator::on_work_skills_extracted(&database.pool, &app).await;
+
     Ok(result)
 }
 

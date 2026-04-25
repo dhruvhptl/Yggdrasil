@@ -5,9 +5,12 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { MimirResource } from '../types';
 import { useMimirContext } from '../contexts/MimirContext';
+import { validateOrLog, TreeNodeSchema } from '../lib/validators';
+import { z } from 'zod';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -1441,6 +1444,7 @@ export default function YggdrasilTree({ projectId }: YggdrasilTreeProps) {
   useEffect(() => {
     setMimirContext({
       treeId: selectedNode ? treeId : null,
+      nodeId: selectedNode?.id ?? null,
       nodeTitle: selectedNode?.title ?? null,
     });
   }, [selectedNode, treeId]);
@@ -1570,15 +1574,27 @@ export default function YggdrasilTree({ projectId }: YggdrasilTreeProps) {
 
   async function loadTreeContents(id: string) {
     try {
-      const [, nodeList, edgeList] = await invoke<[any, TreeNode[], TreeEdge[]]>(
+      const [, rawNodes, edgeList] = await invoke<[any, unknown[], TreeEdge[]]>(
         'get_tree_with_contents', { treeId: id }
       );
+      const nodeList = validateOrLog(z.array(TreeNodeSchema), rawNodes, 'get_tree_with_contents') as TreeNode[];
       setNodes(nodeList);
       setEdges(edgeList);
     } catch (err) {
       console.error('Failed to load tree contents:', err);
     }
   }
+
+  // Reload tree when the orchestrator emits ygg-checkpoint-completed for our tree
+  useEffect(() => {
+    if (!treeId) return;
+    const unlisten = listen<{ treeId: string }>('ygg-checkpoint-completed', ({ payload }) => {
+      if (payload.treeId === treeId) {
+        loadTreeContents(treeId);
+      }
+    });
+    return () => { unlisten.then(fn => fn()); };
+  }, [treeId]);
 
   // ── CRUD handlers ─────────────────────────────────────────────────────────
 
@@ -1598,13 +1614,8 @@ export default function YggdrasilTree({ projectId }: YggdrasilTreeProps) {
         position: null,
       });
 
-      if (updates.progress !== undefined) {
-        await invoke('recalculate_tree_progress', { treeId });
-        await invoke('recalculate_unlocks', { treeId });
-        await invoke('update_project_progress', { projectId });
-        invoke('sync_skills_from_trees').then(() => invoke('recalculate_skill_levels')).catch(console.warn);
-      }
-
+      // recalculate_tree_progress, recalculate_unlocks, and skill sync are now
+      // handled server-side by the orchestrator. Reload to reflect server state.
       await loadTreeContents(treeId);
       setSelectedNode(prev => prev ? { ...prev, ...updates } : null);
     } catch (err) {

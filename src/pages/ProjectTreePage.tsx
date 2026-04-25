@@ -16,21 +16,33 @@ export default function ProjectTreePage() {
   const [pdfFileName, setPdfFileName] = useState<string | null>(null);
   const [isPdfExtracting, setIsPdfExtracting] = useState(false);
   const [githubUrl, setGithubUrl] = useState<string>('');
+  const [paperUrl, setPaperUrl] = useState<string>('');
+  const [paperPdfBase64, setPaperPdfBase64] = useState<string | null>(null);
+  const [paperFileName, setPaperFileName] = useState<string | null>(null);
+  const [isPaperExtracting, setIsPaperExtracting] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
   const [treeKey, setTreeKey] = useState(0);
   const [prdOpen, setPrdOpen] = useState(true);
   const [hasTree, setHasTree] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const pdfInputRef = React.useRef<HTMLInputElement>(null);
+  const paperInputRef = React.useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (projectId) {
-      invoke<any[]>('get_projects').then(projects => {
-        const project = projects.find(p => p.id === projectId);
-        if (project) setProjectName(project.name);
+      invoke<{ treeId: string; treeCount: number } | null>(
+        'get_active_tree_for_project',
+        { projectId }
+      ).then(summary => {
+        setHasTree(summary !== null);
+      }).catch(() => {
+        // fallback: just check if any tree exists
+        invoke<any[]>('get_trees', { projectId }).then(trees => setHasTree(trees.length > 0));
       });
-      invoke<any[]>('get_trees', { projectId }).then(trees => {
-        setHasTree(trees.length > 0);
+
+      invoke<any[]>('get_projects').then(projects => {
+        const project = projects.find((p: any) => p.id === projectId);
+        if (project) setProjectName(project.name);
       });
     }
   }, [projectId, treeKey]);
@@ -52,18 +64,7 @@ export default function ProjectTreePage() {
       for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
       const base64 = btoa(binary);
 
-      const response = await fetch('http://localhost:3002/fetch-pdf', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pdf_base64: base64, filename: file.name }),
-      });
-
-      if (!response.ok) {
-        const err = await response.text();
-        throw new Error(`Scraper error: ${err}`);
-      }
-
-      const data = await response.json();
+      const data = await invoke<{ text: string; pages: number; chars: number }>('extract_pdf_text', { pdfBase64: base64 });
       const text: string = data.text ?? '';
       if (!text.trim()) throw new Error('PDF extracted no text — it may be scanned/image-based.');
 
@@ -75,6 +76,30 @@ export default function ProjectTreePage() {
       setIsPdfExtracting(false);
       // Reset input so the same file can be re-selected
       if (pdfInputRef.current) pdfInputRef.current.value = '';
+    }
+  };
+
+  const handlePaperPdfUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setIsPaperExtracting(true);
+    setPaperFileName(file.name);
+    setPaperUrl('');
+
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const bytes = new Uint8Array(arrayBuffer);
+      let binary = '';
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+      setPaperPdfBase64(btoa(binary));
+    } catch (err) {
+      alert(`Paper upload failed: ${err}`);
+      setPaperFileName(null);
+      setPaperPdfBase64(null);
+    } finally {
+      setIsPaperExtracting(false);
+      if (paperInputRef.current) paperInputRef.current.value = '';
     }
   };
 
@@ -101,7 +126,12 @@ export default function ProjectTreePage() {
       if (inputMode === 'prd') {
         treeJson = await invoke<string>('generate_skill_tree', { projectId, prdText });
       } else {
-        treeJson = await invoke<string>('analyze_repo', { projectId, githubUrl });
+        treeJson = await invoke<string>('analyze_repo', {
+          projectId,
+          githubUrl,
+          paperUrl: paperUrl.trim() || null,
+          paperPdf: paperPdfBase64,
+        });
       }
 
       // Tree is saved to DB by the Rust command — remount YggdrasilTree to reload it
@@ -271,9 +301,76 @@ export default function ProjectTreePage() {
                   placeholder="https://github.com/owner/repo"
                   className="bg-slate-950 border border-slate-700 rounded-md p-3 text-sm text-slate-200 focus:outline-none focus:border-emerald-600"
                 />
+
+                <div className="flex items-center justify-between mt-4 mb-1.5">
+                  <label className="text-xs font-medium text-slate-400 uppercase tracking-wider">
+                    Paper <span className="text-slate-600 normal-case tracking-normal">(optional)</span>
+                  </label>
+                  <div>
+                    <input
+                      ref={paperInputRef}
+                      type="file"
+                      accept=".pdf"
+                      style={{ display: 'none' }}
+                      onChange={handlePaperPdfUpload}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => paperInputRef.current?.click()}
+                      disabled={isPaperExtracting}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: 4,
+                        padding: '3px 8px', borderRadius: 5, fontSize: 11,
+                        background: 'rgba(16,185,129,0.08)',
+                        border: '1px solid rgba(16,185,129,0.25)',
+                        color: isPaperExtracting ? '#475569' : '#6ee7b7',
+                        cursor: isPaperExtracting ? 'not-allowed' : 'pointer',
+                        fontFamily: 'inherit', whiteSpace: 'nowrap',
+                        transition: 'background 0.15s, border-color 0.15s',
+                      }}
+                      onMouseEnter={e => { if (!isPaperExtracting) (e.currentTarget.style.background = 'rgba(16,185,129,0.15)'); }}
+                      onMouseLeave={e => { (e.currentTarget.style.background = 'rgba(16,185,129,0.08)'); }}
+                    >
+                      <svg style={{ width: 11, height: 11 }} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                        <polyline points="14 2 14 8 20 8"/>
+                      </svg>
+                      Upload PDF
+                    </button>
+                  </div>
+                </div>
+                <input
+                  type="url"
+                  value={paperUrl}
+                  onChange={e => {
+                    setPaperUrl(e.target.value);
+                    if (paperFileName) { setPaperFileName(null); setPaperPdfBase64(null); }
+                  }}
+                  placeholder="https://arxiv.org/abs/… or paper URL"
+                  disabled={!!paperFileName}
+                  className="bg-slate-950 border border-slate-700 rounded-md p-3 text-sm text-slate-200 focus:outline-none focus:border-emerald-600 disabled:opacity-40"
+                />
+                {paperFileName && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 6 }}>
+                    <svg style={{ width: 11, height: 11, color: '#6ee7b7', flexShrink: 0 }} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                      <polyline points="20 6 9 17 4 12"/>
+                    </svg>
+                    <span style={{ fontSize: 11, color: '#94a3b8', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {paperFileName}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => { setPaperFileName(null); setPaperPdfBase64(null); }}
+                      style={{ background: 'none', border: 'none', color: '#475569', cursor: 'pointer', fontSize: 13, lineHeight: 1, padding: '0 2px', flexShrink: 0 }}
+                      title="Clear"
+                    >×</button>
+                  </div>
+                )}
+
                 <p className="text-xs text-slate-600 mt-2">
                   Fetches README + dependency files to generate a learning tree of concepts you used.
                   Add <code className="text-slate-500">GITHUB_TOKEN</code> to <code className="text-slate-500">.env</code> for private repos.
+                  Adding a paper grounds the tree in its theoretical context.
                 </p>
               </>
             )}

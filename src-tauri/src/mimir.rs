@@ -10,9 +10,9 @@ use serde_json::json;
 use sha2::{Sha256, Digest};
 use sqlx::Row;
 use tauri::{Emitter, State};
+use crate::constants::{GROQ_API_URL, SCRAPER_URL};
 use crate::database::Database;
 
-const SCRAPER_URL: &str = "http://127.0.0.1:3002";
 const EMBED_DIM: usize = 1024;
 
 // ─── Structs ────────────────────────────────────────────────────────────────
@@ -100,6 +100,16 @@ pub struct MimirChatResponse {
     pub sources: Vec<MimirChatSource>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredChatMessage {
+    pub id: String,
+    pub role: String,
+    pub content: String,
+    pub sources: Option<Vec<MimirChatSource>>,
+    pub created_at: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct RescrapeResult {
@@ -149,6 +159,100 @@ fn openrouter_api_key() -> Result<String, String> {
 fn groq_api_key() -> Result<String, String> {
     std::env::var("GROQ_API_KEY")
         .map_err(|_| "GROQ_API_KEY not configured".to_string())
+}
+
+// ─── Retrieval configuration ────────────────────────────────────────────────
+
+struct RetrievalConfig {
+    top_k: i64,
+    threshold: f64,
+    rerank_top_n: i64,
+    prematch_boost: bool,
+    lexical_top_k: i64,
+    #[allow(dead_code)] // reserved for weighted combination if RRF proves insufficient
+    hybrid_weight: f64,
+}
+
+impl RetrievalConfig {
+    fn from_env() -> Self {
+        Self {
+            top_k: std::env::var("MIMIR_TOP_K")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(10),
+            threshold: std::env::var("MIMIR_THRESHOLD")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0.85),
+            rerank_top_n: std::env::var("MIMIR_RERANK_TOP_N")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(3),
+            prematch_boost: std::env::var("MIMIR_PREMATCH_BOOST")
+                .map(|v| v != "0" && v.to_lowercase() != "false")
+                .unwrap_or(true),
+            lexical_top_k: std::env::var("MIMIR_LEXICAL_TOP_K")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(10),
+            hybrid_weight: std::env::var("MIMIR_HYBRID_WEIGHT")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0.5),
+        }
+    }
+}
+
+// ─── Hybrid retrieval helpers ───────────────────────────────────────────────
+
+/// A retrieved chunk candidate with all context needed to build sources/context.
+struct Candidate {
+    content: String,
+    title: String,
+    url: Option<String>,
+    /// cosine distance (0 = identical); None for lexical-only candidates
+    distance: Option<f64>,
+    section_title: Option<String>,
+    page_start: Option<i32>,
+    page_end: Option<i32>,
+}
+
+/// Reciprocal Rank Fusion merge.
+///
+/// Each list contributes `1 / (rank + k)` per chunk (k=60 per the RRF paper).
+/// Chunks present in both lists get their scores summed.
+/// `key_fn` extracts a dedup key (content string) from a candidate.
+/// Returns indices into `vector_list` and new-only lexical entries, ordered by combined score.
+fn rrf_merge(
+    vector_list: Vec<Candidate>,
+    lexical_list: Vec<Candidate>,
+) -> Vec<Candidate> {
+    const K: f64 = 60.0;
+    use std::collections::HashMap;
+
+    // Map content → cumulative RRF score + owning candidate
+    let mut scores: HashMap<String, (f64, usize)> = HashMap::new(); // content → (score, vec_idx or usize::MAX)
+    let mut all: Vec<Candidate> = vector_list;
+
+    for (rank, c) in all.iter().enumerate() {
+        let key = c.content.clone();
+        scores.entry(key).or_insert((0.0, rank)).0 += 1.0 / (rank as f64 + K);
+    }
+
+    // Lexical list: accumulate score; push new candidates to `all`
+    for (rank, c) in lexical_list.into_iter().enumerate() {
+        let key = c.content.clone();
+        let lex_score = 1.0 / (rank as f64 + K);
+        if let Some(entry) = scores.get_mut(&key) {
+            entry.0 += lex_score;
+        } else {
+            let idx = all.len();
+            scores.insert(key, (lex_score, idx));
+            all.push(c);
+        }
+    }
+
+    // Sort by combined RRF score descending
+    let mut scored: Vec<(f64, usize)> = scores.into_values().collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Reconstruct ordered candidate list — drain from `all` using index map
+    // We need to consume `all` in arbitrary order; use Option-wrapping.
+    let mut wrapped: Vec<Option<Candidate>> = all.into_iter().map(Some).collect();
+    scored
+        .into_iter()
+        .filter_map(|(_, idx)| wrapped.get_mut(idx).and_then(|opt| opt.take()))
+        .collect()
 }
 
 // ─── Embedding via Perplexity API ───────────────────────────────────────────
@@ -712,6 +816,7 @@ pub async fn ingest_mimir_url(
     title: Option<String>,
     force_dynamic: Option<bool>,
     parent_id: Option<String>,
+    app: tauri::AppHandle,
     database: State<'_, Database>,
 ) -> Result<IngestResult, String> {
     // Duplicate check by URL
@@ -781,6 +886,10 @@ pub async fn ingest_mimir_url(
     tx.commit().await.map_err(|e| e.to_string())?;
 
     println!("✅ Ingested URL: \"{}\" ({})", page_title, resource_id);
+
+    // Fire-and-forget: auto-tag + match to nodes
+    crate::orchestrator::on_resource_ingested(&database.pool, &app, &resource_id).await;
+
     Ok(IngestResult {
         id: resource_id,
         title: page_title,
@@ -793,6 +902,7 @@ pub async fn ingest_mimir_url(
 pub async fn ingest_mimir_text(
     text: String,
     title: Option<String>,
+    app: tauri::AppHandle,
     database: State<'_, Database>,
 ) -> Result<String, String> {
     let resource_title = title
@@ -841,6 +951,9 @@ pub async fn ingest_mimir_text(
     tx.commit().await.map_err(|e| e.to_string())?;
 
     println!("✅ Ingested text: \"{}\" ({})", resource_title, resource_id);
+
+    crate::orchestrator::on_resource_ingested(&database.pool, &app, &resource_id).await;
+
     Ok(resource_id)
 }
 
@@ -848,6 +961,7 @@ pub async fn ingest_mimir_text(
 pub async fn ingest_mimir_pdf(
     filename: String,
     pdf_base64: String,
+    app: tauri::AppHandle,
     database: State<'_, Database>,
 ) -> Result<PdfIngestResult, String> {
     let bytes = base64::Engine::decode(
@@ -939,6 +1053,9 @@ pub async fn ingest_mimir_pdf(
 
     let text_preview = text.chars().take(500).collect::<String>();
     println!("✅ Ingested PDF: \"{}\" ({})", resource_title, resource_id);
+
+    crate::orchestrator::on_resource_ingested(&database.pool, &app, &resource_id).await;
+
     Ok(PdfIngestResult {
         id: resource_id,
         title: resource_title,
@@ -1021,14 +1138,15 @@ pub async fn match_node_impl(
     let embedding = get_embedding(client, &search_text).await?;
     let vec_str = vector_str(&embedding);
 
-    // Per-resource: find the single best chunk (lowest distance) and carry its metadata
-    let similar = sqlx::query(
+    // Vector search — per-resource best chunk (lowest cosine distance), threshold 0.55
+    let vec_rows = sqlx::query(
         "SELECT DISTINCT ON (mc.resource_id) \
-                mc.resource_id, mc.id AS chunk_id, \
+                mc.resource_id, mc.id AS chunk_id, mc.content, \
                 mc.section_title, mc.page_start, mc.page_end, \
                 (me.embedding <=> $1::vector) AS distance \
          FROM mimir_embeddings me \
          JOIN mimir_chunks mc ON mc.id = me.chunk_id \
+         WHERE (me.embedding <=> $1::vector) < 0.55 \
          ORDER BY mc.resource_id, distance ASC"
     )
     .bind(&vec_str)
@@ -1036,7 +1154,6 @@ pub async fn match_node_impl(
     .await
     .map_err(|e| e.to_string())?;
 
-    // Filter by threshold — same 0.55 cutoff, take top 10
     struct ChunkMatch {
         resource_id: String,
         chunk_id: String,
@@ -1045,24 +1162,100 @@ pub async fn match_node_impl(
         page_end: Option<i32>,
         distance: f64,
     }
-    let mut matches: Vec<ChunkMatch> = similar
+
+    // Build candidates for RRF: one entry per resource (best chunk by vector distance)
+    let vector_candidates: Vec<Candidate> = vec_rows
         .iter()
-        .filter_map(|row| {
-            let rid: String = row.try_get("resource_id").ok()?;
-            let dist: f64 = row.try_get("distance").ok()?;
-            if dist >= 0.55 { return None; }
+        .map(|r| Candidate {
+            content: r.try_get("content").unwrap_or_default(),
+            title: r.try_get("resource_id").unwrap_or_default(), // placeholder — not used for node matching
+            url: None,
+            distance: Some(r.try_get("distance").unwrap_or(1.0)),
+            section_title: r.try_get("section_title").ok().flatten(),
+            page_start: r.try_get("page_start").ok().flatten(),
+            page_end: r.try_get("page_end").ok().flatten(),
+        })
+        .collect();
+
+    // Keep resource_id + chunk_id mapped by content for lookup after merge
+    let mut content_to_chunk: std::collections::HashMap<String, (String, String, f64)> = vec_rows
+        .iter()
+        .map(|r| {
+            let content: String = r.try_get("content").unwrap_or_default();
+            let rid: String = r.try_get("resource_id").unwrap_or_default();
+            let cid: String = r.try_get("chunk_id").unwrap_or_default();
+            let dist: f64 = r.try_get("distance").unwrap_or(1.0);
+            (content, (rid, cid, dist))
+        })
+        .collect();
+
+    // Lexical search — per-resource best-ranked chunk
+    let lex_rows = sqlx::query(
+        "SELECT DISTINCT ON (mc.resource_id) \
+                mc.resource_id, mc.id AS chunk_id, mc.content, \
+                mc.section_title, mc.page_start, mc.page_end, \
+                ts_rank(mc.fts_vector, plainto_tsquery('english', $1)) AS lexical_score \
+         FROM mimir_chunks mc \
+         WHERE mc.fts_vector @@ plainto_tsquery('english', $1) \
+         ORDER BY mc.resource_id, lexical_score DESC \
+         LIMIT 10"
+    )
+    .bind(&search_text)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let lexical_candidates: Vec<Candidate> = lex_rows
+        .iter()
+        .map(|r| Candidate {
+            content: r.try_get("content").unwrap_or_default(),
+            title: r.try_get("resource_id").unwrap_or_default(),
+            url: None,
+            distance: None,
+            section_title: r.try_get("section_title").ok().flatten(),
+            page_start: r.try_get("page_start").ok().flatten(),
+            page_end: r.try_get("page_end").ok().flatten(),
+        })
+        .collect();
+
+    // Extend content_to_chunk with lexical-only results (resource_id stored in title field)
+    for r in &lex_rows {
+        let content: String = r.try_get("content").unwrap_or_default();
+        if !content_to_chunk.contains_key(&content) {
+            let rid: String = r.try_get("resource_id").unwrap_or_default();
+            let cid: String = r.try_get("chunk_id").unwrap_or_default();
+            content_to_chunk.insert(content, (rid, cid, 0.55)); // treat lexical-only as boundary distance
+        }
+    }
+
+    println!("  ↳ node match: vector={} lexical={} candidates pre-merge",
+        vector_candidates.len(), lexical_candidates.len());
+
+    // RRF merge, take top 10
+    let mut merged = rrf_merge(vector_candidates, lexical_candidates);
+    merged.truncate(10);
+
+    // Reconstruct ChunkMatch list from merged content keys
+    let mut matches: Vec<ChunkMatch> = merged
+        .iter()
+        .filter_map(|c| {
+            let (rid, cid, dist) = content_to_chunk.get(&c.content)?;
             Some(ChunkMatch {
-                resource_id: rid,
-                chunk_id: row.try_get("chunk_id").unwrap_or_default(),
-                section_title: row.try_get("section_title").ok().flatten(),
-                page_start: row.try_get("page_start").ok().flatten(),
-                page_end: row.try_get("page_end").ok().flatten(),
-                distance: dist,
+                resource_id: rid.clone(),
+                chunk_id: cid.clone(),
+                section_title: c.section_title.clone(),
+                page_start: c.page_start,
+                page_end: c.page_end,
+                distance: *dist,
             })
         })
         .collect();
-    matches.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal));
-    matches.truncate(10);
+
+    // Dedup by resource_id (keep first/best per resource after RRF ordering)
+    {
+        let mut seen = std::collections::HashSet::new();
+        matches.retain(|m| seen.insert(m.resource_id.clone()));
+    }
 
     // Upsert node links with chunk metadata
     for m in &matches {
@@ -1153,12 +1346,14 @@ pub async fn mimir_chat(
     message: String,
     page: String,
     tree_id: Option<String>,
+    node_id: Option<String>,
     node_title: Option<String>,
     database: State<'_, Database>,
 ) -> Result<MimirChatResponse, String> {
     let api_key = groq_api_key()?;
     let _ = page; // available for future per-page behavior
     let client = reqwest::Client::new();
+    let cfg = RetrievalConfig::from_env();
 
     // 1. Embed the query (expand with node context)
     let query_text = match &node_title {
@@ -1178,49 +1373,151 @@ pub async fn mimir_chat(
     let mut sources: Vec<MimirChatSource> = Vec::new();
     let mut context_blocks = String::new();
 
+    let mut prematch_chunks_used: i32 = 0;
+
+    // 3a. Checkpoint pre-matched chunks — always included regardless of cosine threshold
+    if cfg.prematch_boost {
+    if let Some(ref nid) = node_id {
+        let pre_rows = sqlx::query(
+            "SELECT mc.content, mc.section_title, mc.page_start, mc.page_end, \
+                    mr.title, mr.url \
+             FROM mimir_node_links mnl \
+             JOIN mimir_chunks mc ON mc.id = mnl.matched_chunk_id \
+             JOIN mimir_resources mr ON mr.id = mnl.resource_id \
+             WHERE mnl.node_id = $1 \
+             ORDER BY mnl.relevance_score DESC \
+             LIMIT 3"
+        )
+        .bind(nid)
+        .fetch_all(&database.pool)
+        .await
+        .unwrap_or_default();
+
+        for row in &pre_rows {
+            let content: String = row.try_get("content").unwrap_or_default();
+            let section_title: Option<String> = row.try_get("section_title").ok().flatten();
+            let page_start: Option<i32> = row.try_get("page_start").ok().flatten();
+            let page_end: Option<i32> = row.try_get("page_end").ok().flatten();
+            let res_title: String = row.try_get("title").unwrap_or_default();
+            let res_url: Option<String> = row.try_get("url").ok();
+
+            let loc_label = match (section_title.as_deref(), page_start, page_end) {
+                (Some(sec), Some(ps), Some(pe)) if pe != ps => format!("{} (pp. {}–{})", sec, ps, pe),
+                (Some(sec), Some(ps), _) => format!("{} (p. {})", sec, ps),
+                (Some(sec), None, _) => sec.to_string(),
+                (None, Some(ps), Some(pe)) if pe != ps => format!("pp. {}–{}", ps, pe),
+                (None, Some(ps), _) => format!("p. {}", ps),
+                _ => String::new(),
+            };
+            let source_label = if loc_label.is_empty() {
+                res_title.clone()
+            } else {
+                format!("{} — {}", res_title, loc_label)
+            };
+
+            sources.push(MimirChatSource {
+                title: res_title,
+                url: res_url,
+                chunk: content.chars().take(300).collect(),
+                score: 1.0,
+                section_title,
+                page_start,
+                page_end,
+            });
+            context_blocks.push_str(&format!(
+                "[Pre-matched for this checkpoint] {}\n— Source: {}\n\n",
+                content, source_label
+            ));
+        }
+        if !pre_rows.is_empty() {
+            prematch_chunks_used = pre_rows.len() as i32;
+            println!("  ↳ injected {} pre-matched checkpoint chunks", pre_rows.len());
+        }
+    }
+    } // end prematch_boost
+
+    let mut candidates_before_rerank: i32 = 0;
+    let mut candidates_after_rerank: i32 = 0;
+    let mut rerank_fallback_used = false;
+    let mut lexical_candidates_count: i32 = 0;
+    let mut hybrid_merged_count: i32 = 0;
+
     if emb_count > 0 {
-        // 3. pgvector cosine search — top 10, threshold < 0.85
-        let rows = sqlx::query(
+        // 3a. pgvector cosine search
+        let vec_rows = sqlx::query(
             "SELECT mc.content, mc.resource_id, mr.title, mr.url, \
                     mc.section_title, mc.page_start, mc.page_end, \
                     (me.embedding <=> $1::vector) AS distance \
              FROM mimir_embeddings me \
              JOIN mimir_chunks mc ON mc.id = me.chunk_id \
              JOIN mimir_resources mr ON mr.id = mc.resource_id \
-             WHERE (me.embedding <=> $1::vector) < 0.85 \
+             WHERE (me.embedding <=> $1::vector) < $2 \
              ORDER BY distance ASC \
-             LIMIT 10"
+             LIMIT $3"
         )
         .bind(&vec_str)
+        .bind(cfg.threshold)
+        .bind(cfg.top_k)
         .fetch_all(&database.pool)
         .await
         .map_err(|e| e.to_string())?;
 
-        // Build candidate list
-        struct Candidate {
-            content: String,
-            title: String,
-            url: Option<String>,
-            distance: f64,
-            section_title: Option<String>,
-            page_start: Option<i32>,
-            page_end: Option<i32>,
-        }
-        let candidates: Vec<Candidate> = rows
+        let vector_candidates: Vec<Candidate> = vec_rows
             .iter()
             .map(|r| Candidate {
                 content: r.try_get("content").unwrap_or_default(),
                 title: r.try_get("title").unwrap_or_default(),
                 url: r.try_get("url").ok(),
-                distance: r.try_get("distance").unwrap_or(1.0),
+                distance: Some(r.try_get("distance").unwrap_or(1.0)),
                 section_title: r.try_get("section_title").ok().flatten(),
                 page_start: r.try_get("page_start").ok().flatten(),
                 page_end: r.try_get("page_end").ok().flatten(),
             })
             .collect();
 
-        // 4. LLM rerank to top 3
-        let ranked = if candidates.len() > 3 {
+        // 3b. Lexical full-text search (BM25-ranked via ts_rank)
+        let lex_rows = sqlx::query(
+            "SELECT mc.content, mr.title, mr.url, mc.section_title, mc.page_start, mc.page_end, \
+                    ts_rank(mc.fts_vector, plainto_tsquery('english', $1)) AS lexical_score \
+             FROM mimir_chunks mc \
+             JOIN mimir_resources mr ON mr.id = mc.resource_id \
+             WHERE mc.fts_vector @@ plainto_tsquery('english', $1) \
+             ORDER BY lexical_score DESC \
+             LIMIT $2"
+        )
+        .bind(&message)
+        .bind(cfg.lexical_top_k)
+        .fetch_all(&database.pool)
+        .await
+        .unwrap_or_default(); // lexical failure is non-fatal
+
+        let lexical_candidates: Vec<Candidate> = lex_rows
+            .iter()
+            .map(|r| Candidate {
+                content: r.try_get("content").unwrap_or_default(),
+                title: r.try_get("title").unwrap_or_default(),
+                url: r.try_get("url").ok(),
+                distance: None,
+                section_title: r.try_get("section_title").ok().flatten(),
+                page_start: r.try_get("page_start").ok().flatten(),
+                page_end: r.try_get("page_end").ok().flatten(),
+            })
+            .collect();
+
+        lexical_candidates_count = lexical_candidates.len() as i32;
+        println!("  ↳ vector={} lexical={} candidates pre-merge",
+            vector_candidates.len(), lexical_candidates.len());
+
+        // 3c. RRF merge + take top_k
+        let mut candidates = rrf_merge(vector_candidates, lexical_candidates);
+        candidates.truncate(cfg.top_k as usize);
+        hybrid_merged_count = candidates.len() as i32;
+
+        candidates_before_rerank = candidates.len() as i32;
+        let rerank_n = cfg.rerank_top_n as usize;
+
+        // 4. LLM rerank to top N
+        let ranked = if candidates.len() > rerank_n {
             let rerank_chunks: String = candidates
                 .iter()
                 .enumerate()
@@ -1228,8 +1525,9 @@ pub async fn mimir_chat(
                 .collect::<Vec<_>>()
                 .join("\n");
 
+            let rerank_t0 = std::time::Instant::now();
             let rerank_resp = client
-                .post("https://api.groq.com/openai/v1/chat/completions")
+                .post(GROQ_API_URL)
                 .header("Authorization", format!("Bearer {}", api_key))
                 .header("Content-Type", "application/json")
                 .json(&json!({
@@ -1237,7 +1535,7 @@ pub async fn mimir_chat(
                     "messages": [
                         {
                             "role": "system",
-                            "content": "You are a relevance filter. Given a question and a list of numbered text chunks, respond with ONLY a JSON array of the indices (0-based) of the 3 most relevant chunks. Example: [0, 3, 7]"
+                            "content": format!("You are a relevance filter. Given a question and a list of numbered text chunks, respond with ONLY a JSON array of the indices (0-based) of the {} most relevant chunks. Example: [0, 3, 7]", rerank_n)
                         },
                         {
                             "role": "user",
@@ -1251,7 +1549,8 @@ pub async fn mimir_chat(
                 .send()
                 .await;
 
-            match rerank_resp {
+            let fallback: Vec<usize> = (0..rerank_n.min(candidates.len())).collect();
+            let ranked_inner = match rerank_resp {
                 Ok(resp) if resp.status().is_success() => {
                     let body: serde_json::Value = resp.json().await.unwrap_or_default();
                     let raw = body["choices"][0]["message"]["content"].as_str().unwrap_or("");
@@ -1268,45 +1567,75 @@ pub async fn mimir_chat(
                                     println!("  ↳ reranker selected indices: {:?}", picked);
                                     picked
                                 } else {
-                                    vec![0, 1, 2]
+                                    rerank_fallback_used = true;
+                                    fallback
                                 }
                             } else {
-                                vec![0, 1, 2]
+                                rerank_fallback_used = true;
+                                fallback
                             }
                         } else {
-                            vec![0, 1, 2]
+                            rerank_fallback_used = true;
+                            fallback
                         }
                     } else {
-                        vec![0, 1, 2]
+                        rerank_fallback_used = true;
+                        fallback
                     }
                 }
                 _ => {
-                    println!("  ⚠️  Reranking failed, using top 3 by distance");
-                    vec![0, 1, 2]
+                    println!("  ⚠️  Reranking failed, using top {} by distance", rerank_n);
+                    rerank_fallback_used = true;
+                    fallback
                 }
-            }
+            };
+            crate::brain::log_prompt_call(
+                database.pool.clone(), "mimir_rerank", "llama-3.1-8b-instant", "mimir_rerank_v1",
+                rerank_t0.elapsed().as_millis() as i64, !rerank_fallback_used, None, None,
+            );
+            ranked_inner
         } else {
             (0..candidates.len()).collect()
         };
+
+        candidates_after_rerank = ranked.len() as i32;
 
         // Build sources and context
         for (rank, &idx) in ranked.iter().enumerate() {
             if idx >= candidates.len() { continue; }
             let c = &candidates[idx];
+            // Score: convert cosine distance to similarity when available, else use rank-based
+            let score = match c.distance {
+                Some(d) => ((1.0 - d) * 1000.0).round() as f32 / 1000.0,
+                None => (1.0 / (rank as f32 + 1.0) * 1000.0).round() / 1000.0,
+            };
             sources.push(MimirChatSource {
                 title: c.title.clone(),
                 url: c.url.clone(),
                 chunk: c.content.chars().take(300).collect(),
-                score: ((1.0 - c.distance) * 1000.0).round() as f32 / 1000.0,
+                score,
                 section_title: c.section_title.clone(),
                 page_start: c.page_start,
                 page_end: c.page_end,
             });
+            let loc_label = match (c.section_title.as_deref(), c.page_start, c.page_end) {
+                (Some(sec), Some(ps), Some(pe)) if pe != ps => format!("{} (pp. {}–{})", sec, ps, pe),
+                (Some(sec), Some(ps), _) => format!("{} (p. {})", sec, ps),
+                (Some(sec), None, _) => sec.to_string(),
+                (None, Some(ps), Some(pe)) if pe != ps => format!("pp. {}–{}", ps, pe),
+                (None, Some(ps), _) => format!("p. {}", ps),
+                _ => String::new(),
+            };
+            let source_label = if loc_label.is_empty() {
+                c.title.clone()
+            } else {
+                format!("{} — {}", c.title, loc_label)
+            };
             context_blocks.push_str(&format!(
                 "[{}] {}\n— Source: {}\n\n",
                 rank + 1,
                 c.content,
-                c.title
+                source_label
             ));
         }
     }
@@ -1329,10 +1658,11 @@ pub async fn mimir_chat(
         .unwrap_or_default();
 
         if !tree_rows.is_empty() {
-            let mut node_map: std::collections::BTreeMap<
-                String,
-                (String, Option<String>, Vec<String>),
-            > = std::collections::BTreeMap::new();
+            // Preserve SQL order_index ordering — BTreeMap would re-sort by UUID string.
+            // Use a HashMap for O(1) resource append + a Vec to track insertion order.
+            use std::collections::HashMap;
+            let mut node_order: Vec<String> = Vec::new();
+            let mut node_data: HashMap<String, (String, Option<String>, Vec<String>)> = HashMap::new();
 
             for row in &tree_rows {
                 let id: String = row.try_get("id").unwrap_or_default();
@@ -1342,33 +1672,34 @@ pub async fn mimir_chat(
                 let res_url: Option<String> = row.try_get("url").ok();
                 let res_type: Option<String> = row.try_get("type").ok();
 
-                let entry = node_map
-                    .entry(id.clone())
-                    .or_insert_with(|| (title, parent_id, Vec::new()));
+                if !node_data.contains_key(&id) {
+                    node_order.push(id.clone());
+                    node_data.insert(id.clone(), (title, parent_id, Vec::new()));
+                }
 
                 if let Some(rt) = res_title {
                     let mut label = rt;
-                    if let Some(t) = res_type {
-                        label = format!("{} ({})", label, t);
+                    if let Some(t) = res_type { label = format!("{} ({})", label, t); }
+                    if let Some(u) = res_url { label = format!("{} — {}", label, u); }
+                    if let Some(entry) = node_data.get_mut(&id) {
+                        entry.2.push(label);
                     }
-                    if let Some(u) = res_url {
-                        label = format!("{} — {}", label, u);
-                    }
-                    entry.2.push(label);
                 }
             }
 
             let mut lines: Vec<String> = Vec::new();
-            for (id, (title, parent_id, resources)) in &node_map {
-                let indent = if parent_id.is_some() { "  " } else { "" };
-                lines.push(format!("{}- {} [id={}]", indent, title, id));
-                for r in resources {
-                    lines.push(format!("{}    ↳ {}", indent, r));
+            for id in &node_order {
+                if let Some((title, parent_id, resources)) = node_data.get(id) {
+                    let indent = if parent_id.is_some() { "  " } else { "" };
+                    lines.push(format!("{}- {} [id={}]", indent, title, id));
+                    for r in resources {
+                        lines.push(format!("{}    ↳ {}", indent, r));
+                    }
                 }
             }
 
             tree_block = format!("\n\nLearning Tree Structure:\n{}", lines.join("\n"));
-            println!("  ↳ injected tree structure: {} nodes", node_map.len());
+            println!("  ↳ injected tree structure: {} nodes", node_order.len());
         }
     }
 
@@ -1406,27 +1737,88 @@ pub async fn mimir_chat(
         system_prompt.push_str(&context_blocks);
     }
 
-    // 7. Call Groq for synthesis
+    // 7. Load session history (if tree_id + node_id both present)
+    let session_id_opt: Option<String> = match (&tree_id, &node_id) {
+        (Some(tid), Some(nid)) => {
+            let new_session_id = uuid::Uuid::new_v4().to_string();
+            let row = sqlx::query(
+                "INSERT INTO mimir_chat_sessions (id, tree_id, node_id) \
+                 VALUES ($1, $2, $3) \
+                 ON CONFLICT (tree_id, node_id) DO UPDATE SET updated_at = NOW() \
+                 RETURNING id"
+            )
+            .bind(&new_session_id)
+            .bind(tid)
+            .bind(nid)
+            .fetch_one(&database.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            Some(row.try_get("id").map_err(|e| e.to_string())?)
+        }
+        _ => None,
+    };
+
+    let mut history_messages: Vec<serde_json::Value> = Vec::new();
+    if let Some(ref sid) = session_id_opt {
+        let hist_rows = sqlx::query(
+            "SELECT role, content FROM mimir_chat_messages \
+             WHERE session_id = $1 \
+             ORDER BY created_at ASC \
+             LIMIT 20"
+        )
+        .bind(sid)
+        .fetch_all(&database.pool)
+        .await
+        .unwrap_or_default();
+
+        for row in &hist_rows {
+            let role: String = row.try_get("role").unwrap_or_default();
+            let content: String = row.try_get("content").unwrap_or_default();
+            history_messages.push(json!({ "role": role, "content": content }));
+        }
+        if !hist_rows.is_empty() {
+            println!("  ↳ loaded {} prior messages for session {}", hist_rows.len(), sid);
+        }
+    }
+
+    // Build full messages array: system + history (last 20) + current user turn
+    let mut groq_messages = vec![json!({ "role": "system", "content": system_prompt })];
+    // Take last 20 history messages to stay within token budget
+    let history_start = history_messages.len().saturating_sub(20);
+    groq_messages.extend_from_slice(&history_messages[history_start..]);
+    groq_messages.push(json!({ "role": "user", "content": message }));
+
+    // 8. Call Groq for synthesis
+    let chat_t0 = std::time::Instant::now();
     let groq_resp = client
-        .post("https://api.groq.com/openai/v1/chat/completions")
+        .post(GROQ_API_URL)
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
         .json(&json!({
             "model": "llama-3.3-70b-versatile",
-            "messages": [
-                { "role": "system", "content": system_prompt },
-                { "role": "user", "content": message }
-            ],
+            "messages": groq_messages,
             "temperature": 0.4,
             "max_tokens": 2048
         }))
         .timeout(std::time::Duration::from_secs(60))
         .send()
         .await
-        .map_err(|e| format!("Groq API error: {}", e))?;
+        .map_err(|e| {
+            crate::brain::log_prompt_call(
+                database.pool.clone(), "mimir_chat", "llama-3.3-70b-versatile", "mimir_chat_v1",
+                0, false, Some(e.to_string()),
+                Some(json!({ "node_id": node_id, "tree_id": tree_id })),
+            );
+            format!("Groq API error: {}", e)
+        })?;
 
     if !groq_resp.status().is_success() {
         let err_text = groq_resp.text().await.unwrap_or_default();
+        crate::brain::log_prompt_call(
+            database.pool.clone(), "mimir_chat", "llama-3.3-70b-versatile", "mimir_chat_v1",
+            chat_t0.elapsed().as_millis() as i64, false, Some(err_text.clone()),
+            Some(json!({ "node_id": node_id, "tree_id": tree_id })),
+        );
         return Err(format!("Groq API error: {}", err_text));
     }
 
@@ -1435,14 +1827,187 @@ pub async fn mimir_chat(
         .as_str()
         .unwrap_or("No response from AI.")
         .to_string();
+    let chat_latency_ms = chat_t0.elapsed().as_millis() as i64;
+    crate::brain::log_prompt_call(
+        database.pool.clone(), "mimir_chat", "llama-3.3-70b-versatile", "mimir_chat_v1",
+        chat_latency_ms, true, None,
+        Some(json!({
+            "node_id": node_id,
+            "tree_id": tree_id,
+            "candidates_used": candidates_after_rerank,
+        })),
+    );
+
+    // 9. Persist user + assistant messages
+    if let Some(ref sid) = session_id_opt {
+        let sources_json = serde_json::to_value(
+            sources.iter().map(|s| json!({
+                "title": s.title,
+                "url": s.url,
+                "sectionTitle": s.section_title,
+                "pageStart": s.page_start,
+                "pageEnd": s.page_end,
+                "score": s.score,
+            })).collect::<Vec<_>>()
+        ).unwrap_or(serde_json::Value::Null);
+
+        let user_msg_id = uuid::Uuid::new_v4().to_string();
+        let _ = sqlx::query(
+            "INSERT INTO mimir_chat_messages (id, session_id, role, content) \
+             VALUES ($1, $2, 'user', $3)"
+        )
+        .bind(&user_msg_id)
+        .bind(sid)
+        .bind(&message)
+        .execute(&database.pool)
+        .await;
+
+        let asst_msg_id = uuid::Uuid::new_v4().to_string();
+        let _ = sqlx::query(
+            "INSERT INTO mimir_chat_messages (id, session_id, role, content, sources) \
+             VALUES ($1, $2, 'assistant', $3, $4)"
+        )
+        .bind(&asst_msg_id)
+        .bind(sid)
+        .bind(&answer)
+        .bind(&sources_json)
+        .execute(&database.pool)
+        .await;
+    }
 
     println!("✅ Chat response: {} chars, {} sources", answer.len(), sources.len());
+
+    // Best-effort retrieval log — never blocks the response
+    {
+        let pool = database.pool.clone();
+        let log_id = uuid::Uuid::new_v4().to_string();
+        let log_query = message.clone();
+        let log_node_id = node_id.clone();
+        let log_tree_id = tree_id.clone();
+        let log_top_k = cfg.top_k as i32;
+        let log_threshold = cfg.threshold;
+        let log_prematch = prematch_chunks_used;
+        let log_before = candidates_before_rerank;
+        let log_after = candidates_after_rerank;
+        let log_fallback = rerank_fallback_used;
+        let log_lexical = lexical_candidates_count;
+        let log_hybrid = hybrid_merged_count;
+        let log_sources = serde_json::to_value(
+            sources.iter().map(|s| json!({
+                "title": s.title,
+                "distance": 1.0 - s.score as f64,
+                "sectionTitle": s.section_title,
+            })).collect::<Vec<_>>()
+        ).unwrap_or(serde_json::Value::Array(vec![]));
+        tokio::spawn(async move {
+            let _ = sqlx::query(
+                "INSERT INTO mimir_retrieval_logs \
+                   (id, query, node_id, tree_id, top_k, threshold, \
+                    candidates_before_rerank, candidates_after_rerank, \
+                    prematch_chunks_used, rerank_fallback_used, sources, \
+                    lexical_candidates, hybrid_candidates_merged) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)"
+            )
+            .bind(&log_id)
+            .bind(&log_query)
+            .bind(&log_node_id)
+            .bind(&log_tree_id)
+            .bind(log_top_k)
+            .bind(log_threshold)
+            .bind(log_before)
+            .bind(log_after)
+            .bind(log_prematch)
+            .bind(log_fallback)
+            .bind(&log_sources)
+            .bind(log_lexical)
+            .bind(log_hybrid)
+            .execute(&pool)
+            .await;
+        });
+    }
+
     Ok(MimirChatResponse { answer, sources })
+}
+
+// ─── Chat session commands ───────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn get_chat_session(
+    tree_id: String,
+    node_id: String,
+    database: State<'_, Database>,
+) -> Result<Vec<StoredChatMessage>, String> {
+    // Upsert session
+    let new_sid = uuid::Uuid::new_v4().to_string();
+    let session_row = sqlx::query(
+        "INSERT INTO mimir_chat_sessions (id, tree_id, node_id) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (tree_id, node_id) DO UPDATE SET updated_at = NOW() \
+         RETURNING id"
+    )
+    .bind(&new_sid)
+    .bind(&tree_id)
+    .bind(&node_id)
+    .fetch_one(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let session_id: String = session_row.try_get("id").map_err(|e| e.to_string())?;
+
+    let rows = sqlx::query(
+        "SELECT id, role, content, sources, \
+                created_at::TEXT AS created_at \
+         FROM mimir_chat_messages \
+         WHERE session_id = $1 \
+         ORDER BY created_at ASC \
+         LIMIT 20"
+    )
+    .bind(&session_id)
+    .fetch_all(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let messages = rows.iter().map(|row| {
+        let sources_val: Option<serde_json::Value> = row.try_get("sources").ok();
+        let sources: Option<Vec<MimirChatSource>> = sources_val.and_then(|v| {
+            serde_json::from_value(v).ok()
+        });
+        StoredChatMessage {
+            id: row.try_get("id").unwrap_or_default(),
+            role: row.try_get("role").unwrap_or_default(),
+            content: row.try_get("content").unwrap_or_default(),
+            sources,
+            created_at: row.try_get("created_at").unwrap_or_default(),
+        }
+    }).collect();
+
+    Ok(messages)
+}
+
+#[tauri::command]
+pub async fn clear_chat_session(
+    tree_id: String,
+    node_id: String,
+    database: State<'_, Database>,
+) -> Result<(), String> {
+    sqlx::query(
+        "DELETE FROM mimir_chat_messages \
+         WHERE session_id = ( \
+           SELECT id FROM mimir_chat_sessions \
+           WHERE tree_id = $1 AND node_id = $2 \
+         )"
+    )
+    .bind(&tree_id)
+    .bind(&node_id)
+    .execute(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 // ─── Rescrape ───────────────────────────────────────────────────────────────
 
-async fn rescrape_one(pool: &sqlx::PgPool, resource_id: &str) -> RescrapeResult {
+pub(crate) async fn rescrape_one(pool: &sqlx::PgPool, resource_id: &str) -> RescrapeResult {
     // Load resource
     let resource_row = match sqlx::query(
         "SELECT id, title, url, type FROM mimir_resources WHERE id = $1"
@@ -1832,7 +2397,7 @@ pub async fn auto_tag_existing_resources(
     database: State<'_, Database>,
 ) -> Result<String, String> {
     let model = "llama-3.3-70b-versatile";
-    let base_url = "https://api.groq.com/openai/v1/chat/completions";
+    let base_url = GROQ_API_URL;
     let api_key = groq_api_key()?;
 
     let rows = sqlx::query(
@@ -1861,6 +2426,7 @@ pub async fn auto_tag_existing_resources(
             title
         );
 
+        let autotag_t0 = std::time::Instant::now();
         let response = client
             .post(base_url)
             .header("Authorization", format!("Bearer {}", api_key))
@@ -1881,6 +2447,10 @@ pub async fn auto_tag_existing_resources(
         let resp = match response {
             Ok(r) => r,
             Err(e) => {
+                crate::brain::log_prompt_call(
+                    database.pool.clone(), "auto_tag", model, "auto_tag_v1",
+                    autotag_t0.elapsed().as_millis() as i64, false, Some(e.to_string()), None,
+                );
                 println!("  ⚠️  Failed to tag '{}': {}", title, e);
                 continue;
             }
@@ -1923,6 +2493,10 @@ pub async fn auto_tag_existing_resources(
             continue;
         }
 
+        crate::brain::log_prompt_call(
+            database.pool.clone(), "auto_tag", model, "auto_tag_v1",
+            autotag_t0.elapsed().as_millis() as i64, true, None, None,
+        );
         tagged += 1;
         println!("  ✅ [{}] {} → {:?}", tagged, title, tags);
     }
@@ -1975,6 +2549,7 @@ pub async fn rematch_all_nodes(
 #[tauri::command]
 pub async fn toggle_resource_completion(
     resource_id: String,
+    app: tauri::AppHandle,
     database: State<'_, Database>,
 ) -> Result<bool, String> {
     let row = sqlx::query(
@@ -1986,6 +2561,12 @@ pub async fn toggle_resource_completion(
     .map_err(|e| e.to_string())?;
 
     let new_val: bool = row.try_get("is_completed").map_err(|e| e.to_string())?;
+
+    // Only cascade on mark-complete, not on un-complete
+    if new_val {
+        crate::orchestrator::on_resource_completed(&database.pool, &app, &resource_id).await;
+    }
+
     Ok(new_val)
 }
 
@@ -2106,6 +2687,77 @@ pub async fn get_linked_node_titles(
 }
 
 // ─── Re-embed PDFs from stored chunk text ────────────────────────────────────
+
+/// Re-embed a single resource by ID. Returns Ok(true) if succeeded, Ok(false) if skipped/failed.
+pub(crate) async fn reembed_resource_inner(pool: &sqlx::PgPool, client: &reqwest::Client, resource_id: &str) -> Result<bool, String> {
+    let row = sqlx::query(
+        "SELECT id, title, raw_text, sections_json FROM mimir_resources WHERE id = $1 AND type = 'pdf'"
+    )
+    .bind(resource_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let row = match row {
+        Some(r) => r,
+        None => return Ok(false), // not a PDF or not found
+    };
+
+    let title: String = row.try_get("title").unwrap_or_default();
+    let raw_text: Option<String> = row.try_get("raw_text").ok().flatten();
+    let sections_json: Option<serde_json::Value> = row.try_get("sections_json").ok().flatten();
+
+    let chunks = sqlx::query(
+        "SELECT id, content FROM mimir_chunks WHERE resource_id = $1 ORDER BY chunk_index ASC"
+    )
+    .bind(resource_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if chunks.is_empty() {
+        let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+        let result = if let Some(ref secs) = sections_json {
+            let count = secs.as_array().map(|a| a.len()).unwrap_or(0);
+            if count > 1 {
+                store_sections_and_embeddings(&mut tx, client, resource_id, secs).await
+            } else if let Some(ref text) = raw_text {
+                store_chunks_and_embeddings(&mut tx, client, resource_id, text).await
+            } else {
+                Err("no text available".to_string())
+            }
+        } else if let Some(ref text) = raw_text {
+            store_chunks_and_embeddings(&mut tx, client, resource_id, text).await
+        } else {
+            return Ok(false);
+        };
+        match result {
+            Ok(_) => { tx.commit().await.map_err(|e| e.to_string())?; Ok(true) }
+            Err(e) => Err(format!("re-chunk '{}' failed: {}", title, e)),
+        }
+    } else {
+        let mut chunk_errors = 0u32;
+        for chunk_row in &chunks {
+            let chunk_id: String = chunk_row.try_get("id").unwrap_or_default();
+            let content: String = chunk_row.try_get("content").unwrap_or_default();
+            let _ = sqlx::query("DELETE FROM mimir_embeddings WHERE chunk_id = $1")
+                .bind(&chunk_id).execute(pool).await;
+            let embedding = match get_embedding(client, &content).await {
+                Ok(e) => e,
+                Err(e) => { println!("    ⚠️  Embedding chunk {} failed: {}", chunk_id, e); chunk_errors += 1; continue; }
+            };
+            let emb_id = uuid::Uuid::new_v4().to_string();
+            let vec_str = vector_str(&embedding);
+            if let Err(e) = sqlx::query(
+                "INSERT INTO mimir_embeddings (id, chunk_id, embedding) VALUES ($1, $2, $3::vector)"
+            ).bind(&emb_id).bind(&chunk_id).bind(&vec_str).execute(pool).await {
+                println!("    ⚠️  Insert embedding chunk {} failed: {}", chunk_id, e);
+                chunk_errors += 1;
+            }
+        }
+        Ok(chunk_errors == 0)
+    }
+}
 
 #[tauri::command]
 pub async fn reembed_pdfs(
@@ -2241,4 +2893,77 @@ pub async fn reembed_pdfs(
     let summary = format!("Re-embedded {}/{} PDFs ({} failed)", succeeded, total, failed);
     println!("📄 {}", summary);
     Ok(summary)
+}
+
+// ─── Retrieval stats ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetrievalStats {
+    pub total_queries: i64,
+    pub avg_candidates_before_rerank: f64,
+    pub avg_candidates_after_rerank: f64,
+    pub rerank_fallback_rate: f64,
+    pub avg_prematch_chunks_used: f64,
+    pub top_queried_nodes: Vec<TopQueriedNode>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TopQueriedNode {
+    pub node_id: String,
+    pub query_count: i64,
+}
+
+#[tauri::command]
+pub async fn get_retrieval_stats(
+    database: State<'_, Database>,
+) -> Result<RetrievalStats, String> {
+    let agg_row = sqlx::query(
+        "SELECT \
+           COUNT(*) AS total_queries, \
+           COALESCE(AVG(candidates_before_rerank), 0) AS avg_before, \
+           COALESCE(AVG(candidates_after_rerank), 0) AS avg_after, \
+           COALESCE(AVG(CASE WHEN rerank_fallback_used THEN 1.0 ELSE 0.0 END), 0) AS fallback_rate, \
+           COALESCE(AVG(prematch_chunks_used), 0) AS avg_prematch \
+         FROM mimir_retrieval_logs"
+    )
+    .fetch_one(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let total_queries: i64 = agg_row.try_get("total_queries").unwrap_or(0);
+    let avg_before: f64 = agg_row.try_get("avg_before").unwrap_or(0.0);
+    let avg_after: f64 = agg_row.try_get("avg_after").unwrap_or(0.0);
+    let fallback_rate: f64 = agg_row.try_get("fallback_rate").unwrap_or(0.0);
+    let avg_prematch: f64 = agg_row.try_get("avg_prematch").unwrap_or(0.0);
+
+    let node_rows = sqlx::query(
+        "SELECT node_id, COUNT(*) AS query_count \
+         FROM mimir_retrieval_logs \
+         WHERE node_id IS NOT NULL \
+         GROUP BY node_id \
+         ORDER BY query_count DESC \
+         LIMIT 5"
+    )
+    .fetch_all(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let top_queried_nodes: Vec<TopQueriedNode> = node_rows
+        .iter()
+        .map(|r| TopQueriedNode {
+            node_id: r.try_get("node_id").unwrap_or_default(),
+            query_count: r.try_get("query_count").unwrap_or(0),
+        })
+        .collect();
+
+    Ok(RetrievalStats {
+        total_queries,
+        avg_candidates_before_rerank: (avg_before * 100.0).round() / 100.0,
+        avg_candidates_after_rerank: (avg_after * 100.0).round() / 100.0,
+        rerank_fallback_rate: (fallback_rate * 1000.0).round() / 10.0,
+        avg_prematch_chunks_used: (avg_prematch * 100.0).round() / 100.0,
+        top_queried_nodes,
+    })
 }

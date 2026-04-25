@@ -5,6 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use tauri::State;
 use uuid::Uuid;
+use crate::constants::SCRAPER_URL;
 use crate::database::Database;
 
 /// Token budget for each per-skill checkpoint expansion call (Stage 2).
@@ -249,15 +250,29 @@ Output ONLY valid JSON:
 - relevant_files: up to 10 paths from the FILE PATHS list that contain the most core logic
 - REJECT generic concepts like "Software Architecture", "Error Handling", "Testing", "Async Programming" unless they are the primary technical subject of a specific file
 - concept_type must be one of the 8 values listed above
+- If a PAPER / THEORY CONTEXT section is provided, prioritize concepts that appear in both the paper and the codebase. Concepts that are only in the paper (theory with no implementation) should still be included if they are prerequisites for understanding the implementation.
 
 Respond with ONLY the JSON. No markdown, no preamble."#
 }
 
-async fn extract_concept_graph(client: &reqwest::Client, context: &str) -> Result<ConceptGraph, String> {
-    let user_prompt = format!(
-        "Extract the concept dependency graph from this project:\n\n{}\n\nGenerate the concept graph JSON:",
-        context
-    );
+async fn extract_concept_graph(
+    client: &reqwest::Client,
+    context: &str,
+    paper_context: Option<&str>,
+    pool: Option<&sqlx::PgPool>,
+) -> Result<ConceptGraph, String> {
+    let user_prompt = if let Some(paper) = paper_context {
+        let truncated = if paper.len() > 20_000 { &paper[..20_000] } else { paper };
+        format!(
+            "## PAPER / THEORY CONTEXT\n\nThe following reference paper describes the theoretical background this project implements. Use it to decide which concepts matter and which files contain the core logic.\n\n{}\n\n---\n\nExtract the concept dependency graph from this project:\n\n{}\n\nGenerate the concept graph JSON:",
+            truncated, context
+        )
+    } else {
+        format!(
+            "Extract the concept dependency graph from this project:\n\n{}\n\nGenerate the concept graph JSON:",
+            context
+        )
+    };
 
     let concept_model = std::env::var("CONCEPT_GRAPH_MODEL")
         .unwrap_or_else(|_| "google/gemini-2.5-flash".to_string());
@@ -268,7 +283,7 @@ async fn extract_concept_graph(client: &reqwest::Client, context: &str) -> Resul
         .unwrap_or_default();
     println!("🧠 Concept graph model: {} via {}", concept_model, concept_base_url);
 
-    let raw_graph_json = call_llm(
+    let (raw_graph_json, cg_latency) = call_llm(
         client,
         &concept_base_url,
         &concept_api_key,
@@ -278,7 +293,16 @@ async fn extract_concept_graph(client: &reqwest::Client, context: &str) -> Resul
         4096,
         true,
     )
-    .await?;
+    .await
+    .map_err(|e| {
+        if let Some(p) = pool {
+            log_prompt_call(p.clone(), "concept_graph", &concept_model, "concept_graph_v1", 0, false, Some(e.clone()), None);
+        }
+        e
+    })?;
+    if let Some(p) = pool {
+        log_prompt_call(p.clone(), "concept_graph", &concept_model, "concept_graph_v1", cg_latency, true, None, None);
+    }
 
     // Log a preview before attempting to parse
     let preview_len = raw_graph_json.len().min(600);
@@ -438,6 +462,7 @@ async fn build_repo_profile(
     repo_context: &str,
     concept_graph: &ConceptGraph,
     sorted_concepts: &[Concept],
+    pool: Option<&sqlx::PgPool>,
 ) -> Result<RepoProfile, String> {
     // Build a compact concept list for the prompt
     let concept_summary: String = sorted_concepts
@@ -462,7 +487,7 @@ async fn build_repo_profile(
         .unwrap_or_default();
 
     println!("🔍 Building repo profile…");
-    let profile_json = call_llm(
+    let (profile_json, rp_latency) = call_llm(
         client,
         &concept_base_url,
         &concept_api_key,
@@ -472,7 +497,16 @@ async fn build_repo_profile(
         2048,
         true,
     )
-    .await?;
+    .await
+    .map_err(|e| {
+        if let Some(p) = pool {
+            log_prompt_call(p.clone(), "repo_profile", &concept_model, "repo_profile_v1", 0, false, Some(e.clone()), None);
+        }
+        e
+    })?;
+    if let Some(p) = pool {
+        log_prompt_call(p.clone(), "repo_profile", &concept_model, "repo_profile_v1", rp_latency, true, None, None);
+    }
 
     let profile_json_clean = clean_llm_json(&profile_json);
     let value: serde_json::Value = serde_json::from_str(&profile_json_clean)
@@ -522,6 +556,7 @@ async fn build_prd_profile(
     client: &reqwest::Client,
     prd_text: &str,
     sorted_concepts: &[Concept],
+    pool: Option<&sqlx::PgPool>,
 ) -> Result<String, String> {
     let concept_summary: String = sorted_concepts
         .iter()
@@ -553,7 +588,7 @@ async fn build_prd_profile(
         .unwrap_or_default();
 
     println!("🔍 Building PRD profile…");
-    let raw = call_llm(
+    let (raw, pp_latency) = call_llm(
         client,
         &concept_base_url,
         &concept_api_key,
@@ -563,7 +598,16 @@ async fn build_prd_profile(
         1024,
         true,
     )
-    .await?;
+    .await
+    .map_err(|e| {
+        if let Some(p) = pool {
+            log_prompt_call(p.clone(), "prd_profile", &concept_model, "prd_profile_v1", 0, false, Some(e.clone()), None);
+        }
+        e
+    })?;
+    if let Some(p) = pool {
+        log_prompt_call(p.clone(), "prd_profile", &concept_model, "prd_profile_v1", pp_latency, true, None, None);
+    }
 
     let clean = clean_llm_json(&raw);
     // Validate it's parseable JSON — if not, return error so caller can fall back
@@ -1515,6 +1559,8 @@ async fn expand_skill_checkpoints(
     skill_index: usize,
     total_skills: usize,
     json_mode: bool,
+    pool: Option<&sqlx::PgPool>,
+    log_metadata: Option<serde_json::Value>,
 ) -> Result<Vec<Checkpoint>, String> {
     let expansion_tokens = CHECKPOINT_EXPANSION_MAX_TOKENS;
 
@@ -1537,7 +1583,7 @@ async fn expand_skill_checkpoints(
         project_context, phase_name, skill.name, skill.description
     );
 
-    let raw = call_llm(
+    let (raw, exp_latency) = call_llm(
         client,
         tree_base_url,
         tree_api_key,
@@ -1547,7 +1593,16 @@ async fn expand_skill_checkpoints(
         expansion_tokens,
         json_mode,
     )
-    .await?;
+    .await
+    .map_err(|e| {
+        if let Some(p) = pool {
+            log_prompt_call(p.clone(), "skill_expansion", tree_model, "skill_expansion_v1", 0, false, Some(e.clone()), log_metadata.clone());
+        }
+        e
+    })?;
+    if let Some(p) = pool {
+        log_prompt_call(p.clone(), "skill_expansion", tree_model, "skill_expansion_v1", exp_latency, true, None, log_metadata.clone());
+    }
 
     let cleaned = clean_llm_json(&raw);
     let (repaired, was_repaired) = repair_truncated_tree_json(&cleaned);
@@ -1580,10 +1635,11 @@ async fn generate_tree_two_stage(
     project_context: &str, // compact summary passed to each expansion call
     project_id: &str,
     json_mode: bool,
+    pool: Option<&sqlx::PgPool>,
 ) -> Result<SkillTree, String> {
     // ── Stage 1: Outline ──────────────────────────────────────────────────────
     println!("🌿 Stage 1: generating outline (3×3 skeleton)…");
-    let raw_outline = call_llm(
+    let (raw_outline, outline_latency) = call_llm(
         client,
         tree_base_url,
         tree_api_key,
@@ -1593,7 +1649,16 @@ async fn generate_tree_two_stage(
         3000,
         json_mode,
     )
-    .await?;
+    .await
+    .map_err(|e| {
+        if let Some(p) = pool {
+            log_prompt_call(p.clone(), "tree_outline", tree_model, "tree_outline_v1", 0, false, Some(e.clone()), Some(serde_json::json!({ "project_id": project_id })));
+        }
+        e
+    })?;
+    if let Some(p) = pool {
+        log_prompt_call(p.clone(), "tree_outline", tree_model, "tree_outline_v1", outline_latency, true, None, Some(serde_json::json!({ "project_id": project_id })));
+    }
 
     // Log raw preview before any cleanup
     let raw_preview_len = raw_outline.len().min(600);
@@ -1665,6 +1730,7 @@ async fn generate_tree_two_stage(
 
         for outline_skill in &outline_phase.skills {
             skill_index += 1;
+            let skill_meta = Some(serde_json::json!({ "project_id": project_id, "skill_name": outline_skill.name }));
             // Fix 5: single retry with 5s delay before aborting the whole tree
             let checkpoints = match expand_skill_checkpoints(
                 client,
@@ -1677,6 +1743,8 @@ async fn generate_tree_two_stage(
                 skill_index,
                 total_skills,
                 json_mode,
+                pool,
+                skill_meta.clone(),
             )
             .await
             {
@@ -1698,6 +1766,8 @@ async fn generate_tree_two_stage(
                         skill_index,
                         total_skills,
                         json_mode,
+                        pool,
+                        skill_meta,
                     )
                     .await
                     .map_err(|e| format!("Stage 2 failed at skill '{}' after 2 attempts: {}", outline_skill.name, e))?
@@ -1909,8 +1979,46 @@ fn repair_truncated_tree_json(s: &str) -> (String, bool) {
     (repaired, true)
 }
 
+// ─── Prompt logging ──────────────────────────────────────────────────────────
+
+/// Fire-and-forget insert into prompt_logs. Spawns its own task so it never
+/// blocks the caller. All errors are silently swallowed (debug tool only).
+pub(crate) fn log_prompt_call(
+    pool: sqlx::PgPool,
+    command: &str,
+    model: &str,
+    prompt_version: &str,
+    latency_ms: i64,
+    success: bool,
+    error: Option<String>,
+    metadata: Option<serde_json::Value>,
+) {
+    let command = command.to_string();
+    let model = model.to_string();
+    let prompt_version = prompt_version.to_string();
+    tokio::spawn(async move {
+        let id = uuid::Uuid::new_v4().to_string();
+        let _ = sqlx::query(
+            "INSERT INTO prompt_logs \
+               (id, command, model, prompt_version, latency_ms, success, error, metadata) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+        )
+        .bind(&id)
+        .bind(&command)
+        .bind(&model)
+        .bind(&prompt_version)
+        .bind(latency_ms as i32)
+        .bind(success)
+        .bind(error.as_deref())
+        .bind(&metadata)
+        .execute(&pool)
+        .await;
+    });
+}
+
 // ─── LLM call helper (OpenAI-compatible API) ────────────────────────────────
 
+/// Returns (content, latency_ms).
 async fn call_llm(
     client: &reqwest::Client,
     base_url: &str,
@@ -1920,7 +2028,7 @@ async fn call_llm(
     user_prompt: &str,
     max_tokens: u32,
     json_mode: bool,
-) -> Result<String, String> {
+) -> Result<(String, i64), String> {
     println!("📡 call_llm: model={} max_tokens={} json_mode={} url={}", model, max_tokens, json_mode, base_url);
     let mut request_body = json!({
         "model": model,
@@ -1935,6 +2043,7 @@ async fn call_llm(
         request_body["response_format"] = json!({ "type": "json_object" });
     }
 
+    let t0 = std::time::Instant::now();
     let mut attempts = 0u32;
     let max_retries = 3u32;
     let (status, response_text) = loop {
@@ -1966,6 +2075,7 @@ async fn call_llm(
         }
         break (st, text);
     };
+    let latency_ms = t0.elapsed().as_millis() as i64;
 
     if !status.is_success() {
         return Err(format!("LLM API returned {}: {}", status, response_text));
@@ -1974,7 +2084,7 @@ async fn call_llm(
     let parsed: GroqResponse = serde_json::from_str(&response_text)
         .map_err(|e| format!("Failed to parse LLM response: {}\nRaw: {}", e, &response_text[..response_text.len().min(500)]))?;
 
-    Ok(parsed.choices[0].message.content.clone())
+    Ok((parsed.choices[0].message.content.clone(), latency_ms))
 }
 
 // ─── Commands ────────────────────────────────────────────────────────────────
@@ -1983,6 +2093,7 @@ async fn call_llm(
 pub async fn generate_skill_tree(
     project_id: String,
     prd_text: String,
+    app: tauri::AppHandle,
     database: State<'_, Database>,
 ) -> Result<String, String> {
     println!("\n=== Generate Skill Tree (PRD) ===");
@@ -1993,7 +2104,7 @@ pub async fn generate_skill_tree(
 
     // Phase 1: Extract concept dependency graph
     // Keep sorted concepts alive so we can build a PRD profile in phase 1b.
-    let (graph_context, prd_profile_section) = match extract_concept_graph(&client, &prd_text).await {
+    let (graph_context, prd_profile_section) = match extract_concept_graph(&client, &prd_text, None, Some(&database.pool)).await {
         Ok(graph) => {
             println!(
                 "🧠 Concept graph extracted: {} concepts",
@@ -2006,7 +2117,7 @@ pub async fn generate_skill_tree(
             let gc = build_graph_context(&sorted);
 
             // Fix 2: PRD profile — grounding step identical to repo path's build_repo_profile
-            let profile = match build_prd_profile(&client, &prd_text, &sorted).await {
+            let profile = match build_prd_profile(&client, &prd_text, &sorted, Some(&database.pool)).await {
                 Ok(p) => {
                     let section = format!(
                         "## PROJECT PROFILE (authoritative — use this to anchor checkpoints)\n\n{}\n",
@@ -2102,6 +2213,7 @@ pub async fn generate_skill_tree(
         &expansion_context,
         &project_id,
         json_mode,
+        Some(&database.pool),
     ).await?;
     skill_tree.project_id = project_id;
 
@@ -2115,6 +2227,7 @@ pub async fn generate_skill_tree(
     println!("💾 Saved to database with tree_id: {}", tree_id);
 
     auto_match_tree_nodes(&database.pool, &leaf_node_ids).await;
+    crate::orchestrator::on_tree_generated(&database.pool, &app, &tree_id, &skill_tree.project_id).await;
 
     let mut response_json = serde_json::json!(skill_tree);
     response_json["tree_id"] = serde_json::json!(tree_id);
@@ -2122,10 +2235,119 @@ pub async fn generate_skill_tree(
     Ok(serde_json::to_string_pretty(&response_json).unwrap())
 }
 
+async fn fetch_paper_text(
+    paper_url: Option<&str>,
+    paper_pdf_base64: Option<&str>,
+) -> Result<Option<String>, String> {
+    let client = reqwest::Client::new();
+
+    if let Some(base64_data) = paper_pdf_base64 {
+        println!("📄 Paper PDF upload: {} base64 chars", base64_data.len());
+        let resp = client
+            .post(format!("{}/fetch-pdf", SCRAPER_URL))
+            .json(&json!({ "pdf_base64": base64_data, "filename": "paper.pdf" }))
+            .timeout(std::time::Duration::from_secs(120))
+            .send()
+            .await
+            .map_err(|e| format!("Paper PDF scraper request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Paper PDF scraper returned error: {}", body));
+        }
+        let result: serde_json::Value = resp.json().await
+            .map_err(|e| format!("Paper PDF scraper response parse failed: {}", e))?;
+        let text = result["text"].as_str().unwrap_or("").to_string();
+        if text.trim().is_empty() {
+            return Err("Paper PDF produced no text (scanned/image-based?)".to_string());
+        }
+        println!("  ✅ Paper PDF extracted: {} chars", text.len());
+        return Ok(Some(text));
+    }
+
+    if let Some(url) = paper_url {
+        let url = url.trim();
+        if url.is_empty() {
+            return Ok(None);
+        }
+
+        if url.contains("arxiv.org/abs/") {
+            let pdf_url = url.replace("/abs/", "/pdf/");
+            println!("📄 arXiv paper: {} → {}", url, pdf_url);
+
+            let pdf_bytes = client
+                .get(&pdf_url)
+                .header(reqwest::header::USER_AGENT, "Yggdrasil")
+                .timeout(std::time::Duration::from_secs(60))
+                .send()
+                .await
+                .map_err(|e| format!("arXiv PDF fetch failed: {}", e))?
+                .error_for_status()
+                .map_err(|e| format!("arXiv PDF returned error status: {}", e))?
+                .bytes()
+                .await
+                .map_err(|e| format!("arXiv PDF body read failed: {}", e))?;
+
+            let encoded = general_purpose::STANDARD.encode(&pdf_bytes);
+            println!("  Downloaded {} bytes, forwarding to scraper", pdf_bytes.len());
+
+            let resp = client
+                .post(format!("{}/fetch-pdf", SCRAPER_URL))
+                .json(&json!({ "pdf_base64": encoded, "filename": "arxiv.pdf" }))
+                .timeout(std::time::Duration::from_secs(120))
+                .send()
+                .await
+                .map_err(|e| format!("arXiv scraper request failed: {}", e))?;
+            if !resp.status().is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(format!("arXiv scraper returned error: {}", body));
+            }
+            let result: serde_json::Value = resp.json().await
+                .map_err(|e| format!("arXiv scraper response parse failed: {}", e))?;
+            let text = result["text"].as_str().unwrap_or("").to_string();
+            if text.trim().is_empty() {
+                return Err("arXiv PDF produced no text".to_string());
+            }
+            println!("  ✅ arXiv paper extracted: {} chars", text.len());
+            return Ok(Some(text));
+        }
+
+        println!("📄 Paper URL (webpage): {}", url);
+        let resp = client
+            .post(format!("{}/fetch", SCRAPER_URL))
+            .json(&json!({ "url": url }))
+            .timeout(std::time::Duration::from_secs(60))
+            .send()
+            .await
+            .map_err(|e| format!("Paper web scraper request failed: {}", e))?;
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Paper web scraper returned error: {}", body));
+        }
+        let result: serde_json::Value = resp.json().await
+            .map_err(|e| format!("Paper web scraper response parse failed: {}", e))?;
+        let text = result["text"]
+            .as_str()
+            .or_else(|| result["content"].as_str())
+            .unwrap_or("")
+            .to_string();
+        if text.trim().is_empty() {
+            return Err("Paper webpage produced no text".to_string());
+        }
+        println!("  ✅ Paper webpage extracted: {} chars", text.len());
+        return Ok(Some(text));
+    }
+
+    Ok(None)
+}
+
 #[tauri::command]
 pub async fn analyze_repo(
     project_id: String,
     github_url: String,
+    paper_url: Option<String>,
+    paper_pdf: Option<String>,
+    app: tauri::AppHandle,
     database: State<'_, Database>,
 ) -> Result<String, String> {
     let (owner, repo) = parse_github_url(&github_url).ok_or_else(|| {
@@ -2133,6 +2355,18 @@ pub async fn analyze_repo(
     })?;
 
     println!("\n=== Analyze Repo: {}/{} ===", owner, repo);
+
+    // Optional reference paper — non-fatal if it fails
+    let paper_text: Option<String> = match fetch_paper_text(
+        paper_url.as_deref(),
+        paper_pdf.as_deref(),
+    ).await {
+        Ok(t) => t,
+        Err(e) => {
+            println!("⚠️  Paper fetch failed (non-fatal): {}", e);
+            None
+        }
+    };
 
     // Shared LLM client (reused for concept graph + tree gen)
     let llm_client = reqwest::Client::new();
@@ -2372,7 +2606,7 @@ pub async fn analyze_repo(
 
     // 9. Phase 1: Extract concept graph + relevant files (lightweight context)
     // Keep graph + sorted alive so the repo profile stage can reference them.
-    let (raw_graph, graph_context, relevant_file_paths) = match extract_concept_graph(&llm_client, &phase1_context).await {
+    let (raw_graph, graph_context, relevant_file_paths) = match extract_concept_graph(&llm_client, &phase1_context, paper_text.as_deref(), Some(&database.pool)).await {
         Ok(graph) => {
             println!(
                 "🧠 Concept graph extracted: {} concepts, {} relevant files",
@@ -2469,11 +2703,20 @@ pub async fn analyze_repo(
         context.push('\n');
     }
 
+    if let Some(ref paper) = paper_text {
+        // Cap at 20k chars so a long paper doesn't blow the tree-gen context budget
+        let truncated = if paper.len() > 20_000 { &paper[..20_000] } else { paper.as_str() };
+        context.push_str("## PAPER CONTEXT\n\n");
+        context.push_str("The following reference paper describes the theoretical background this repository implements. Use it to anchor concepts, terminology, and learning progression.\n\n");
+        context.push_str(truncated);
+        context.push_str("\n\n");
+    }
+
     println!("📦 Phase 2 context: {} chars", context.len());
 
     // 11b. Build repo profile (grounding stage) — best-effort, non-fatal
     let profile_section = if let Some((ref graph, ref sorted)) = raw_graph {
-        match build_repo_profile(&llm_client, &context, graph, sorted).await {
+        match build_repo_profile(&llm_client, &context, graph, sorted, Some(&database.pool)).await {
             Ok(profile) => {
                 let mut s = String::from("## REPO PROFILE (authoritative — use this to anchor the tree)\n\n");
                 s.push_str(&format!("**Summary:** {}\n\n", profile.summary));
@@ -2507,7 +2750,7 @@ pub async fn analyze_repo(
     };
 
     // Compact context for skill expansion — repo profile + short context summary
-    let expansion_context = if !profile_section.is_empty() {
+    let mut expansion_context = if !profile_section.is_empty() {
         format!("{}\n\nRepository: {}/{}", profile_section, owner, repo)
     } else {
         format!(
@@ -2516,6 +2759,14 @@ pub async fn analyze_repo(
             if context.len() > 3000 { &context[..3000] } else { &context }
         )
     };
+
+    if let Some(ref paper) = paper_text {
+        // Per-skill expansion happens once per skill (often 9+ calls) — keep the
+        // paper slice small so we don't multiply token cost by the fanout.
+        let snippet = if paper.len() > 4_000 { &paper[..4_000] } else { paper.as_str() };
+        expansion_context.push_str("\n\n## PAPER CONTEXT (reference material)\n\n");
+        expansion_context.push_str(snippet);
+    }
 
     let tree_model = std::env::var("TREE_GEN_MODEL")
         .unwrap_or_else(|_| "google/gemini-2.5-flash".to_string());
@@ -2538,6 +2789,7 @@ pub async fn analyze_repo(
         &expansion_context,
         &project_id,
         json_mode,
+        Some(&database.pool),
     ).await?;
     skill_tree.project_id = project_id;
 
@@ -2547,9 +2799,129 @@ pub async fn analyze_repo(
     println!("💾 Saved repo tree with tree_id: {}", tree_id);
 
     auto_match_tree_nodes(&database.pool, &leaf_node_ids).await;
+    crate::orchestrator::on_tree_generated(&database.pool, &app, &tree_id, &skill_tree.project_id).await;
 
     let mut response_json = serde_json::json!(skill_tree);
     response_json["tree_id"] = serde_json::json!(tree_id);
 
     Ok(serde_json::to_string_pretty(&response_json).unwrap())
+}
+
+// ─── Prompt stats ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandStats {
+    pub command: String,
+    pub total_calls: i64,
+    pub success_rate: f64,
+    pub avg_latency_ms: f64,
+    pub latest_prompt_version: String,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelStats {
+    pub model: String,
+    pub total_calls: i64,
+    pub avg_latency_ms: f64,
+    pub error_rate: f64,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentError {
+    pub command: String,
+    pub error: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptStats {
+    pub by_command: Vec<CommandStats>,
+    pub by_model: Vec<ModelStats>,
+    pub recent_errors: Vec<RecentError>,
+}
+
+#[tauri::command]
+pub async fn get_prompt_stats(
+    database: tauri::State<'_, Database>,
+) -> Result<PromptStats, String> {
+    use sqlx::Row;
+
+    let cmd_rows = sqlx::query(
+        "SELECT command,
+                COUNT(*) AS total_calls,
+                COALESCE(AVG(CASE WHEN success THEN 1.0 ELSE 0.0 END), 0) AS success_rate,
+                COALESCE(AVG(latency_ms), 0) AS avg_latency_ms,
+                (SELECT prompt_version FROM prompt_logs pl2
+                 WHERE pl2.command = pl.command
+                 ORDER BY created_at DESC LIMIT 1) AS latest_version
+         FROM prompt_logs pl
+         GROUP BY command
+         ORDER BY total_calls DESC"
+    )
+    .fetch_all(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let by_command = cmd_rows.iter().map(|r| CommandStats {
+        command: r.try_get("command").unwrap_or_default(),
+        total_calls: r.try_get("total_calls").unwrap_or(0),
+        success_rate: {
+            let v: f64 = r.try_get("success_rate").unwrap_or(0.0);
+            (v * 1000.0).round() / 10.0
+        },
+        avg_latency_ms: {
+            let v: f64 = r.try_get("avg_latency_ms").unwrap_or(0.0);
+            v.round()
+        },
+        latest_prompt_version: r.try_get("latest_version").unwrap_or_default(),
+    }).collect();
+
+    let model_rows = sqlx::query(
+        "SELECT model,
+                COUNT(*) AS total_calls,
+                COALESCE(AVG(latency_ms), 0) AS avg_latency_ms,
+                COALESCE(AVG(CASE WHEN NOT success THEN 1.0 ELSE 0.0 END), 0) AS error_rate
+         FROM prompt_logs
+         GROUP BY model
+         ORDER BY total_calls DESC"
+    )
+    .fetch_all(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let by_model = model_rows.iter().map(|r| ModelStats {
+        model: r.try_get("model").unwrap_or_default(),
+        total_calls: r.try_get("total_calls").unwrap_or(0),
+        avg_latency_ms: {
+            let v: f64 = r.try_get("avg_latency_ms").unwrap_or(0.0);
+            v.round()
+        },
+        error_rate: {
+            let v: f64 = r.try_get("error_rate").unwrap_or(0.0);
+            (v * 1000.0).round() / 10.0
+        },
+    }).collect();
+
+    let err_rows = sqlx::query(
+        "SELECT command, error, created_at::TEXT AS created_at
+         FROM prompt_logs
+         WHERE success = false AND error IS NOT NULL
+         ORDER BY created_at DESC
+         LIMIT 5"
+    )
+    .fetch_all(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let recent_errors = err_rows.iter().map(|r| RecentError {
+        command: r.try_get("command").unwrap_or_default(),
+        error: r.try_get("error").unwrap_or_default(),
+        created_at: r.try_get("created_at").unwrap_or_default(),
+    }).collect();
+
+    Ok(PromptStats { by_command, by_model, recent_errors })
 }

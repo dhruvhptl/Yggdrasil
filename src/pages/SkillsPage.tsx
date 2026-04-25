@@ -2,14 +2,17 @@
 // Universal Skill Tree: D3 force-directed galaxy visualization.
 // Left panel: skill list, sync controls, gap analysis. Right panel: D3 galaxy.
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import * as d3 from 'd3';
 import {
   RefreshCw, Loader2, Download, AlertTriangle, ChevronDown, ChevronRight,
-  Sparkles, FileText, TreePine, Briefcase, X, Wand2,
+  Sparkles, FileText, TreePine, Briefcase, X, Wand2, GitMerge, Check, Search, Eye,
 } from 'lucide-react';
-import type { UniversalSkill, SkillGap, SkillDependency, SkillEvidence } from '../types';
+import type { UniversalSkill, SkillGap, SkillDependency, SkillEvidence, SkillAlias, SkillGraphSnapshot } from '../types';
+import { validateOrLog, SkillSchema } from '../lib/validators';
+import { z } from 'zod';
 
 // ─── D3 types ────────────────────────────────────────────────────────────────
 
@@ -513,31 +516,221 @@ function SkillPopover({
   );
 }
 
+// ─── Merge Modal ─────────────────────────────────────────────────────────────
+
+function MergeModal({
+  skills,
+  onClose,
+  onMerged,
+}: {
+  skills: UniversalSkill[];
+  onClose: () => void;
+  onMerged: () => void;
+}) {
+  const [query, setQuery] = useState('');
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [canonicalId, setCanonicalId] = useState<string | null>(null);
+  const [merging, setMerging] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const filtered = useMemo(() => {
+    if (!query.trim()) return skills;
+    const q = query.toLowerCase();
+    return skills.filter(s => s.name.toLowerCase().includes(q));
+  }, [skills, query]);
+
+  function toggleSkill(id: string) {
+    setSelected(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+        if (canonicalId === id) setCanonicalId(null);
+      } else {
+        next.add(id);
+        if (!canonicalId) setCanonicalId(id);
+      }
+      return next;
+    });
+  }
+
+  function setAsCanonical(id: string) {
+    setSelected(prev => new Set([...prev, id]));
+    setCanonicalId(id);
+  }
+
+  async function handleMerge() {
+    if (!canonicalId || selected.size < 2) return;
+    const aliasIds = [...selected].filter(id => id !== canonicalId);
+    setMerging(true);
+    setError(null);
+    try {
+      await invoke('merge_skills', { canonicalId, aliasIds });
+      onMerged();
+      onClose();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setMerging(false);
+    }
+  }
+
+  const selectedSkills = skills.filter(s => selected.has(s.id));
+  const canonical = skills.find(s => s.id === canonicalId);
+
+  return (
+    <div
+      style={{
+        position: 'fixed', inset: 0, zIndex: 100,
+        background: 'rgba(0,0,0,0.7)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+      }}
+      onClick={onClose}
+    >
+      <div
+        style={{
+          width: 520, maxHeight: '80vh', background: '#0f172a',
+          border: '1px solid #1e293b', borderRadius: 16, display: 'flex',
+          flexDirection: 'column', overflow: 'hidden',
+        }}
+        onClick={e => e.stopPropagation()}
+      >
+        {/* Header */}
+        <div style={{ padding: '16px 20px', borderBottom: '1px solid #1e293b', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <GitMerge size={16} style={{ color: '#10b981' }} />
+            <span style={{ fontWeight: 600, fontSize: 14, color: '#f1f5f9' }}>Merge Skills</span>
+          </div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: '#64748b', cursor: 'pointer' }}>
+            <X size={16} />
+          </button>
+        </div>
+
+        {/* Search */}
+        <div style={{ padding: '10px 20px', borderBottom: '1px solid #1e293b' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: '#1e293b', borderRadius: 8, padding: '6px 10px' }}>
+            <Search size={13} style={{ color: '#475569', flexShrink: 0 }} />
+            <input
+              autoFocus
+              value={query}
+              onChange={e => setQuery(e.target.value)}
+              placeholder="Filter skills…"
+              style={{ flex: 1, background: 'none', border: 'none', outline: 'none', color: '#f1f5f9', fontSize: 13 }}
+            />
+          </div>
+        </div>
+
+        {/* Skill list */}
+        <div style={{ flex: 1, overflowY: 'auto', padding: '8px 20px' }}>
+          {filtered.map(skill => {
+            const isSelected = selected.has(skill.id);
+            const isCanonical = skill.id === canonicalId;
+            return (
+              <div
+                key={skill.id}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 10,
+                  padding: '6px 8px', borderRadius: 8, marginBottom: 2,
+                  background: isSelected ? 'rgba(16,185,129,0.08)' : 'transparent',
+                  border: isCanonical ? '1px solid rgba(16,185,129,0.4)' : '1px solid transparent',
+                  cursor: 'pointer',
+                }}
+                onClick={() => toggleSkill(skill.id)}
+              >
+                <div style={{
+                  width: 16, height: 16, borderRadius: 4, flexShrink: 0,
+                  background: isSelected ? '#10b981' : '#1e293b',
+                  border: '1px solid ' + (isSelected ? '#10b981' : '#334155'),
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                }}>
+                  {isSelected && <Check size={10} color="#fff" />}
+                </div>
+                <span style={{ flex: 1, fontSize: 13, color: isSelected ? '#d1fae5' : '#94a3b8' }}>{skill.name}</span>
+                {isSelected && !isCanonical && (
+                  <button
+                    onClick={e => { e.stopPropagation(); setAsCanonical(skill.id); }}
+                    style={{
+                      fontSize: 10, padding: '2px 6px', borderRadius: 4,
+                      background: 'rgba(99,102,241,0.15)', border: '1px solid rgba(99,102,241,0.3)',
+                      color: '#818cf8', cursor: 'pointer',
+                    }}
+                  >
+                    Set canonical
+                  </button>
+                )}
+                {isCanonical && (
+                  <span style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, background: 'rgba(16,185,129,0.15)', color: '#34d399' }}>
+                    canonical
+                  </span>
+                )}
+                <span style={{ fontSize: 10, color: '#475569' }}>L{skill.level}</span>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Summary + action */}
+        <div style={{ padding: '12px 20px', borderTop: '1px solid #1e293b' }}>
+          {selected.size >= 2 && canonical && (
+            <div style={{ fontSize: 12, color: '#64748b', marginBottom: 10 }}>
+              Merge {selectedSkills.filter(s => s.id !== canonicalId).map(s => `"${s.name}"`).join(', ')} →{' '}
+              <span style={{ color: '#10b981' }}>"{canonical.name}"</span>
+            </div>
+          )}
+          {error && <div style={{ fontSize: 11, color: '#f87171', marginBottom: 8 }}>{error}</div>}
+          <button
+            onClick={handleMerge}
+            disabled={selected.size < 2 || !canonicalId || merging}
+            style={{
+              width: '100%', padding: '8px', borderRadius: 8, border: 'none',
+              background: (selected.size >= 2 && canonicalId && !merging) ? '#059669' : '#1e293b',
+              color: (selected.size >= 2 && canonicalId && !merging) ? '#fff' : '#475569',
+              fontSize: 13, fontWeight: 500, cursor: (selected.size >= 2 && canonicalId && !merging) ? 'pointer' : 'default',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+            }}
+          >
+            {merging ? <><Loader2 size={13} style={{ animation: 'spin 1s linear infinite' }} /> Merging…</> : <><GitMerge size={13} /> Merge {selected.size >= 2 ? `${selected.size} skills` : 'skills'}</>}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Main Page ───────────────────────────────────────────────────────────────
 
 export default function SkillsPage() {
   const [skills, setSkills] = useState<UniversalSkill[]>([]);
   const [gaps, setGaps] = useState<SkillGap[]>([]);
   const [deps, setDeps] = useState<SkillDependency[]>([]);
+  const [aliases, setAliases] = useState<SkillAlias[]>([]);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
   const [inferring, setInferring] = useState(false);
   const [showGaps, setShowGaps] = useState(true);
+  const [showReviewOnly, setShowReviewOnly] = useState(false);
+  const [showMerge, setShowMerge] = useState(false);
   const [expandedDomains, setExpandedDomains] = useState<Set<string>>(new Set());
   const [selectedSkill, setSelectedSkill] = useState<UniversalSkill | null>(null);
   const [selectedGap, setSelectedGap] = useState<SkillGap | null>(null);
   const svgContainerRef = useRef<HTMLDivElement>(null);
 
+  // Map from canonical skill ID → alias count, for indicators in the list
+  const aliasCountMap = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const a of aliases) {
+      m.set(a.canonicalSkillId, (m.get(a.canonicalSkillId) ?? 0) + 1);
+    }
+    return m;
+  }, [aliases]);
+
   async function loadAll() {
     try {
-      const [s, g, d] = await Promise.all([
-        invoke<UniversalSkill[]>('get_universal_skills'),
-        invoke<SkillGap[]>('get_skill_gaps', { season: null }),
-        invoke<SkillDependency[]>('get_skill_dependencies'),
-      ]);
+      const snapshot = await invoke<SkillGraphSnapshot>('get_skill_graph_snapshot');
+      const s = validateOrLog(z.array(SkillSchema), snapshot.skills, 'get_skill_graph_snapshot') as UniversalSkill[];
       setSkills(s);
-      setGaps(g);
-      setDeps(d);
+      setGaps(snapshot.gaps);
+      setDeps(snapshot.dependencies);
+      setAliases(snapshot.aliases);
 
       // Auto-expand all domains
       const domains = new Set(s.map(sk => sk.domain || 'General'));
@@ -550,6 +743,12 @@ export default function SkillsPage() {
   }
 
   useEffect(() => { loadAll(); }, []);
+
+  // Reload skill graph whenever the orchestrator finishes a cascade
+  useEffect(() => {
+    const unlisten = listen('ygg-skills-updated', () => { loadAll(); });
+    return () => { unlisten.then(fn => fn()); };
+  }, []);
 
   async function handleSync() {
     setSyncing(true);
@@ -575,6 +774,16 @@ export default function SkillsPage() {
     }
   }
 
+  async function handleMarkReviewed(skillId: string, e: React.MouseEvent) {
+    e.stopPropagation();
+    try {
+      await invoke('mark_skill_reviewed', { skillId });
+      setSkills(prev => prev.map(s => s.id === skillId ? { ...s, reviewNeeded: false, status: 'active' } : s));
+    } catch (err) {
+      console.error('mark_skill_reviewed failed:', err);
+    }
+  }
+
   function handleExport() {
     const svgEl = svgContainerRef.current?.querySelector('svg');
     if (!svgEl) return;
@@ -594,21 +803,24 @@ export default function SkillsPage() {
     setSelectedGap(gap);
   }
 
-  // Group skills by domain for the left panel
-  const domainGroups = new Map<string, UniversalSkill[]>();
-  for (const skill of skills) {
-    const domain = skill.domain || 'General';
-    const arr = domainGroups.get(domain) || [];
-    arr.push(skill);
-    domainGroups.set(domain, arr);
-  }
-
   const avgLevel = skills.length > 0
     ? (skills.reduce((sum, s) => sum + s.level, 0) / skills.length).toFixed(1)
     : '0';
 
   const levelCounts = [0, 0, 0, 0, 0, 0]; // index 0 unused
   for (const s of skills) levelCounts[s.level]++;
+
+  const reviewCount = skills.filter(s => s.reviewNeeded).length;
+
+  // Apply review filter to domain groups
+  const filteredSkills = showReviewOnly ? skills.filter(s => s.reviewNeeded) : skills;
+  const filteredDomainGroups = new Map<string, UniversalSkill[]>();
+  for (const skill of filteredSkills) {
+    const domain = skill.domain || 'General';
+    const arr = filteredDomainGroups.get(domain) || [];
+    arr.push(skill);
+    filteredDomainGroups.set(domain, arr);
+  }
 
   if (loading) {
     return (
@@ -668,6 +880,16 @@ export default function SkillsPage() {
               )}
             </button>
           )}
+
+          {/* Merge skills button */}
+          {skills.length >= 2 && (
+            <button
+              onClick={() => setShowMerge(true)}
+              className="w-full mt-2 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium rounded-lg transition-colors flex items-center justify-center gap-2"
+            >
+              <GitMerge className="w-3 h-3" /> Merge Skills
+            </button>
+          )}
         </div>
 
         {/* Stats */}
@@ -706,6 +928,22 @@ export default function SkillsPage() {
           </div>
         )}
 
+        {/* Review filter */}
+        {reviewCount > 0 && (
+          <div className="px-4 py-2 border-b border-slate-800 flex items-center justify-between">
+            <span className="text-xs text-orange-400 flex items-center gap-1.5">
+              <span className="w-2 h-2 rounded-full bg-orange-400 flex-shrink-0" />
+              {reviewCount} need{reviewCount === 1 ? 's' : ''} review
+            </span>
+            <button
+              onClick={() => setShowReviewOnly(!showReviewOnly)}
+              className={`text-[10px] px-2 py-0.5 rounded ${showReviewOnly ? 'bg-orange-600/20 text-orange-300' : 'bg-slate-800 text-slate-500'}`}
+            >
+              {showReviewOnly ? 'Filtering' : 'Show'}
+            </button>
+          </div>
+        )}
+
         {/* Skill list */}
         <div className="flex-1 overflow-auto px-4 py-3">
           {skills.length === 0 ? (
@@ -716,7 +954,7 @@ export default function SkillsPage() {
             </div>
           ) : (
             <div className="space-y-1">
-              {Array.from(domainGroups.entries()).map(([domain, domainSkills]) => {
+              {Array.from(filteredDomainGroups.entries()).map(([domain, domainSkills]) => {
                 const expanded = expandedDomains.has(domain);
                 return (
                   <div key={domain}>
@@ -739,18 +977,38 @@ export default function SkillsPage() {
                         {domainSkills
                           .sort((a, b) => b.level - a.level)
                           .map(skill => (
-                            <button
+                            <div
                               key={skill.id}
-                              onClick={() => handleSkillClick(skill, null)}
-                              className={`w-full flex items-center gap-2 py-1 px-2 rounded text-left transition-colors ${
+                              className={`group w-full flex items-center gap-2 py-1 px-2 rounded text-left transition-colors cursor-pointer ${
                                 selectedSkill?.id === skill.id
                                   ? 'bg-slate-800 text-slate-100'
                                   : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-200'
                               }`}
+                              onClick={() => handleSkillClick(skill, null)}
                             >
+                              {skill.reviewNeeded && (
+                                <span
+                                  title="Needs classification review"
+                                  className="w-1.5 h-1.5 rounded-full bg-orange-400 flex-shrink-0"
+                                />
+                              )}
                               <span className="text-xs truncate flex-1 capitalize">{skill.name}</span>
+                              {skill.reviewNeeded && (
+                                <button
+                                  onClick={e => handleMarkReviewed(skill.id, e)}
+                                  title="Mark as reviewed"
+                                  className="hidden group-hover:flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded bg-orange-900/30 text-orange-300 hover:bg-orange-800/50 flex-shrink-0"
+                                >
+                                  <Eye className="w-2.5 h-2.5" />
+                                </button>
+                              )}
+                              {aliasCountMap.has(skill.id) && (
+                                <span title={`${aliasCountMap.get(skill.id)} alias(es) merged`} style={{ fontSize: 9, padding: '1px 4px', borderRadius: 3, background: 'rgba(99,102,241,0.15)', color: '#818cf8', flexShrink: 0 }}>
+                                  {aliasCountMap.get(skill.id)}↗
+                                </span>
+                              )}
                               <LevelDots level={skill.level} />
-                            </button>
+                            </div>
                           ))}
                       </div>
                     )}
@@ -810,6 +1068,14 @@ export default function SkillsPage() {
           to   { opacity: var(--max-op, 0.12); }
         }
       `}</style>
+
+      {showMerge && (
+        <MergeModal
+          skills={skills}
+          onClose={() => setShowMerge(false)}
+          onMerged={loadAll}
+        />
+      )}
     </div>
   );
 }

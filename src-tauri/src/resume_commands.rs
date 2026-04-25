@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tauri::State;
 use uuid::Uuid;
+use crate::constants::GROQ_API_URL;
 use crate::database::Database;
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -123,7 +124,7 @@ async fn call_groq(api_key: &str, system_prompt: &str, user_prompt: &str) -> Res
     });
 
     let response = client
-        .post("https://api.groq.com/openai/v1/chat/completions")
+        .post(GROQ_API_URL)
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
         .json(&request_body)
@@ -152,6 +153,7 @@ async fn call_groq(api_key: &str, system_prompt: &str, user_prompt: &str) -> Res
 #[tauri::command]
 pub async fn parse_resume(
     text: String,
+    app: tauri::AppHandle,
     database: State<'_, Database>,
 ) -> Result<ResumeProfile, String> {
     println!("\n=== Parse Resume ===");
@@ -211,9 +213,12 @@ pub async fn parse_resume(
         .map_err(|e| e.to_string())?;
 
     let profile_id = Uuid::new_v4().to_string();
-    let education_json = serde_json::to_value(&profile.education.unwrap_or_default()).unwrap();
-    let work_exp_json = serde_json::to_value(&profile.work_experience.unwrap_or_default()).unwrap();
-    let skills_json = serde_json::to_value(&profile.skills.unwrap_or_default()).unwrap();
+    let education_json = serde_json::to_value(&profile.education.unwrap_or_default())
+        .map_err(|e| format!("Failed to serialize education: {}", e))?;
+    let work_exp_json = serde_json::to_value(&profile.work_experience.unwrap_or_default())
+        .map_err(|e| format!("Failed to serialize work experience: {}", e))?;
+    let skills_json = serde_json::to_value(&profile.skills.unwrap_or_default())
+        .map_err(|e| format!("Failed to serialize skills: {}", e))?;
 
     sqlx::query(
         "INSERT INTO resume_profile (id, raw_text, name, email, education, work_experience, skills) \
@@ -238,7 +243,8 @@ pub async fn parse_resume(
 
     for p in &projects {
         let project_id = Uuid::new_v4().to_string();
-        let tech_stack_json = serde_json::to_value(&p.tech_stack).unwrap();
+        let tech_stack_json = serde_json::to_value(&p.tech_stack)
+            .map_err(|e| format!("Failed to serialize tech stack: {}", e))?;
         let github_url = p.github_url.as_deref().filter(|u| !u.is_empty());
 
         sqlx::query(
@@ -273,6 +279,8 @@ pub async fn parse_resume(
     let education: Vec<Education> = serde_json::from_value(education_json).unwrap_or_default();
     let work_experience: Vec<WorkExperience> = serde_json::from_value(work_exp_json).unwrap_or_default();
     let skills: Vec<String> = serde_json::from_value(skills_json).unwrap_or_default();
+
+    crate::orchestrator::on_resume_parsed(&database.pool, &app).await;
 
     Ok(ResumeProfile {
         id: profile_id,

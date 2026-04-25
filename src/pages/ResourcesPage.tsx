@@ -4,6 +4,8 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { Trash2, Link, FileText, Globe, BookOpen, X, RefreshCw, CheckCircle2, Minus, XCircle, Filter, Search, ChevronDown, ChevronRight, Play, Tag, Wand2, Check } from 'lucide-react';
 import { MimirResource } from '../types';
+import { validateOrLog, MimirResourceSchema } from '../lib/validators';
+import { z } from 'zod';
 
 type AddMode = 'url' | 'text' | 'pdf';
 
@@ -173,7 +175,8 @@ export default function ResourcesPage() {
 
   async function loadResources() {
     try {
-      const list = await invoke<MimirResource[]>('get_mimir_resources');
+      const raw = await invoke('get_mimir_resources');
+      const list = validateOrLog(z.array(MimirResourceSchema), raw, 'get_mimir_resources') as MimirResource[];
       setResources(list);
     } catch (err) {
       console.error('Failed to load resources:', err);
@@ -222,18 +225,18 @@ export default function ResourcesPage() {
   async function handleRematchAll() {
     if (rematching) return;
     setRematching(true);
-    setRematchResult(null);
-    try {
-      const result = await invoke<string>('rematch_all_nodes');
-      setRematchResult(result);
-      await loadResources();
-      setTimeout(() => setRematchResult(null), 5000);
-    } catch (err) {
-      setRematchResult(`Failed: ${err}`);
-      setTimeout(() => setRematchResult(null), 5000);
-    } finally {
-      setRematching(false);
-    }
+    setRematchResult('Re-matching in background…');
+    invoke<string>('rematch_all_nodes')
+      .then(result => {
+        setRematchResult(result);
+        loadResources();
+        setTimeout(() => setRematchResult(null), 5000);
+      })
+      .catch(err => {
+        setRematchResult(`Failed: ${err}`);
+        setTimeout(() => setRematchResult(null), 5000);
+      })
+      .finally(() => setRematching(false));
   }
 
   async function handleReembedPdfs() {
@@ -255,10 +258,9 @@ export default function ResourcesPage() {
   async function handleToggleCompletion(resourceId: string) {
     try {
       const newVal = await invoke<boolean>('toggle_resource_completion', { resourceId });
+      // Orchestrator handles tree progress + skills cascade server-side on mark-complete.
+      // Optimistically update completion badge in the list.
       setResources(prev => prev.map(r => r.id === resourceId ? { ...r, isCompleted: newVal } : r));
-      if (newVal) {
-        await invoke('on_resource_completed', { resourceId });
-      }
     } catch (err) {
       console.error('Failed to toggle completion:', err);
     }
@@ -327,6 +329,16 @@ export default function ResourcesPage() {
     loadResources();
     loadChunkCounts();
     loadTags();
+  }, []);
+
+  // Reload list when orchestrator finishes ingesting or completing a resource
+  useEffect(() => {
+    const unlistenIngested = listen('ygg-resource-ingested', () => { loadResources(); loadTags(); });
+    const unlistenCompleted = listen('ygg-resource-completed', () => { loadResources(); });
+    return () => {
+      unlistenIngested.then(fn => fn());
+      unlistenCompleted.then(fn => fn());
+    };
   }, []);
 
   useEffect(() => {

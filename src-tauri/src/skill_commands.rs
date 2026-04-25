@@ -7,8 +7,32 @@ use sqlx::{PgPool, Row};
 use std::collections::HashSet;
 use tauri::State;
 use uuid::Uuid;
+use crate::constants::GROQ_API_URL;
 
 use crate::database::Database;
+
+// ─── Abbreviation map ────────────────────────────────────────────────────────
+
+static ABBREV_MAP: std::sync::LazyLock<std::collections::HashMap<&'static str, &'static str>> =
+    std::sync::LazyLock::new(|| {
+        [
+            ("ml",  "Machine Learning"),
+            ("dl",  "Deep Learning"),
+            ("nlp", "Natural Language Processing"),
+            ("cv",  "Computer Vision"),
+            ("rl",  "Reinforcement Learning"),
+            ("db",  "Database"),
+            ("os",  "Operating Systems"),
+            ("ds",  "Data Structures"),
+            ("ai",  "Artificial Intelligence"),
+            ("oop", "Object-Oriented Programming"),
+            ("fp",  "Functional Programming"),
+            ("ci",  "Continuous Integration"),
+            ("cd",  "Continuous Deployment"),
+        ]
+        .into_iter()
+        .collect()
+    });
 
 // ─── Structs ─────────────────────────────────────────────────────────────────
 
@@ -21,6 +45,17 @@ pub struct UniversalSkill {
     pub level: i32,
     pub evidence: serde_json::Value,
     pub last_updated: String,
+    pub review_needed: bool,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillAlias {
+    pub id: String,
+    pub canonical_skill_id: String,
+    pub canonical_skill_name: String,
+    pub alias: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,7 +86,70 @@ pub struct SyncResult {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-async fn upsert_skill(
+/// Deterministic normalization: lowercase + trim + suffix stripping + abbrev expansion.
+/// Preserves special cases like C++, C#, .NET.
+pub(crate) fn normalize_skill_name(name: &str) -> String {
+    let s = name.trim();
+    if s.is_empty() { return String::new(); }
+
+    // Special cases that must not be mangled
+    let lower = s.to_lowercase();
+    if matches!(lower.as_str(), "c++" | "c#" | ".net" | "f#" | "c") {
+        return s.to_string();
+    }
+
+    // Strip language-ecosystem suffixes (case-insensitive)
+    let stripped = {
+        let l = lower.as_str();
+        // Version numbers: "Python 3", "Python 3.11", "ES2022", etc.
+        // Strip trailing whitespace + digits/dots (but keep if that's the whole name)
+        let no_ver = {
+            let bytes = l.as_bytes();
+            let mut end = bytes.len();
+            while end > 0 && (bytes[end - 1].is_ascii_digit() || bytes[end - 1] == b'.') {
+                end -= 1;
+            }
+            // also strip trailing whitespace before the version
+            while end > 0 && bytes[end - 1] == b' ' {
+                end -= 1;
+            }
+            if end == 0 { l } else { &l[..end] }
+        };
+        // Strip .js / .py / .rb / .ts suffixes
+        let no_ext = no_ver
+            .strip_suffix(".js")
+            .or_else(|| no_ver.strip_suffix(".py"))
+            .or_else(|| no_ver.strip_suffix(".rb"))
+            .or_else(|| no_ver.strip_suffix(".ts"))
+            .unwrap_or(no_ver);
+        no_ext.trim()
+    };
+
+    // Abbreviation expansion — domain-agnostic common abbreviations only.
+    // Extend this map for any abbreviations that should always be expanded.
+    let expanded = ABBREV_MAP.get(stripped).copied().unwrap_or("");
+    if !expanded.is_empty() {
+        return expanded.to_string();
+    }
+
+    // Title-case the stripped form to produce a clean canonical name.
+    // We keep the original casing of s but apply the stripping from stripped.
+    // To preserve user's preferred casing, we re-slice the original `s` to the
+    // same byte length as `stripped` (both are derived from the same string).
+    let orig_trimmed = s;
+    let stripped_len_in_original = {
+        // stripped is a substring of lower (same byte positions), so find how
+        // many chars that maps to in the original.
+        // Since we only stripped ASCII suffixes and spaces, byte positions match.
+        stripped.len()
+    };
+    if stripped_len_in_original == 0 || stripped_len_in_original > orig_trimmed.len() {
+        return orig_trimmed.to_string();
+    }
+    orig_trimmed[..stripped_len_in_original].trim().to_string()
+}
+
+pub(crate) async fn upsert_skill(
     pool: &PgPool,
     name: &str,
     domain: Option<&str>,
@@ -61,25 +159,36 @@ async fn upsert_skill(
     if trimmed.is_empty() {
         return Err("Empty skill name".to_string());
     }
+    let normalized = normalize_skill_name(trimmed);
+    let canonical_name = if normalized.is_empty() { trimmed } else { &normalized };
+    let slug = canonical_name.to_lowercase().replace(' ', "-");
     let id = Uuid::new_v4().to_string();
     let evidence_arr = serde_json::json!([evidence_entry]);
 
     // ON CONFLICT uses a case-insensitive expression index on LOWER(name).
-    // If an existing row has a different casing, we keep the existing name
-    // (DO UPDATE does not update `name`) so the first-inserted casing wins.
+    // New skills with no domain are flagged unclassified + review_needed so they
+    // surface for human classification. On update we never flip review_needed back
+    // to false — only the explicit mark_skill_reviewed command does that.
+    let no_domain = domain.is_none();
     let row = sqlx::query(
-        "INSERT INTO universal_skills (id, name, domain, level, evidence, last_updated)
-         VALUES ($1, $2, $3, 1, $4::jsonb, NOW())
+        "INSERT INTO universal_skills
+             (id, name, concept_slug, domain, level, evidence, last_updated, status, review_needed)
+         VALUES ($1, $2, $3, $4, 1, $5::jsonb, NOW(),
+                 CASE WHEN $4 IS NULL THEN 'unclassified' ELSE 'active' END,
+                 $6)
          ON CONFLICT (LOWER(name)) DO UPDATE SET
-             evidence = universal_skills.evidence || $4::jsonb,
-             domain = COALESCE($3, universal_skills.domain),
+             evidence = universal_skills.evidence || $5::jsonb,
+             concept_slug = COALESCE(universal_skills.concept_slug, EXCLUDED.concept_slug),
+             domain = COALESCE($4, universal_skills.domain),
              last_updated = NOW()
          RETURNING id"
     )
     .bind(&id)
-    .bind(trimmed)
+    .bind(canonical_name)
+    .bind(&slug)
     .bind(domain)
     .bind(&evidence_arr)
+    .bind(no_domain)
     .fetch_one(pool)
     .await
     .map_err(|e| format!("upsert_skill failed: {}", e))?;
@@ -89,7 +198,7 @@ async fn upsert_skill(
 
 // ─── Inner sync functions (take &PgPool directly) ───────────────────────────
 
-async fn sync_resume_inner(pool: &PgPool) -> Result<SyncResult, String> {
+pub(crate) async fn sync_resume_inner(pool: &PgPool) -> Result<SyncResult, String> {
     let row = sqlx::query(
         "SELECT skills FROM resume_profile ORDER BY created_at DESC LIMIT 1"
     )
@@ -118,7 +227,7 @@ async fn sync_resume_inner(pool: &PgPool) -> Result<SyncResult, String> {
     Ok(SyncResult { upserted: count, source: "resume".into() })
 }
 
-async fn sync_trees_inner(pool: &PgPool) -> Result<SyncResult, String> {
+pub(crate) async fn sync_trees_inner(pool: &PgPool) -> Result<SyncResult, String> {
     // Skill nodes: branch nodes whose parent is also a branch (phase).
     // trunk -> phase (branch, parent=trunk) -> skill (branch, parent=phase) -> leaf (quest)
     // We want: n.type='branch' AND parent.type='branch'
@@ -161,7 +270,7 @@ async fn sync_trees_inner(pool: &PgPool) -> Result<SyncResult, String> {
     Ok(SyncResult { upserted: count, source: "trees".into() })
 }
 
-async fn sync_work_inner(pool: &PgPool) -> Result<SyncResult, String> {
+pub(crate) async fn sync_work_inner(pool: &PgPool) -> Result<SyncResult, String> {
     let rows = sqlx::query(
         "SELECT wrs.skill_name, wr.title AS resource_title, wr.id AS resource_id,
                 ct.company
@@ -195,7 +304,7 @@ async fn sync_work_inner(pool: &PgPool) -> Result<SyncResult, String> {
     Ok(SyncResult { upserted: count, source: "work".into() })
 }
 
-async fn recalculate_levels_inner(pool: &PgPool) -> Result<usize, String> {
+pub(crate) async fn recalculate_levels_inner(pool: &PgPool) -> Result<usize, String> {
     let rows = sqlx::query("SELECT id, evidence FROM universal_skills")
         .fetch_all(pool)
         .await
@@ -213,6 +322,12 @@ async fn recalculate_levels_inner(pool: &PgPool) -> Result<usize, String> {
         let work_entries: Vec<_> = entries.iter()
             .filter(|e| e["type"] == "work_resource")
             .collect();
+        let mimir_entries: Vec<_> = entries.iter()
+            .filter(|e| e["type"] == "mimir_resource")
+            .collect();
+        let manual_entries: Vec<_> = entries.iter()
+            .filter(|e| e["type"] == "manual")
+            .collect();
 
         // Unique project contexts from tree evidence
         let unique_projects: HashSet<String> = tree_entries.iter()
@@ -224,17 +339,19 @@ async fn recalculate_levels_inner(pool: &PgPool) -> Result<usize, String> {
             .filter(|e| e["progress"].as_i64().unwrap_or(0) == 100)
             .count();
 
+        // mimir_resource and manual count as practical evidence alongside work
         let has_work = !work_entries.is_empty();
+        let has_practical = has_work || !mimir_entries.is_empty() || !manual_entries.is_empty();
         let total_evidence = entries.len();
 
-        // PRD level rules
-        let level: i32 = if total_evidence >= 8 && unique_projects.len() >= 3 && has_work {
+        // PRD level rules (extended for domain-agnostic sources)
+        let level: i32 = if total_evidence >= 8 && unique_projects.len() >= 3 && has_practical {
             5 // Expert
-        } else if unique_projects.len() >= 2 && (has_work || completed_skills >= 2) {
+        } else if unique_projects.len() >= 2 && (has_practical || completed_skills >= 2) {
             4 // Advanced
-        } else if unique_projects.len() >= 2 || (completed_skills >= 1 && has_work) {
+        } else if unique_projects.len() >= 2 || (completed_skills >= 1 && has_practical) {
             3 // Proficient
-        } else if completed_skills >= 1 {
+        } else if completed_skills >= 1 || (!manual_entries.is_empty() && !mimir_entries.is_empty()) {
             2 // Familiar
         } else {
             1 // Aware
@@ -332,8 +449,8 @@ pub async fn get_universal_skills(
     database: State<'_, Database>,
 ) -> Result<Vec<UniversalSkill>, String> {
     let rows = sqlx::query(
-        "SELECT id, name, domain, level, evidence, last_updated
-         FROM universal_skills ORDER BY level DESC, name ASC"
+        "SELECT id, name, domain, level, evidence, last_updated, review_needed, status
+         FROM universal_skills ORDER BY review_needed DESC, level DESC, name ASC"
     )
     .fetch_all(&database.pool)
     .await
@@ -349,6 +466,8 @@ pub async fn get_universal_skills(
             last_updated: r.try_get::<chrono::DateTime<chrono::Utc>, _>("last_updated")
                 .map(|dt| dt.to_rfc3339())
                 .map_err(|e| e.to_string())?,
+            review_needed: r.try_get("review_needed").unwrap_or(false),
+            status: r.try_get("status").unwrap_or_else(|_| "active".to_string()),
         })
     }).collect()
 }
@@ -447,8 +566,12 @@ pub async fn get_skill_gaps(
 pub async fn infer_skill_dependencies(
     database: State<'_, Database>,
 ) -> Result<usize, String> {
+    infer_skill_deps_inner(&database.pool).await
+}
+
+pub(crate) async fn infer_skill_deps_inner(pool: &PgPool) -> Result<usize, String> {
     let rows = sqlx::query("SELECT id, name FROM universal_skills ORDER BY name")
-        .fetch_all(&database.pool)
+        .fetch_all(pool)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -458,7 +581,6 @@ pub async fn infer_skill_dependencies(
         .map(|r| r.try_get::<String, _>("name").unwrap_or_default())
         .collect();
 
-    // Build name -> id map
     let name_to_id: std::collections::HashMap<String, String> = rows.iter()
         .map(|r| {
             let name: String = r.try_get("name").unwrap_or_default();
@@ -467,7 +589,6 @@ pub async fn infer_skill_dependencies(
         })
         .collect();
 
-    // Load API key
     let api_key = std::env::var("GROQ_API_KEY")
         .map_err(|_| "GROQ_API_KEY environment variable not set".to_string())?;
 
@@ -482,28 +603,26 @@ pub async fn infer_skill_dependencies(
         to: String,
     }
 
-    // Build a lowercase name → id lookup to match LLM output case-insensitively
     let lower_to_id: std::collections::HashMap<String, String> = name_to_id.iter()
         .map(|(name, id)| (name.to_lowercase(), id.clone()))
         .collect();
 
     let client = reqwest::Client::new();
 
-    // Batch into groups of 30 to stay well within token limits
     const BATCH_SIZE: usize = 30;
     let batches: Vec<&[String]> = skill_names.chunks(BATCH_SIZE).collect();
     let mut all_pairs: Vec<DepPair> = Vec::new();
 
     for (i, batch) in batches.iter().enumerate() {
         if i > 0 {
-            // Small delay between batches to avoid rate limiting
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
 
         let user_prompt = format!("Skills: {}", batch.join(", "));
 
+        let deps_t0 = std::time::Instant::now();
         let response = client
-            .post("https://api.groq.com/openai/v1/chat/completions")
+            .post(GROQ_API_URL)
             .header("Authorization", format!("Bearer {}", api_key))
             .header("Content-Type", "application/json")
             .json(&serde_json::json!({
@@ -518,7 +637,13 @@ pub async fn infer_skill_dependencies(
             .timeout(std::time::Duration::from_secs(30))
             .send()
             .await
-            .map_err(|e| format!("Groq request failed (batch {}): {}", i, e))?;
+            .map_err(|e| {
+                crate::brain::log_prompt_call(
+                    pool.clone(), "skill_deps", "llama-3.3-70b-versatile", "skill_deps_v1",
+                    deps_t0.elapsed().as_millis() as i64, false, Some(e.to_string()), None,
+                );
+                format!("Groq request failed (batch {}): {}", i, e)
+            })?;
 
         let body: serde_json::Value = response
             .json()
@@ -529,7 +654,6 @@ pub async fn infer_skill_dependencies(
             .as_str()
             .unwrap_or("[]");
 
-        // Strip markdown fences before parsing
         let clean = content
             .trim()
             .trim_start_matches("```json")
@@ -538,13 +662,17 @@ pub async fn infer_skill_dependencies(
             .trim();
 
         let batch_pairs: Vec<DepPair> = serde_json::from_str(clean).unwrap_or_default();
+        crate::brain::log_prompt_call(
+            pool.clone(), "skill_deps", "llama-3.3-70b-versatile", "skill_deps_v1",
+            deps_t0.elapsed().as_millis() as i64, true, None,
+            Some(serde_json::json!({ "batch": i, "skills": batch.len() })),
+        );
         println!("  🔗 Batch {}: {} pairs from {} skills", i + 1, batch_pairs.len(), batch.len());
         all_pairs.extend(batch_pairs);
     }
 
-    // Clear existing inferred dependencies
     sqlx::query("DELETE FROM skill_dependencies WHERE relationship = 'prerequisite'")
-        .execute(&database.pool)
+        .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -564,7 +692,7 @@ pub async fn infer_skill_dependencies(
             .bind(&dep_id)
             .bind(from_id)
             .bind(to_id)
-            .execute(&database.pool)
+            .execute(pool)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -576,4 +704,207 @@ pub async fn infer_skill_dependencies(
 
     println!("🔗 Inferred {} skill dependencies from {} total pairs ({} batches)", count, all_pairs.len(), batches.len());
     Ok(count)
+}
+
+// ─── Skill alias / merge commands ───────────────────────────────────────────
+
+#[tauri::command]
+pub async fn get_skill_aliases(
+    database: State<'_, Database>,
+) -> Result<Vec<SkillAlias>, String> {
+    let rows = sqlx::query(
+        "SELECT sa.id, sa.canonical_skill_id, us.name AS canonical_skill_name, sa.alias
+         FROM skill_aliases sa
+         JOIN universal_skills us ON us.id = sa.canonical_skill_id
+         ORDER BY us.name ASC, sa.alias ASC"
+    )
+    .fetch_all(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    rows.iter().map(|r| {
+        Ok(SkillAlias {
+            id: r.try_get("id").map_err(|e| e.to_string())?,
+            canonical_skill_id: r.try_get("canonical_skill_id").map_err(|e| e.to_string())?,
+            canonical_skill_name: r.try_get("canonical_skill_name").map_err(|e| e.to_string())?,
+            alias: r.try_get("alias").map_err(|e| e.to_string())?,
+        })
+    }).collect()
+}
+
+#[tauri::command]
+pub async fn merge_skills(
+    canonical_id: String,
+    alias_ids: Vec<String>,
+    database: State<'_, Database>,
+) -> Result<(), String> {
+    if alias_ids.is_empty() {
+        return Err("No alias IDs provided".to_string());
+    }
+
+    // Fetch the canonical skill's current evidence
+    let canonical_row = sqlx::query(
+        "SELECT name, evidence FROM universal_skills WHERE id = $1"
+    )
+    .bind(&canonical_id)
+    .fetch_one(&database.pool)
+    .await
+    .map_err(|e| format!("Canonical skill not found: {}", e))?;
+
+    let canonical_name: String = canonical_row.try_get("name").map_err(|e| e.to_string())?;
+    let mut merged_evidence: Vec<serde_json::Value> = canonical_row
+        .try_get::<serde_json::Value, _>("evidence")
+        .map_err(|e| e.to_string())?
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+
+    for alias_id in &alias_ids {
+        if *alias_id == canonical_id { continue; }
+
+        // Fetch alias skill data
+        let alias_row = sqlx::query(
+            "SELECT name, evidence FROM universal_skills WHERE id = $1"
+        )
+        .bind(alias_id)
+        .fetch_optional(&database.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let Some(alias_row) = alias_row else { continue; };
+
+        let alias_name: String = alias_row.try_get("name").map_err(|e| e.to_string())?;
+
+        // Record alias in skill_aliases table
+        let alias_entry_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO skill_aliases (id, canonical_skill_id, alias)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (alias) DO UPDATE SET canonical_skill_id = EXCLUDED.canonical_skill_id"
+        )
+        .bind(&alias_entry_id)
+        .bind(&canonical_id)
+        .bind(&alias_name)
+        .execute(&database.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        // Merge alias evidence into canonical
+        let alias_evidence: Vec<serde_json::Value> = alias_row
+            .try_get::<serde_json::Value, _>("evidence")
+            .map_err(|e| e.to_string())?
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        merged_evidence.extend(alias_evidence);
+
+        // Re-point skill_dependencies: source edges
+        sqlx::query(
+            "UPDATE skill_dependencies SET source_skill_id = $1
+             WHERE source_skill_id = $2
+               AND NOT EXISTS (
+                 SELECT 1 FROM skill_dependencies
+                 WHERE source_skill_id = $1
+                   AND target_skill_id = skill_dependencies.target_skill_id
+               )"
+        )
+        .bind(&canonical_id)
+        .bind(alias_id)
+        .execute(&database.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        // Re-point skill_dependencies: target edges
+        sqlx::query(
+            "UPDATE skill_dependencies SET target_skill_id = $1
+             WHERE target_skill_id = $2
+               AND NOT EXISTS (
+                 SELECT 1 FROM skill_dependencies
+                 WHERE target_skill_id = $1
+                   AND source_skill_id = skill_dependencies.source_skill_id
+               )"
+        )
+        .bind(&canonical_id)
+        .bind(alias_id)
+        .execute(&database.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        // Delete alias skill (CASCADE removes stale dependency rows)
+        sqlx::query("DELETE FROM universal_skills WHERE id = $1")
+            .bind(alias_id)
+            .execute(&database.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        println!("🔀 Merged '{}' → '{}' (canonical)", alias_name, canonical_name);
+    }
+
+    // Write merged evidence back to canonical
+    let merged_json = serde_json::Value::Array(merged_evidence);
+    sqlx::query(
+        "UPDATE universal_skills SET evidence = $1::jsonb, last_updated = NOW() WHERE id = $2"
+    )
+    .bind(&merged_json)
+    .bind(&canonical_id)
+    .execute(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Recalculate level for the canonical skill
+    recalculate_levels_inner(&database.pool).await?;
+
+    println!("✅ Merge complete: {} aliases into '{}'", alias_ids.len(), canonical_name);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn mark_skill_reviewed(
+    skill_id: String,
+    database: State<'_, Database>,
+) -> Result<(), String> {
+    sqlx::query(
+        "UPDATE universal_skills SET review_needed = false, status = 'active', last_updated = NOW()
+         WHERE id = $1"
+    )
+    .bind(&skill_id)
+    .execute(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn backfill_skill_slugs(
+    database: State<'_, Database>,
+) -> Result<usize, String> {
+    let rows = sqlx::query(
+        "SELECT id, name FROM universal_skills WHERE concept_slug IS NULL"
+    )
+    .fetch_all(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut updated = 0;
+    for row in &rows {
+        let id: String = row.try_get("id").map_err(|e| e.to_string())?;
+        let name: String = row.try_get("name").map_err(|e| e.to_string())?;
+        let normalized = normalize_skill_name(&name);
+        let slug = if normalized.is_empty() {
+            name.to_lowercase().replace(' ', "-")
+        } else {
+            normalized.to_lowercase().replace(' ', "-")
+        };
+        sqlx::query(
+            "UPDATE universal_skills SET concept_slug = $1 WHERE id = $2 AND concept_slug IS NULL"
+        )
+        .bind(&slug)
+        .bind(&id)
+        .execute(&database.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        updated += 1;
+    }
+    println!("🔤 Backfilled concept_slug for {} skills", updated);
+    Ok(updated)
 }

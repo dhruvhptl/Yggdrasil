@@ -5,6 +5,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import * as d3 from 'd3';
 import { ChevronDown, ChevronRight, ChevronLeft, Plus, ExternalLink, X, Loader2, Cpu, Code2, Layers } from 'lucide-react';
 
@@ -616,9 +617,8 @@ function LeftPanel({
       setExtractingFor(prev => new Set([...prev, resource.id]));
       try {
         await invoke('extract_skills', { resourceId: resource.id });
+        // Skill sync to universal skills is handled server-side by the orchestrator
         await onRefresh();
-        // Sync work skills to universal skills (fire-and-forget)
-        invoke('sync_skills_from_work').then(() => invoke('recalculate_skill_levels')).catch(console.warn);
       } catch (e) {
         console.warn('Skill extraction failed:', e);
       } finally {
@@ -953,6 +953,12 @@ export default function WorkPage() {
   }
 
   useEffect(() => { loadAll(); }, []);
+
+  // Refresh graph when skill extraction cascade completes
+  useEffect(() => {
+    const unlisten = listen('ygg-skills-updated', () => { loadAll(); });
+    return () => { unlisten.then(fn => fn()); };
+  }, []);
 
   const hasSkills = graph.coops.some(c =>
     c.topics.some(t => t.resources.some(r => r.skills.length > 0))

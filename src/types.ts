@@ -107,6 +107,8 @@ export interface UniversalSkill {
   level: number;
   evidence: SkillEvidence[];
   lastUpdated: string;
+  reviewNeeded: boolean;
+  status: string;
 }
 
 export interface SkillGap {
@@ -122,6 +124,79 @@ export interface SkillDependency {
   sourceSkillId: string;
   targetSkillId: string;
   relationship: string;
+}
+
+export interface SkillAlias {
+  id: string;
+  canonicalSkillId: string;
+  canonicalSkillName: string;
+  alias: string;
+}
+
+// Read-model helpers
+
+export interface TreeSummary {
+  treeId: string;
+  treeName: string;
+  projectId: string;
+  totalNodes: number;
+  completedNodes: number;
+  overallProgress: number;
+  phaseCount: number;
+  createdAt: string;
+}
+
+export interface MatchedResource {
+  resourceId: string;
+  title: string;
+  url: string | null;
+  resourceType: string;
+  matchedSectionTitle: string | null;
+  matchedPageStart: number | null;
+  matchedPageEnd: number | null;
+  relevanceScore: number | null;
+}
+
+export interface NodeChatContext {
+  nodeId: string;
+  title: string;
+  description: string;
+  masteryCriteria: string;
+  exercises: string[];
+  progress: number;
+  isLocked: boolean;
+  phaseName: string | null;
+  skillName: string | null;
+  siblings: string[];
+  matchedResources: MatchedResource[];
+}
+
+export interface PhaseBreakdown {
+  phaseName: string;
+  skillCount: number;
+  completedSkills: number;
+  checkpointsTotal: number;
+  checkpointsCompleted: number;
+}
+
+export interface ProjectTreeSummary {
+  projectId: string;
+  projectName: string;
+  treeId: string | null;
+  treeName: string | null;
+  overallProgress: number;
+  phases: PhaseBreakdown[];
+  totalMatchedResources: number;
+  lastActivity: string | null;
+}
+
+export interface SkillGraphSnapshot {
+  skills: UniversalSkill[];
+  dependencies: SkillDependency[];
+  aliases: SkillAlias[];
+  gaps: SkillGap[];
+  gapCount: number;
+  reviewCount: number;
 }
 
 // Daily Eisenhower Matrix types
