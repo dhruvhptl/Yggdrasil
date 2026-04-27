@@ -1,3 +1,11 @@
+export interface Tree {
+  id: string;
+  project_id: string;
+  name: string;
+  created_at: string;
+  version: number;
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -197,6 +205,21 @@ export interface SkillGraphSnapshot {
   gaps: SkillGap[];
   gapCount: number;
   reviewCount: number;
+}
+
+// Mimir suggestion payloads
+
+export type SuggestionPayload =
+  | { action: 'mark_complete'; node_id: string }
+  | { action: 'next_quest'; node_id: string }
+  | { action: 'explain_prereq'; concept: string }
+  | { action: 'add_resource'; url: string }
+  | { action: 'find_gaps' };
+
+export interface Suggestion {
+  action: string;
+  label: string;
+  payload: SuggestionPayload | null;
 }
 
 // Daily Eisenhower Matrix types

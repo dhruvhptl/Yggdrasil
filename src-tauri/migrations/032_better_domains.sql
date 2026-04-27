@@ -20,5 +20,5 @@ VALUES
     ('dom-devops',      'DevOps',                        'CI/CD, containerization (Docker, K8s), infrastructure as code, monitoring, cloud platforms'),
     ('dom-databases',   'Databases',                     'Relational (SQL, PostgreSQL), NoSQL (Mongo, Redis), indexing, query optimization, schema design'),
     ('dom-viz',         'Visualization',                 'Data visualization, charting libraries (D3, Vega), dashboards, scientific plotting, rendering'),
-    ('dom-research',    'Research Methods',              'Experimental design, literature review, academic writing, citation, reproducibility, peer review')
+    ('dom-research-methods', 'Research Methods',          'Experimental design, literature review, academic writing, citation, reproducibility, peer review')
 ON CONFLICT (name) DO UPDATE SET description = EXCLUDED.description;

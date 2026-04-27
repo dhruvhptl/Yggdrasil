@@ -307,6 +307,7 @@ pub async fn toggle_resource_completed(
 pub async fn extract_skills(
     resource_id: String,
     app: tauri::AppHandle,
+    client: State<'_, reqwest::Client>,
     database: State<'_, Database>,
 ) -> Result<Vec<WorkResourceSkill>, String> {
     // Load resource
@@ -338,7 +339,6 @@ pub async fn extract_skills(
         notes.as_deref().unwrap_or("")
     );
 
-    let client = reqwest::Client::new();
     let response = client
         .post(GROQ_API_URL)
         .header("Authorization", format!("Bearer {}", api_key))

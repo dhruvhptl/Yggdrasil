@@ -109,8 +109,7 @@ struct ParsedProjectsAI {
 
 // ─── Groq helper ────────────────────────────────────────────────────────────
 
-async fn call_groq(api_key: &str, system_prompt: &str, user_prompt: &str) -> Result<String, String> {
-    let client = reqwest::Client::new();
+async fn call_groq(client: &reqwest::Client, api_key: &str, system_prompt: &str, user_prompt: &str) -> Result<String, String> {
 
     let request_body = json!({
         "model": "llama-3.3-70b-versatile",
@@ -154,6 +153,7 @@ async fn call_groq(api_key: &str, system_prompt: &str, user_prompt: &str) -> Res
 pub async fn parse_resume(
     text: String,
     app: tauri::AppHandle,
+    client: State<'_, reqwest::Client>,
     database: State<'_, Database>,
 ) -> Result<ResumeProfile, String> {
     println!("\n=== Parse Resume ===");
@@ -177,7 +177,7 @@ pub async fn parse_resume(
         Return ONLY the JSON, nothing else.\n\nResume:\n{}",
         text
     );
-    let profile_json = call_groq(&api_key, system_prompt, &profile_prompt).await?;
+    let profile_json = call_groq(&*client, &api_key, system_prompt, &profile_prompt).await?;
     println!("Got profile response: {} chars", profile_json.len());
 
     let profile: ParsedProfileAI = serde_json::from_str(&profile_json)
@@ -198,7 +198,7 @@ pub async fn parse_resume(
         Return ONLY the JSON, nothing else.\n\nResume:\n{}",
         text
     );
-    let projects_json = call_groq(&api_key, system_prompt, &projects_prompt).await?;
+    let projects_json = call_groq(&*client, &api_key, system_prompt, &projects_prompt).await?;
     println!("Got projects response: {} chars", projects_json.len());
 
     let projects_parsed: ParsedProjectsAI = serde_json::from_str(&projects_json)

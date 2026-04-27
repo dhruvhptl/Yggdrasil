@@ -6,8 +6,16 @@ mod commands;
 mod constants;
 mod database;
 mod tree_commands;
+mod llm_client;
+mod github;
+mod prompt_builders;
+mod tree_persistence;
 mod brain;
 mod mimir;
+mod mimir_ingest;
+mod mimir_retrieval;
+mod mimir_tags;
+mod mimir_manage;
 mod work_commands;
 mod job_commands;
 mod idea_commands;
@@ -56,7 +64,9 @@ fn main() {
                     .expect("Failed to initialize database");
                 let pool = database.pool.clone();
                 app_handle.manage(database);
-                let queue = orchestrator::start_worker(pool, app_handle.clone());
+                let http_client = reqwest::Client::new();
+                let queue = orchestrator::start_worker(pool, app_handle.clone(), http_client.clone());
+                app_handle.manage(http_client);
                 app_handle.manage(queue);
             });
             Ok(())
@@ -81,32 +91,32 @@ fn main() {
             tree_commands::recalculate_tree_progress,
             tree_commands::recalculate_unlocks,
             tree_commands::get_tree_node_data,
-            mimir::get_mimir_resources,
-            mimir::get_node_resources,
-            mimir::ingest_mimir_url,
-            mimir::ingest_mimir_text,
-            mimir::ingest_mimir_pdf,
-            mimir::delete_mimir_resource,
-            mimir::match_node_to_resources,
-            mimir::link_resource_to_node,
-            mimir::extract_pdf_text,
-            mimir::mimir_chat,
-            mimir::discover_links,
-            mimir::fetch_playlist,
-            mimir::rescrape_resource,
-            mimir::rescrape_all,
-            mimir::get_chunk_counts,
-            mimir::get_distinct_tags,
-            mimir::update_resource_tags,
-            mimir::auto_tag_existing_resources,
-            mimir::rematch_all_nodes,
-            mimir::toggle_resource_completion,
-            mimir::on_resource_completed,
-            mimir::get_linked_node_titles,
-            mimir::reembed_pdfs,
-            mimir::get_chat_session,
-            mimir::clear_chat_session,
-            mimir::get_retrieval_stats,
+            mimir_manage::get_mimir_resources,
+            mimir_manage::get_node_resources,
+            mimir_ingest::ingest_mimir_url,
+            mimir_ingest::ingest_mimir_text,
+            mimir_ingest::ingest_mimir_pdf,
+            mimir_manage::delete_mimir_resource,
+            mimir_retrieval::match_node_to_resources,
+            mimir_manage::link_resource_to_node,
+            mimir_ingest::extract_pdf_text,
+            mimir_retrieval::mimir_chat,
+            mimir_manage::discover_links,
+            mimir_manage::fetch_playlist,
+            mimir_ingest::rescrape_resource,
+            mimir_ingest::rescrape_all,
+            mimir_manage::get_chunk_counts,
+            mimir_tags::get_distinct_tags,
+            mimir_tags::update_resource_tags,
+            mimir_tags::auto_tag_existing_resources,
+            mimir_retrieval::rematch_all_nodes,
+            mimir_manage::toggle_resource_completion,
+            mimir_manage::on_resource_completed,
+            mimir_manage::get_linked_node_titles,
+            mimir_ingest::reembed_pdfs,
+            mimir_retrieval::get_chat_session,
+            mimir_retrieval::clear_chat_session,
+            mimir_retrieval::get_retrieval_stats,
             work_commands::create_coop,
             work_commands::get_coops,
             work_commands::create_topic,
@@ -146,17 +156,20 @@ fn main() {
             skill_commands::get_skill_aliases,
             skill_commands::merge_skills,
             skill_commands::mark_skill_reviewed,
-            skill_commands::backfill_skill_slugs,
             skill_commands::classify_skill_domains,
             skill_commands::reset_skill_domains,
             read_models::get_active_tree_for_project,
             read_models::get_node_chat_context,
             read_models::get_project_tree_summary,
             read_models::get_skill_graph_snapshot,
+            read_models::get_tree_resource_gaps,
             orchestrator::enqueue_rematch,
             orchestrator::enqueue_reembed,
             orchestrator::enqueue_autotag,
             brain::get_prompt_stats,
+            brain::get_tree_concept_graph,
+            brain::regenerate_tree,
+            brain::get_tree_regenerations,
             export_commands::export_tree,
             daily_commands::get_daily_log,
             daily_commands::upsert_daily_notes,

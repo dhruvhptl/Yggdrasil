@@ -20,8 +20,6 @@ pub(crate) enum OrchestratorJob {
     RematchAllNodes { tree_id: String },
     ReembedResources { resource_ids: Vec<String> },
     InferSkillDeps,
-    #[allow(dead_code)]
-    RescrapeResources { resource_ids: Vec<String> },
     AutoTagResources { resource_ids: Vec<String> },
 }
 
@@ -43,26 +41,23 @@ impl JobQueue {
 
 // ─── Worker startup ───────────────────────────────────────────────────────────
 
-pub fn start_worker(pool: PgPool, app: AppHandle) -> JobQueue {
+pub fn start_worker(pool: PgPool, app: AppHandle, client: reqwest::Client) -> JobQueue {
     let (tx, mut rx) = mpsc::channel::<OrchestratorJob>(64);
 
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
             match job {
                 OrchestratorJob::RematchAllNodes { tree_id } => {
-                    run_rematch_all_nodes(&pool, &app, &tree_id).await;
+                    run_rematch_all_nodes(&pool, &app, &client, &tree_id).await;
                 }
                 OrchestratorJob::ReembedResources { resource_ids } => {
-                    run_reembed_resources(&pool, &app, resource_ids).await;
+                    run_reembed_resources(&pool, &app, &client, resource_ids).await;
                 }
                 OrchestratorJob::InferSkillDeps => {
-                    run_infer_skill_deps(&pool, &app).await;
-                }
-                OrchestratorJob::RescrapeResources { resource_ids } => {
-                    run_rescrape_resources(&pool, &app, resource_ids).await;
+                    run_infer_skill_deps(&pool, &app, &client).await;
                 }
                 OrchestratorJob::AutoTagResources { resource_ids } => {
-                    run_autotag_resources(&pool, &app, resource_ids).await;
+                    run_autotag_resources(&pool, &app, &client, resource_ids).await;
                 }
             }
         }
@@ -99,7 +94,7 @@ pub async fn enqueue_autotag(
 
 // ─── Job implementations ──────────────────────────────────────────────────────
 
-async fn run_rematch_all_nodes(pool: &PgPool, app: &AppHandle, tree_id: &str) {
+async fn run_rematch_all_nodes(pool: &PgPool, app: &AppHandle, client: &reqwest::Client, tree_id: &str) {
     let rows = match sqlx::query(
         "SELECT id FROM tree_nodes WHERE tree_id = $1 AND type = 'leaf'"
     )
@@ -116,13 +111,12 @@ async fn run_rematch_all_nodes(pool: &PgPool, app: &AppHandle, tree_id: &str) {
         .collect();
 
     let total = node_ids.len();
-    let client = reqwest::Client::new();
 
     for (i, node_id) in node_ids.iter().enumerate() {
         if i > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        match crate::mimir::match_node_impl(pool, &client, node_id).await {
+        match crate::mimir_retrieval::match_node_impl(pool, client, node_id).await {
             Ok(_) => {}
             Err(e) => println!("⚠️  [job/rematch] node {}: {}", node_id, e),
         }
@@ -137,12 +131,11 @@ async fn run_rematch_all_nodes(pool: &PgPool, app: &AppHandle, tree_id: &str) {
     println!("📡 [job/rematch] ygg-rematch-complete (tree={})", tree_id);
 }
 
-async fn run_reembed_resources(pool: &PgPool, app: &AppHandle, resource_ids: Vec<String>) {
-    let client = reqwest::Client::new();
+async fn run_reembed_resources(pool: &PgPool, app: &AppHandle, client: &reqwest::Client, resource_ids: Vec<String>) {
     let total = resource_ids.len();
 
     for (i, resource_id) in resource_ids.iter().enumerate() {
-        match crate::mimir::reembed_resource_inner(pool, &client, resource_id).await {
+        match crate::mimir_ingest::reembed_resource_inner(pool, client, resource_id).await {
             Ok(_) => {}
             Err(e) => println!("⚠️  [job/reembed] resource {}: {}", resource_id, e),
         }
@@ -157,8 +150,8 @@ async fn run_reembed_resources(pool: &PgPool, app: &AppHandle, resource_ids: Vec
     println!("📡 [job/reembed] ygg-reembed-complete ({} resources)", total);
 }
 
-async fn run_infer_skill_deps(pool: &PgPool, app: &AppHandle) {
-    match crate::skill_commands::infer_skill_deps_inner(pool).await {
+async fn run_infer_skill_deps(pool: &PgPool, app: &AppHandle, client: &reqwest::Client) {
+    match crate::skill_commands::infer_skill_deps_inner(client, pool).await {
         Ok(count) => println!("🔗 [job/infer-deps] {} deps written", count),
         Err(e) => println!("⚠️  [job/infer-deps] failed: {}", e),
     }
@@ -166,32 +159,9 @@ async fn run_infer_skill_deps(pool: &PgPool, app: &AppHandle) {
     println!("📡 [job/infer-deps] ygg-skills-updated emitted");
 }
 
-async fn run_rescrape_resources(pool: &PgPool, app: &AppHandle, resource_ids: Vec<String>) {
-    let total = resource_ids.len();
-
-    for (i, resource_id) in resource_ids.iter().enumerate() {
-        if i > 0 {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        }
-        let result = crate::mimir::rescrape_one(pool, resource_id).await;
-        let status = if !result.success { "failed" } else if result.changed { "improved" } else { "unchanged" };
-        let _ = app.emit("ygg-rescrape-progress", serde_json::json!({
-            "resourceId": resource_id,
-            "completed": i + 1,
-            "total": total,
-            "status": status,
-            "oldChunks": result.old_chunks,
-            "newChunks": result.new_chunks,
-        }));
-    }
-
-    let _ = app.emit("ygg-rescrape-complete", serde_json::json!({ "total": total }));
-    println!("📡 [job/rescrape] ygg-rescrape-complete ({} resources)", total);
-}
-
-async fn run_autotag_resources(pool: &PgPool, app: &AppHandle, resource_ids: Vec<String>) {
+async fn run_autotag_resources(pool: &PgPool, app: &AppHandle, client: &reqwest::Client, resource_ids: Vec<String>) {
     for resource_id in &resource_ids {
-        if let Err(e) = auto_tag_single(pool, resource_id).await {
+        if let Err(e) = auto_tag_single(pool, client, resource_id).await {
             println!("⚠️  [job/autotag] resource {}: {}", resource_id, e);
         } else {
             let _ = app.emit("ygg-resource-ingested", serde_json::json!({ "resourceId": resource_id }));
@@ -225,6 +195,10 @@ pub async fn on_tree_generated(
         println!("⚠️  [orch] recalculate_levels_inner failed: {}", e);
     }
 
+    if let Err(e) = crate::skill_commands::sync_concept_slugs_inner(pool).await {
+        println!("⚠️  [orch] sync_concept_slugs_inner failed: {}", e);
+    }
+
     let _ = app.emit("ygg-tree-generated", serde_json::json!({
         "treeId": tree_id,
         "projectId": project_id,
@@ -237,13 +211,14 @@ pub async fn on_tree_generated(
 pub async fn on_resource_ingested(
     pool: &PgPool,
     app: &AppHandle,
+    client: &reqwest::Client,
     resource_id: &str,
 ) {
-    if let Err(e) = auto_tag_single(pool, resource_id).await {
+    if let Err(e) = auto_tag_single(pool, client, resource_id).await {
         println!("⚠️  [orch] auto_tag_single failed for {}: {}", resource_id, e);
     }
 
-    if let Err(e) = match_resource_to_nodes(pool, resource_id).await {
+    if let Err(e) = match_resource_to_nodes(pool, client, resource_id).await {
         println!("⚠️  [orch] match_resource_to_nodes failed for {}: {}", resource_id, e);
     }
 
@@ -501,7 +476,7 @@ async fn recalculate_unlocks_inner(pool: &PgPool, tree_id: &str) -> Result<(), S
     Ok(())
 }
 
-async fn auto_tag_single(pool: &PgPool, resource_id: &str) -> Result<(), String> {
+async fn auto_tag_single(pool: &PgPool, client: &reqwest::Client, resource_id: &str) -> Result<(), String> {
     let row = sqlx::query(
         "SELECT title, tags FROM mimir_resources WHERE id = $1"
     )
@@ -528,7 +503,6 @@ async fn auto_tag_single(pool: &PgPool, resource_id: &str) -> Result<(), String>
     let api_key = std::env::var("GROQ_API_KEY")
         .map_err(|_| "GROQ_API_KEY not set".to_string())?;
 
-    let client = reqwest::Client::new();
     let response = client
         .post(crate::constants::GROQ_API_URL)
         .header("Authorization", format!("Bearer {}", api_key))
@@ -587,7 +561,7 @@ async fn auto_tag_single(pool: &PgPool, resource_id: &str) -> Result<(), String>
     Ok(())
 }
 
-async fn match_resource_to_nodes(pool: &PgPool, resource_id: &str) -> Result<(), String> {
+async fn match_resource_to_nodes(pool: &PgPool, client: &reqwest::Client, resource_id: &str) -> Result<(), String> {
     let chunk_row = sqlx::query(
         "SELECT mc.content FROM mimir_chunks mc WHERE mc.resource_id = $1 LIMIT 1"
     )
@@ -621,7 +595,6 @@ async fn match_resource_to_nodes(pool: &PgPool, resource_id: &str) -> Result<(),
         return Ok(());
     }
 
-    let client = reqwest::Client::new();
     let mut matched = 0usize;
 
     for row in &leaf_rows {
@@ -629,7 +602,7 @@ async fn match_resource_to_nodes(pool: &PgPool, resource_id: &str) -> Result<(),
             Ok(v) => v,
             Err(_) => continue,
         };
-        match crate::mimir::match_node_impl(pool, &client, &node_id).await {
+        match crate::mimir_retrieval::match_node_impl(pool, client, &node_id).await {
             Ok(resources) if resources.iter().any(|r| r.id == resource_id) => matched += 1,
             Ok(_) => {}
             Err(e) => println!("⚠️  [orch] match_resource_to_nodes node {}: {}", node_id, e),

@@ -7,12 +7,19 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
-import { MimirResource } from '../types';
+import { MimirResource, Project, Tree } from '../types';
 import { useMimirContext } from '../contexts/MimirContext';
 import { validateOrLog, TreeNodeSchema } from '../lib/validators';
 import { z } from 'zod';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
+
+type TasksPayload = {
+  mastery_criteria: string;
+  exercises: string[];
+  notes: string;
+  completed: boolean;
+} | null;
 
 interface TreeNode {
   id: string;
@@ -22,8 +29,8 @@ interface TreeNode {
   title: string;
   description: string;
   progress: number; // 0–100
-  tasks: any;
-  resources: any[] | null;
+  tasks: TasksPayload;
+  resources: unknown[] | null;
   x: number | null;
   y: number | null;
   order_index: number;
@@ -39,6 +46,7 @@ interface TreeEdge {
 
 interface YggdrasilTreeProps {
   projectId: string;
+  externalSelectedNodeId?: string | null;
 }
 
 // ─── Branch type (tapered filled segments) ───────────────────────────────────
@@ -1413,7 +1421,7 @@ function NodePanel({ node, skillLocked, onSave, onClose, onAddChild, onDelete }:
 
 // ─── Main component ────────────────────────────────────────────────────────────
 
-export default function YggdrasilTree({ projectId }: YggdrasilTreeProps) {
+export default function YggdrasilTree({ projectId, externalSelectedNodeId }: YggdrasilTreeProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const { setMimirContext } = useMimirContext();
@@ -1440,10 +1448,10 @@ export default function YggdrasilTree({ projectId }: YggdrasilTreeProps) {
     [nodes, size.w, size.h],
   );
 
-  // Sync selected node to Mimir context
+  // Sync selected node + tree to Mimir context — projectName/treeName set by loadTree and persist
   useEffect(() => {
     setMimirContext({
-      treeId: selectedNode ? treeId : null,
+      treeId,  // always keep treeId once loaded so Mimir has tree context even without a node
       nodeId: selectedNode?.id ?? null,
       nodeTitle: selectedNode?.title ?? null,
     });
@@ -1476,6 +1484,13 @@ export default function YggdrasilTree({ projectId }: YggdrasilTreeProps) {
     setSelectedNode(null);
     loadTree();
   }, [projectId]);
+
+  // Sync external node selection (e.g. from gap panel)
+  useEffect(() => {
+    if (!externalSelectedNodeId) return;
+    const node = nodes.find(n => n.id === externalSelectedNodeId) ?? null;
+    if (node) setSelectedNode(node);
+  }, [externalSelectedNodeId, nodes]);
 
   // ── Canvas render — with pan/zoom transform ─────────────────────────────────
   useEffect(() => {
@@ -1551,21 +1566,31 @@ export default function YggdrasilTree({ projectId }: YggdrasilTreeProps) {
 
   async function loadTree() {
     try {
-      const trees = await invoke<any[]>('get_trees', { projectId });
+      const [trees, projects] = await Promise.all([
+        invoke<Tree[]>('get_trees', { projectId }),
+        invoke<Project[]>('get_projects'),
+      ]);
+      const project = projects.find(p => p.id === projectId);
+      const pName = project?.name ?? null;
+
       let id: string;
+      let tName: string;
 
       if (trees.length === 0) {
-        const newTree = await invoke<any>('create_tree', { projectId, name: 'My Skill Tree' });
+        const newTree = await invoke<Tree>('create_tree', { projectId, name: 'My Skill Tree' });
         id = newTree.id;
+        tName = newTree.name;
         await invoke('create_tree_node', {
           treeId: id, parentId: null, type: 'trunk',
           title: 'Start Here', description: 'Root of your skill tree',
         });
       } else {
         id = trees[0].id;
+        tName = trees[0].name;
       }
 
       setTreeId(id);
+      setMimirContext({ treeId: id, projectName: pName, treeName: tName });
       await loadTreeContents(id);
     } catch (err) {
       console.error('Failed to load tree:', err);

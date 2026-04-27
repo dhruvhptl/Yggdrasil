@@ -1,6 +1,7 @@
 // src/pages/ResumePage.tsx
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { warn } from '../lib/logger';
 import { useNavigate } from "react-router-dom";
 import {
   FileText, Upload, Loader2, ExternalLink, TreePine, Link2, Unlink,
@@ -169,7 +170,7 @@ function EmptyState({ onParsed }: { onParsed: (r: ResumeProfile) => void }) {
       });
       onParsed(result);
       // Sync resume skills to universal skills (fire-and-forget)
-      invoke('sync_skills_from_resume').catch(console.warn);
+      invoke('sync_skills_from_resume').catch(warn);
     } catch (e) {
       setError(String(e));
     } finally {

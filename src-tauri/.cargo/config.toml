@@ -4,3 +4,4 @@
 # in the IDE's environment.
 [env]
 SQLX_OFFLINE = "true"
+

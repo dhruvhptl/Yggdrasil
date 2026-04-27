@@ -90,13 +90,14 @@ This will:
 
 ## Features
 
-- **Skill Trees** — AI generates learning trees from project PRDs or GitHub repos (two-stage: concept graph → outline → per-skill checkpoint expansion)
-- **Checkpoints** — Track progress with mastery criteria, exercises, and notes
+- **Skill Trees** — AI generates learning trees from project PRDs or GitHub repos (two-stage: concept graph → outline → per-skill checkpoint expansion); optional paper/arXiv context for theory-grounded trees
+- **Tree Versioning** — Regenerate trees against updated repos; diff-based carry-over preserves notes and completion state by stable concept identity
+- **Checkpoints** — Track progress with mastery criteria, exercises, and notes; leaf nodes have four visual states (dormant / budding / growing / bloomed) with animated pulse, progress ring, orbiting sparkles
 - **Daily Matrix** — Eisenhower 2x2 triage for daily learning priorities
-- **Resource Library** — Ingest URLs, PDFs, YouTube playlists; auto-tag; track completion; auto-match to tree nodes via pgvector
-- **Mimir Chat** — RAG assistant grounded in your personal resource library, with section + page citations
+- **Resource Library** — Ingest URLs, PDFs, YouTube playlists; auto-tag; track completion; auto-match to tree nodes via pgvector; resource gap finder surfaces resources for unmastered checkpoints
+- **Mimir Chat** — GraphRAG + hybrid retrieval (cosine + FTS) assistant grounded in your personal resource library; tree-aware system prompt with phase breakdown and progress; checkpoint-tutor mode vs. tree-overview mode; section + page citations; persistent session memory per checkpoint
 - **Work Tracker** — Co-op experience with D3 galaxy visualization and AI skill extraction
 - **Job Tracker** — Kanban board with JD analysis and skill demand analytics
 - **Ideas** — Scratchpad with tagging, pinning, and promote-to-project
 - **Resume** — AI-parsed resume that seeds your skill inventory
-- **Universal Skill Tree** — D3 force galaxy aggregating skills from all sources with gap analysis
+- **Universal Skill Tree** — Canvas-rendered radial tree with domain classification, skill dependencies, and gap analysis aggregating skills from all sources

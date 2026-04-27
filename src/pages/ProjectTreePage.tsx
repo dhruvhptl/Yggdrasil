@@ -1,11 +1,41 @@
 // src/pages/ProjectTreePage.tsx
 import { useParams, useNavigate } from 'react-router-dom';
 import YggdrasilTree from '../components/YggdrasilTree';
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { Tree, Project } from '../types';
+import { listen } from '@tauri-apps/api/event';
 import { exportTreeAsZip } from '../utils/exportTree';
 
 type InputMode = 'prd' | 'github';
+
+interface TreeRegenerationRecord {
+  id: string;
+  oldTreeId: string | null;
+  newTreeId: string | null;
+  regeneratedAt: string;
+  nodesCarried: number;
+  nodesDropped: number;
+}
+
+interface CheckpointGap {
+  nodeId: string;
+  title: string;
+  description: string;
+  phaseName: string;
+  skillName: string;
+  progress: number;
+  isLocked: boolean;
+}
+
+interface TreeResourceGaps {
+  treeId: string;
+  totalCheckpoints: number;
+  matchedCheckpoints: number;
+  unmatchedCheckpoints: number;
+  coveragePercent: number;
+  gaps: CheckpointGap[];
+}
 
 export default function ProjectTreePage() {
   const { projectId } = useParams<{ projectId: string }>();
@@ -25,6 +55,19 @@ export default function ProjectTreePage() {
   const [prdOpen, setPrdOpen] = useState(true);
   const [hasTree, setHasTree] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
+  const [treeVersion, setTreeVersion] = useState<number | null>(null);
+  const [activeTreeId, setActiveTreeId] = useState<string | null>(null);
+  const [isRegenerating, setIsRegenerating] = useState(false);
+  const [showRegenConfirm, setShowRegenConfirm] = useState(false);
+  const [regenToast, setRegenToast] = useState<{ carried: number; dropped: number } | null>(null);
+  const [showVersionHistory, setShowVersionHistory] = useState(false);
+  const [versionHistory, setVersionHistory] = useState<TreeRegenerationRecord[]>([]);
+  const versionBadgeRef = useRef<HTMLButtonElement>(null);
+  const [showCoveragePanel, setShowCoveragePanel] = useState(false);
+  const [coverageGaps, setCoverageGaps] = useState<TreeResourceGaps | null>(null);
+  const [isCoverageLoading, setIsCoverageLoading] = useState(false);
+  const [matchingNodeId, setMatchingNodeId] = useState<string | null>(null);
+  const [externalSelectedNodeId, setExternalSelectedNodeId] = useState<string | null>(null);
   const pdfInputRef = React.useRef<HTMLInputElement>(null);
   const paperInputRef = React.useRef<HTMLInputElement>(null);
 
@@ -33,15 +76,23 @@ export default function ProjectTreePage() {
       invoke<{ treeId: string; treeCount: number } | null>(
         'get_active_tree_for_project',
         { projectId }
-      ).then(summary => {
+      ).then(async summary => {
         setHasTree(summary !== null);
+        if (summary?.treeId) {
+          setActiveTreeId(summary.treeId);
+          // Load version from trees table
+          try {
+            const trees = await invoke<Tree[]>('get_trees', { projectId });
+            const active = trees.find(t => t.id === summary.treeId);
+            if (active) setTreeVersion(active.version ?? 1);
+          } catch { /* non-fatal */ }
+        }
       }).catch(() => {
-        // fallback: just check if any tree exists
-        invoke<any[]>('get_trees', { projectId }).then(trees => setHasTree(trees.length > 0));
+        invoke<Tree[]>('get_trees', { projectId }).then(trees => setHasTree(trees.length > 0));
       });
 
-      invoke<any[]>('get_projects').then(projects => {
-        const project = projects.find((p: any) => p.id === projectId);
+      invoke<Project[]>('get_projects').then(projects => {
+        const project = projects.find(p => p.id === projectId);
         if (project) setProjectName(project.name);
       });
     }
@@ -145,6 +196,97 @@ export default function ProjectTreePage() {
       setIsGenerating(false);
     }
   };
+
+  const handleRegenerate = async () => {
+    if (!projectId || isRegenerating) return;
+    setShowRegenConfirm(false);
+    setIsRegenerating(true);
+    try {
+      const result = await invoke<{ treeId: string; version: number; nodesCarried: number; nodesDropped: number }>(
+        'regenerate_tree',
+        {
+          projectId,
+          useGithub: inputMode === 'github',
+          githubUrl: inputMode === 'github' ? githubUrl : null,
+          prdText: inputMode === 'prd' ? prdText : null,
+          paperUrl: paperUrl.trim() || null,
+          paperPdf: paperPdfBase64,
+        }
+      );
+      setTreeKey(k => k + 1);
+      setPrdOpen(false);
+      setRegenToast({ carried: result.nodesCarried, dropped: result.nodesDropped });
+      setTimeout(() => setRegenToast(null), 6000);
+    } catch (error) {
+      alert(`Regeneration failed: ${error}`);
+    } finally {
+      setIsRegenerating(false);
+    }
+  };
+
+  const handleShowVersionHistory = async () => {
+    if (!activeTreeId) return;
+    setShowVersionHistory(v => !v);
+    if (!showVersionHistory && activeTreeId) {
+      try {
+        const records = await invoke<TreeRegenerationRecord[]>('get_tree_regenerations', { treeId: activeTreeId });
+        setVersionHistory(records);
+      } catch { /* non-fatal */ }
+    }
+  };
+
+  // Listen for ygg-open-coverage from Mimir suggestion chips
+  useEffect(() => {
+    if (!activeTreeId) return;
+    let unlisten: (() => void) | undefined;
+    listen<{ treeId: string | null }>('ygg-open-coverage', (event) => {
+      const tid = event.payload?.treeId ?? activeTreeId;
+      if (tid !== activeTreeId) return;
+      setShowCoveragePanel(true);
+      loadCoverageGaps(activeTreeId);
+    }).then(fn => { unlisten = fn; });
+    return () => { unlisten?.(); };
+  }, [activeTreeId]); // loadCoverageGaps excluded intentionally — stable ref
+
+  const loadCoverageGaps = useCallback(async (treeId: string) => {
+    setIsCoverageLoading(true);
+    try {
+      const gaps = await invoke<TreeResourceGaps>('get_tree_resource_gaps', { treeId });
+      setCoverageGaps(gaps);
+    } catch { /* non-fatal */ }
+    finally { setIsCoverageLoading(false); }
+  }, []);
+
+  const handleOpenCoverage = useCallback(async () => {
+    if (!activeTreeId) return;
+    setShowCoveragePanel(true);
+    await loadCoverageGaps(activeTreeId);
+  }, [activeTreeId, loadCoverageGaps]);
+
+  const handleFindMatches = useCallback(async (nodeId: string) => {
+    if (!activeTreeId) return;
+    setMatchingNodeId(nodeId);
+    try {
+      await invoke('match_node_to_resources', { nodeId, treeId: activeTreeId });
+      await loadCoverageGaps(activeTreeId);
+    } catch { /* non-fatal */ }
+    finally { setMatchingNodeId(null); }
+  }, [activeTreeId, loadCoverageGaps]);
+
+  const handleFindAllMatches = useCallback(async () => {
+    if (!activeTreeId) return;
+    setMatchingNodeId('all');
+    try {
+      await invoke('enqueue_rematch', { treeId: activeTreeId });
+      const unlisten = await listen('ygg-rematch-complete', async () => {
+        unlisten();
+        setMatchingNodeId(null);
+        await loadCoverageGaps(activeTreeId);
+      });
+    } catch {
+      setMatchingNodeId(null);
+    }
+  }, [activeTreeId, loadCoverageGaps]);
 
   if (!projectId) {
     return <div className="p-6 text-slate-300">Project not found</div>;
@@ -429,9 +571,293 @@ export default function ProjectTreePage() {
               onMouseLeave={e => { e.currentTarget.style.color = '#64748b'; e.currentTarget.style.borderColor = '#1e293b'; }}
             >{isExporting ? 'Exporting…' : 'Export ↓'}</button>
           )}
+          {hasTree && (
+            <button
+              onClick={showCoveragePanel ? () => setShowCoveragePanel(false) : handleOpenCoverage}
+              style={{
+                ...floatBtn,
+                color: showCoveragePanel ? '#6ee7b7' : '#64748b',
+                borderColor: showCoveragePanel ? '#1d4e3a' : '#1e293b',
+              }}
+              onMouseEnter={e => { e.currentTarget.style.color = '#94a3b8'; e.currentTarget.style.borderColor = '#334155'; }}
+              onMouseLeave={e => {
+                e.currentTarget.style.color = showCoveragePanel ? '#6ee7b7' : '#64748b';
+                e.currentTarget.style.borderColor = showCoveragePanel ? '#1d4e3a' : '#1e293b';
+              }}
+              title="Show resource coverage for this tree"
+            >Coverage</button>
+          )}
+          {hasTree && (
+            <button
+              onClick={() => setShowRegenConfirm(true)}
+              disabled={isRegenerating || !canSubmit}
+              style={{ ...floatBtn, opacity: (isRegenerating || !canSubmit) ? 0.45 : 1, color: isRegenerating ? '#64748b' : '#64748b' }}
+              onMouseEnter={e => { if (!isRegenerating && canSubmit) { e.currentTarget.style.color = '#94a3b8'; e.currentTarget.style.borderColor = '#334155'; } }}
+              onMouseLeave={e => { e.currentTarget.style.color = '#64748b'; e.currentTarget.style.borderColor = '#1e293b'; }}
+              title="Regenerate tree, carrying over your notes and progress"
+            >
+              {isRegenerating ? (
+                <>
+                  <svg style={{ width: 11, height: 11, animation: 'spin 1s linear infinite' }} viewBox="0 0 24 24" fill="none">
+                    <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25"/>
+                    <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round"/>
+                  </svg>
+                  Regenerating…
+                </>
+              ) : '↺ Regenerate'}
+            </button>
+          )}
+          {hasTree && treeVersion != null && (
+            <div style={{ position: 'relative' }}>
+              <button
+                ref={versionBadgeRef}
+                onClick={handleShowVersionHistory}
+                style={{ ...floatBtn, color: '#475569', fontSize: 11 }}
+                onMouseEnter={e => { e.currentTarget.style.color = '#94a3b8'; e.currentTarget.style.borderColor = '#334155'; }}
+                onMouseLeave={e => { e.currentTarget.style.color = '#475569'; e.currentTarget.style.borderColor = '#1e293b'; }}
+                title="View regeneration history"
+              >v{treeVersion}</button>
+              {showVersionHistory && (
+                <div style={{
+                  position: 'absolute', top: '100%', left: 0, marginTop: 6, zIndex: 50,
+                  background: 'rgba(15, 23, 42, 0.97)', border: '1px solid #1e293b',
+                  borderRadius: 8, padding: 12, minWidth: 260, boxShadow: '0 8px 24px rgba(0,0,0,0.6)',
+                }}>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: '#64748b', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                    Regeneration History
+                  </div>
+                  {versionHistory.length === 0 ? (
+                    <div style={{ fontSize: 12, color: '#475569' }}>No regenerations yet.</div>
+                  ) : versionHistory.map(r => (
+                    <div key={r.id} style={{ marginBottom: 8, paddingBottom: 8, borderBottom: '1px solid #1e293b' }}>
+                      <div style={{ fontSize: 12, color: '#94a3b8' }}>
+                        {new Date(r.regeneratedAt).toLocaleString()}
+                      </div>
+                      <div style={{ fontSize: 11, color: '#6ee7b7', marginTop: 2 }}>
+                        {r.nodesCarried} carried
+                        {r.nodesDropped > 0 && (
+                          <span style={{ color: '#f59e0b', marginLeft: 6 }}>{r.nodesDropped} lost</span>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                  <button
+                    onClick={() => setShowVersionHistory(false)}
+                    style={{ marginTop: 4, fontSize: 11, color: '#475569', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}
+                  >Close</button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
-        <YggdrasilTree key={treeKey} projectId={projectId} />
+        <YggdrasilTree key={treeKey} projectId={projectId} externalSelectedNodeId={externalSelectedNodeId} />
+
+        {/* Coverage side panel */}
+        {showCoveragePanel && (
+          <div style={{
+            position: 'absolute', top: 0, right: 0, bottom: 0, width: 300,
+            background: 'rgba(10, 15, 30, 0.97)', borderLeft: '1px solid #1e293b',
+            zIndex: 40, display: 'flex', flexDirection: 'column', overflow: 'hidden',
+          }}>
+            {/* Panel header */}
+            <div style={{ padding: '12px 14px 10px', borderBottom: '1px solid #1e293b', flexShrink: 0 }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+                <span style={{ fontSize: 12, fontWeight: 600, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                  Resource Coverage
+                </span>
+                <button
+                  onClick={() => setShowCoveragePanel(false)}
+                  style={{ background: 'none', border: 'none', color: '#475569', cursor: 'pointer', fontSize: 16, lineHeight: 1, padding: '0 2px' }}
+                >×</button>
+              </div>
+
+              {isCoverageLoading && !coverageGaps ? (
+                <div style={{ fontSize: 11, color: '#475569' }}>Loading…</div>
+              ) : coverageGaps ? (() => {
+                const pct = coverageGaps.coveragePercent;
+                const barColor = pct >= 70 ? '#10b981' : pct >= 40 ? '#f59e0b' : '#ef4444';
+                const textColor = pct >= 70 ? '#6ee7b7' : pct >= 40 ? '#fcd34d' : '#fca5a5';
+                return (
+                  <>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                      <span style={{ fontSize: 11, color: '#64748b' }}>
+                        {coverageGaps.matchedCheckpoints}/{coverageGaps.totalCheckpoints} checkpoints
+                      </span>
+                      <span style={{ fontSize: 12, fontWeight: 600, color: textColor }}>
+                        {Math.round(pct)}%
+                      </span>
+                    </div>
+                    <div style={{ height: 5, borderRadius: 3, background: '#1e293b', overflow: 'hidden' }}>
+                      <div style={{ width: `${pct}%`, height: '100%', background: barColor, borderRadius: 3, transition: 'width 0.4s ease' }} />
+                    </div>
+                    <div style={{ display: 'flex', gap: 6, marginTop: 10 }}>
+                      <button
+                        onClick={handleFindAllMatches}
+                        disabled={matchingNodeId === 'all'}
+                        style={{
+                          flex: 1, padding: '5px 0', borderRadius: 5, fontSize: 11,
+                          background: matchingNodeId === 'all' ? 'rgba(16,185,129,0.05)' : 'rgba(16,185,129,0.1)',
+                          border: '1px solid rgba(16,185,129,0.25)',
+                          color: matchingNodeId === 'all' ? '#475569' : '#6ee7b7',
+                          cursor: matchingNodeId === 'all' ? 'not-allowed' : 'pointer',
+                          fontFamily: 'inherit', transition: 'background 0.15s',
+                        }}
+                      >
+                        {matchingNodeId === 'all' ? 'Matching…' : 'Find all matches'}
+                      </button>
+                      <button
+                        onClick={() => activeTreeId && loadCoverageGaps(activeTreeId)}
+                        disabled={isCoverageLoading}
+                        style={{
+                          padding: '5px 9px', borderRadius: 5, fontSize: 11,
+                          background: 'rgba(30,41,59,0.5)', border: '1px solid #1e293b',
+                          color: isCoverageLoading ? '#475569' : '#64748b',
+                          cursor: isCoverageLoading ? 'not-allowed' : 'pointer',
+                          fontFamily: 'inherit',
+                        }}
+                        title="Refresh"
+                      >↻</button>
+                    </div>
+                  </>
+                );
+              })() : null}
+            </div>
+
+            {/* Gap list */}
+            <div style={{ flex: 1, overflowY: 'auto', padding: '8px 0' }}>
+              {!coverageGaps || coverageGaps.gaps.length === 0 ? (
+                <div style={{ padding: '24px 14px', textAlign: 'center', fontSize: 12, color: '#475569' }}>
+                  {coverageGaps ? '🎉 All checkpoints have matched resources.' : ''}
+                </div>
+              ) : (() => {
+                // Group by phase
+                const byPhase = new Map<string, CheckpointGap[]>();
+                for (const gap of coverageGaps.gaps) {
+                  if (!byPhase.has(gap.phaseName)) byPhase.set(gap.phaseName, []);
+                  byPhase.get(gap.phaseName)!.push(gap);
+                }
+                return Array.from(byPhase.entries()).map(([phase, gaps]) => (
+                  <div key={phase}>
+                    <div style={{
+                      padding: '6px 14px 4px', fontSize: 10, fontWeight: 600,
+                      color: '#475569', textTransform: 'uppercase', letterSpacing: '0.06em',
+                    }}>{phase}</div>
+                    {gaps.map(gap => (
+                      <div
+                        key={gap.nodeId}
+                        style={{
+                          padding: '7px 14px',
+                          borderBottom: '1px solid rgba(30,41,59,0.5)',
+                          cursor: 'pointer',
+                          background: externalSelectedNodeId === gap.nodeId ? 'rgba(16,185,129,0.07)' : 'transparent',
+                          transition: 'background 0.12s',
+                        }}
+                        onClick={() => setExternalSelectedNodeId(gap.nodeId)}
+                        onMouseEnter={e => { if (externalSelectedNodeId !== gap.nodeId) (e.currentTarget as HTMLDivElement).style.background = 'rgba(30,41,59,0.4)'; }}
+                        onMouseLeave={e => { (e.currentTarget as HTMLDivElement).style.background = externalSelectedNodeId === gap.nodeId ? 'rgba(16,185,129,0.07)' : 'transparent'; }}
+                      >
+                        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 6 }}>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontSize: 12, color: gap.isLocked ? '#475569' : '#e2e8f0', fontWeight: 500, lineHeight: 1.3, marginBottom: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {gap.isLocked && <span style={{ marginRight: 4, fontSize: 10 }}>🔒</span>}
+                              {gap.title}
+                            </div>
+                            <div style={{ fontSize: 10, color: '#475569' }}>
+                              {gap.skillName}
+                              {gap.progress > 0 && (
+                                <span style={{ marginLeft: 6, color: '#64748b' }}>{gap.progress}%</span>
+                              )}
+                            </div>
+                          </div>
+                          <button
+                            onClick={e => { e.stopPropagation(); handleFindMatches(gap.nodeId); }}
+                            disabled={matchingNodeId === gap.nodeId}
+                            style={{
+                              flexShrink: 0, padding: '3px 7px', borderRadius: 4, fontSize: 10,
+                              background: 'rgba(16,185,129,0.08)', border: '1px solid rgba(16,185,129,0.2)',
+                              color: matchingNodeId === gap.nodeId ? '#475569' : '#6ee7b7',
+                              cursor: matchingNodeId === gap.nodeId ? 'not-allowed' : 'pointer',
+                              fontFamily: 'inherit', whiteSpace: 'nowrap',
+                            }}
+                          >
+                            {matchingNodeId === gap.nodeId ? '…' : 'Find'}
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ));
+              })()}
+            </div>
+          </div>
+        )}
+
+        {/* Regenerate confirmation dialog */}
+        {showRegenConfirm && (
+          <div style={{
+            position: 'absolute', inset: 0, zIndex: 100,
+            background: 'rgba(1,2,8,0.75)', backdropFilter: 'blur(4px)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}>
+            <div style={{
+              background: '#0f172a', border: '1px solid #1e293b', borderRadius: 10,
+              padding: 24, maxWidth: 360, width: '90%',
+              boxShadow: '0 16px 48px rgba(0,0,0,0.8)',
+            }}>
+              <div style={{ fontSize: 14, fontWeight: 600, color: '#e2e8f0', marginBottom: 8 }}>
+                Regenerate tree?
+              </div>
+              <div style={{ fontSize: 12, color: '#94a3b8', lineHeight: 1.6, marginBottom: 20 }}>
+                A new tree will be generated from your current {inputMode === 'github' ? 'GitHub repo' : 'PRD'}.
+                Your notes and checkpoint progress will be carried over where possible.
+                The old tree will be archived.
+              </div>
+              <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+                <button
+                  onClick={() => setShowRegenConfirm(false)}
+                  style={{
+                    padding: '6px 14px', borderRadius: 6, fontSize: 12,
+                    background: 'transparent', border: '1px solid #334155',
+                    color: '#64748b', cursor: 'pointer', fontFamily: 'inherit',
+                  }}
+                >Cancel</button>
+                <button
+                  onClick={handleRegenerate}
+                  style={{
+                    padding: '6px 14px', borderRadius: 6, fontSize: 12,
+                    background: '#059669', border: '1px solid #10b981',
+                    color: '#fff', cursor: 'pointer', fontFamily: 'inherit', fontWeight: 500,
+                  }}
+                >Regenerate</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Post-regeneration toast */}
+        {regenToast && (
+          <div style={{
+            position: 'absolute', bottom: 20, left: '50%', transform: 'translateX(-50%)',
+            zIndex: 80, background: 'rgba(15,23,42,0.96)', border: '1px solid #1e293b',
+            borderRadius: 8, padding: '10px 18px', display: 'flex', alignItems: 'center', gap: 10,
+            boxShadow: '0 8px 24px rgba(0,0,0,0.6)', fontSize: 12, color: '#e2e8f0',
+            whiteSpace: 'nowrap',
+          }}>
+            <svg style={{ width: 14, height: 14, color: '#6ee7b7', flexShrink: 0 }} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="20 6 9 17 4 12"/>
+            </svg>
+            Tree updated —{' '}
+            <span style={{ color: '#6ee7b7' }}>{regenToast.carried} checkpoints carried over</span>
+            {regenToast.dropped > 0 && (
+              <span style={{ color: '#f59e0b' }}>, {regenToast.dropped} lost</span>
+            )}
+            <button
+              onClick={() => setRegenToast(null)}
+              style={{ background: 'none', border: 'none', color: '#475569', cursor: 'pointer', fontSize: 14, lineHeight: 1, padding: '0 2px', marginLeft: 4 }}
+            >×</button>
+          </div>
+        )}
       </main>
     </div>
   );

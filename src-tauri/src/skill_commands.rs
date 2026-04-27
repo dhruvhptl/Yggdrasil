@@ -564,12 +564,13 @@ pub async fn get_skill_gaps(
 
 #[tauri::command]
 pub async fn infer_skill_dependencies(
+    client: State<'_, reqwest::Client>,
     database: State<'_, Database>,
 ) -> Result<usize, String> {
-    infer_skill_deps_inner(&database.pool).await
+    infer_skill_deps_inner(&*client, &database.pool).await
 }
 
-pub(crate) async fn infer_skill_deps_inner(pool: &PgPool) -> Result<usize, String> {
+pub(crate) async fn infer_skill_deps_inner(client: &reqwest::Client, pool: &PgPool) -> Result<usize, String> {
     let rows = sqlx::query("SELECT id, name FROM universal_skills ORDER BY name")
         .fetch_all(pool)
         .await
@@ -606,8 +607,6 @@ pub(crate) async fn infer_skill_deps_inner(pool: &PgPool) -> Result<usize, Strin
     let lower_to_id: std::collections::HashMap<String, String> = name_to_id.iter()
         .map(|(name, id)| (name.to_lowercase(), id.clone()))
         .collect();
-
-    let client = reqwest::Client::new();
 
     const BATCH_SIZE: usize = 30;
     let batches: Vec<&[String]> = skill_names.chunks(BATCH_SIZE).collect();
@@ -886,10 +885,10 @@ pub struct ClassificationResult {
 
 #[tauri::command]
 pub async fn classify_skill_domains(
+    client: State<'_, reqwest::Client>,
     database: State<'_, Database>,
 ) -> Result<ClassificationResult, String> {
     let api_key = std::env::var("GROQ_API_KEY").map_err(|_| "GROQ_API_KEY not set".to_string())?;
-    let client = reqwest::Client::new();
 
     // Load all domains with descriptions
     let domain_rows = sqlx::query(
@@ -909,6 +908,11 @@ pub async fn classify_skill_domains(
         let desc: String = r.try_get("description").unwrap_or_default();
         (id, name, desc)
     }).collect();
+
+    // Build a set of valid IDs for post-LLM validation — prevents FK violations
+    // when the model hallucinates an ID not present in skill_domains.
+    let valid_domain_ids: std::collections::HashSet<&str> =
+        domains.iter().map(|(id, _, _)| id.as_str()).collect();
 
     // One line per domain: "  Machine Learning (dom-ml): algorithms that learn from data..."
     let domain_list: String = domains.iter()
@@ -1035,6 +1039,13 @@ pub async fn classify_skill_domains(
         );
 
         for (skill_id, domain_id) in &mapping {
+            // Reject hallucinated IDs before they hit the FK constraint
+            if !valid_domain_ids.contains(domain_id.as_str()) {
+                eprintln!("⚠️ LLM returned unknown domain_id '{}' for skill {} — skipping", domain_id, skill_id);
+                failed += 1;
+                continue;
+            }
+
             let res = sqlx::query(
                 "UPDATE universal_skills
                  SET domain_id = $1, status = 'active', review_needed = false, last_updated = NOW()
@@ -1088,37 +1099,45 @@ pub async fn reset_skill_domains(
     Ok(count)
 }
 
-#[tauri::command]
-pub async fn backfill_skill_slugs(
-    database: State<'_, Database>,
-) -> Result<usize, String> {
+// ─── Concept slug bridge ──────────────────────────────────────────────────────
+
+/// Copy concept_slug from tree_nodes onto universal_skills where the skill name
+/// matches the node title (case-insensitive, ILIKE).
+/// Called from on_tree_generated so newly generated trees immediately enrich
+/// the skill graph with concept identities from the concept graph.
+pub async fn sync_concept_slugs_inner(pool: &PgPool) -> Result<usize, String> {
+    // Find skills that don't yet have a concept_slug but whose name matches
+    // a tree_node that does.
     let rows = sqlx::query(
-        "SELECT id, name FROM universal_skills WHERE concept_slug IS NULL"
+        "SELECT DISTINCT ON (us.id) us.id AS skill_id, tn.concept_slug
+         FROM universal_skills us
+         JOIN tree_nodes tn
+           ON tn.title ILIKE us.name
+          AND tn.concept_slug IS NOT NULL
+         WHERE us.concept_slug IS NULL
+         ORDER BY us.id, tn.concept_slug"
     )
-    .fetch_all(&database.pool)
+    .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
 
-    let mut updated = 0;
+    let mut updated = 0usize;
     for row in &rows {
-        let id: String = row.try_get("id").map_err(|e| e.to_string())?;
-        let name: String = row.try_get("name").map_err(|e| e.to_string())?;
-        let normalized = normalize_skill_name(&name);
-        let slug = if normalized.is_empty() {
-            name.to_lowercase().replace(' ', "-")
-        } else {
-            normalized.to_lowercase().replace(' ', "-")
-        };
+        let skill_id: String = row.try_get("skill_id").map_err(|e| e.to_string())?;
+        let slug: String = row.try_get("concept_slug").map_err(|e| e.to_string())?;
         sqlx::query(
             "UPDATE universal_skills SET concept_slug = $1 WHERE id = $2 AND concept_slug IS NULL"
         )
         .bind(&slug)
-        .bind(&id)
-        .execute(&database.pool)
+        .bind(&skill_id)
+        .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
         updated += 1;
     }
-    println!("🔤 Backfilled concept_slug for {} skills", updated);
+
+    if updated > 0 {
+        println!("🔖 sync_concept_slugs_inner: bridged concept_slug to {} skills", updated);
+    }
     Ok(updated)
 }

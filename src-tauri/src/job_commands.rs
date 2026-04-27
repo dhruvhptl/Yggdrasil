@@ -102,6 +102,7 @@ fn row_to_job(r: &sqlx::postgres::PgRow) -> Result<JobApplication, String> {
 // Internal: call Groq and parse skill extraction response.
 // Returns (required_skills, nicetohave_skills).
 async fn do_extract_skills(
+    client: &reqwest::Client,
     job_id: &str,
     jd_text: &str,
     pool: &sqlx::PgPool,
@@ -116,7 +117,6 @@ async fn do_extract_skills(
 
     let user_prompt = format!("Job Description: {}", jd_text);
 
-    let client = reqwest::Client::new();
     let response = client
         .post(GROQ_API_URL)
         .header("Authorization", format!("Bearer {}", api_key))
@@ -326,6 +326,7 @@ pub async fn delete_job(
 pub async fn save_job_description(
     id: String,
     job_description: String,
+    client: State<'_, reqwest::Client>,
     database: State<'_, Database>,
 ) -> Result<Vec<JobSkill>, String> {
     sqlx::query("UPDATE job_applications SET job_description = $1 WHERE id = $2")
@@ -335,12 +336,13 @@ pub async fn save_job_description(
         .await
         .map_err(|e| e.to_string())?;
 
-    do_extract_skills(&id, &job_description, &database.pool).await
+    do_extract_skills(&*client, &id, &job_description, &database.pool).await
 }
 
 #[tauri::command]
 pub async fn extract_job_skills(
     id: String,
+    client: State<'_, reqwest::Client>,
     database: State<'_, Database>,
 ) -> Result<Vec<JobSkill>, String> {
     let row = sqlx::query("SELECT job_description FROM job_applications WHERE id = $1")
@@ -352,7 +354,7 @@ pub async fn extract_job_skills(
     let jd: Option<String> = row.try_get("job_description").map_err(|e| e.to_string())?;
     let jd_text = jd.ok_or_else(|| "No job description saved yet".to_string())?;
 
-    do_extract_skills(&id, &jd_text, &database.pool).await
+    do_extract_skills(&*client, &id, &jd_text, &database.pool).await
 }
 
 #[tauri::command]
@@ -494,6 +496,7 @@ pub struct ReextractResult {
 
 #[tauri::command]
 pub async fn reextract_all_skills(
+    client: State<'_, reqwest::Client>,
     database: State<'_, Database>,
 ) -> Result<ReextractResult, String> {
     let rows = sqlx::query(
@@ -536,7 +539,7 @@ pub async fn reextract_all_skills(
             continue;
         }
 
-        match do_extract_skills(&job_id, &jd, &database.pool).await {
+        match do_extract_skills(&*client, &job_id, &jd, &database.pool).await {
             Ok(_) => processed += 1,
             Err(e) => {
                 failed += 1;

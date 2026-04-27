@@ -5,6 +5,7 @@ import { listen } from '@tauri-apps/api/event';
 import { Trash2, Link, FileText, Globe, BookOpen, X, RefreshCw, CheckCircle2, Minus, XCircle, Filter, Search, ChevronDown, ChevronRight, Play, Tag, Wand2, Check } from 'lucide-react';
 import { MimirResource } from '../types';
 import { validateOrLog, MimirResourceSchema } from '../lib/validators';
+import { log } from '../lib/logger';
 import { z } from 'zod';
 
 type AddMode = 'url' | 'text' | 'pdf';
@@ -568,22 +569,22 @@ export default function ResourcesPage() {
         text: `YouTube Playlist: ${playlistData.playlistTitle}\n\nURL: ${playlistData.playlistUrl}`,
         title: playlistData.playlistTitle,
       });
-      console.log('[playlist] parent created:', parentId);
+      log('[playlist] parent created:', parentId);
     } catch (err) {
       const msg = String(err);
-      console.log('[playlist] parent create error:', msg);
+      log('[playlist] parent create error:', msg);
       if (msg.startsWith('DUPLICATE:')) {
         const existing = resources.find(r => r.title === playlistData.playlistTitle);
         parentId = existing?.id;
-        console.log('[playlist] found existing parent:', parentId);
+        log('[playlist] found existing parent:', parentId);
       }
     }
 
-    console.log('[playlist] parentId captured:', parentId);
+    log('[playlist] parentId captured:', parentId);
 
     for (let i = 0; i < selected.length; i++) {
       const video = selected[i];
-      console.log(`[playlist] ingesting video ${i+1} with parent_id:`, parentId);
+      log(`[playlist] ingesting video ${i+1} with parent_id:`, parentId);
       setPlaylistProgress({ current: i + 1, total: selected.length, currentTitle: video.title, skipping: false });
       try {
         await invoke('ingest_mimir_url', {

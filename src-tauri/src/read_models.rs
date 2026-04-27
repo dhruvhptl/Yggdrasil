@@ -394,6 +394,148 @@ pub async fn get_project_tree_summary(
     })
 }
 
+// ─── TreeResourceGaps ────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointGap {
+    pub node_id: String,
+    pub title: String,
+    pub description: String,
+    pub phase_name: String,
+    pub skill_name: String,
+    pub progress: i32,
+    pub is_locked: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TreeResourceGaps {
+    pub tree_id: String,
+    pub total_checkpoints: i32,
+    pub matched_checkpoints: i32,
+    pub unmatched_checkpoints: i32,
+    pub coverage_percent: f32,
+    pub gaps: Vec<CheckpointGap>,
+}
+
+#[tauri::command]
+pub async fn get_tree_resource_gaps(
+    tree_id: String,
+    database: State<'_, Database>,
+) -> Result<TreeResourceGaps, String> {
+    // Fetch all leaf nodes with their parent chain (skill→phase) via two joins.
+    // LEFT JOIN mimir_node_links to detect whether any resource is matched.
+    let rows = sqlx::query(
+        "SELECT
+             lf.id          AS node_id,
+             lf.title       AS title,
+             COALESCE(lf.description, '') AS description,
+             COALESCE(lf.progress, 0)     AS progress,
+             COALESCE(lf.is_locked, false) AS is_locked,
+             lf.order_index               AS leaf_order,
+             br.title       AS skill_name,
+             br.order_index AS skill_order,
+             ph.title       AS phase_name,
+             ph.order_index AS phase_order,
+             COUNT(mnl.id)  AS link_count
+         FROM tree_nodes lf
+         JOIN tree_nodes br ON br.id = lf.parent_id AND br.tree_id = lf.tree_id
+         JOIN tree_nodes ph ON ph.id = br.parent_id AND ph.tree_id = lf.tree_id
+         LEFT JOIN mimir_node_links mnl ON mnl.node_id = lf.id
+         WHERE lf.tree_id = $1 AND lf.type = 'leaf'
+         GROUP BY lf.id, lf.title, lf.description, lf.progress, lf.is_locked, lf.order_index,
+                  br.title, br.order_index,
+                  ph.title, ph.order_index"
+    )
+    .bind(&tree_id)
+    .fetch_all(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let total_checkpoints = rows.len() as i32;
+    let mut matched_checkpoints = 0i32;
+    let mut gaps: Vec<CheckpointGap> = Vec::new();
+
+    struct RawRow {
+        node_id: String,
+        title: String,
+        description: String,
+        progress: i32,
+        is_locked: bool,
+        leaf_order: i32,
+        skill_name: String,
+        skill_order: i32,
+        phase_name: String,
+        phase_order: i32,
+        link_count: i64,
+    }
+
+    let parsed: Vec<RawRow> = rows.iter().map(|r| {
+        Ok(RawRow {
+            node_id: r.try_get("node_id").map_err(|e: sqlx::Error| e.to_string())?,
+            title: r.try_get("title").map_err(|e: sqlx::Error| e.to_string())?,
+            description: r.try_get("description").map_err(|e: sqlx::Error| e.to_string())?,
+            progress: r.try_get::<i32, _>("progress").map_err(|e: sqlx::Error| e.to_string())?,
+            is_locked: r.try_get::<bool, _>("is_locked").map_err(|e: sqlx::Error| e.to_string())?,
+            leaf_order: r.try_get::<i32, _>("leaf_order").unwrap_or(0),
+            skill_name: r.try_get("skill_name").map_err(|e: sqlx::Error| e.to_string())?,
+            skill_order: r.try_get::<i32, _>("skill_order").unwrap_or(0),
+            phase_name: r.try_get("phase_name").map_err(|e: sqlx::Error| e.to_string())?,
+            phase_order: r.try_get::<i32, _>("phase_order").unwrap_or(0),
+            link_count: r.try_get("link_count").map_err(|e: sqlx::Error| e.to_string())?,
+        })
+    }).collect::<Result<Vec<_>, String>>()?;
+
+    for row in &parsed {
+        if row.link_count > 0 {
+            matched_checkpoints += 1;
+        } else {
+            gaps.push(CheckpointGap {
+                node_id: row.node_id.clone(),
+                title: row.title.clone(),
+                description: row.description.clone(),
+                phase_name: row.phase_name.clone(),
+                skill_name: row.skill_name.clone(),
+                progress: row.progress,
+                is_locked: row.is_locked,
+            });
+        }
+    }
+
+    // Sort: unlocked first (can act on them now), then by phase→skill→leaf order
+    gaps.sort_by(|a, b| {
+        a.is_locked.cmp(&b.is_locked)
+            .then_with(|| {
+                // Recover phase/skill order from parsed rows for stable sort
+                let pa = parsed.iter().find(|r| r.node_id == a.node_id);
+                let pb = parsed.iter().find(|r| r.node_id == b.node_id);
+                match (pa, pb) {
+                    (Some(ra), Some(rb)) => ra.phase_order.cmp(&rb.phase_order)
+                        .then(ra.skill_order.cmp(&rb.skill_order))
+                        .then(ra.leaf_order.cmp(&rb.leaf_order)),
+                    _ => std::cmp::Ordering::Equal,
+                }
+            })
+    });
+
+    let unmatched_checkpoints = gaps.len() as i32;
+    let coverage_percent = if total_checkpoints > 0 {
+        (matched_checkpoints as f32 / total_checkpoints as f32) * 100.0
+    } else {
+        100.0
+    };
+
+    Ok(TreeResourceGaps {
+        tree_id,
+        total_checkpoints,
+        matched_checkpoints,
+        unmatched_checkpoints,
+        coverage_percent,
+        gaps,
+    })
+}
+
 // ─── SkillGraphSnapshot ───────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]

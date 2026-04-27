@@ -12,6 +12,7 @@ pub struct Tree {
     pub project_id: String,
     pub name: String,
     pub created_at: String,
+    pub version: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +55,7 @@ pub async fn create_tree(
         project_id,
         name: name.trim().into(),
         created_at: String::new(), // set by DB DEFAULT NOW()
+        version: 1,
     };
 
     sqlx::query!(
@@ -74,6 +76,7 @@ pub async fn create_tree(
         project_id: row.project_id,
         name: row.name,
         created_at: row.created_at.to_rfc3339(),
+        version: 1,
     })
 }
 
@@ -82,16 +85,23 @@ pub async fn get_trees(
     project_id: String,
     database: State<'_, Database>
 ) -> Result<Vec<Tree>, String> {
-    let rows = sqlx::query!(
-        "SELECT id, project_id, name, created_at FROM trees WHERE project_id = $1 ORDER BY created_at DESC",
-        project_id
-    ).fetch_all(&database.pool).await.map_err(|e| e.to_string())?;
+    let rows = sqlx::query(
+        "SELECT id, project_id, name, created_at, COALESCE(version, 1) AS version \
+         FROM trees WHERE project_id = $1 ORDER BY created_at DESC"
+    )
+    .bind(&project_id)
+    .fetch_all(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
 
-    Ok(rows.into_iter().map(|r| Tree {
-        id: r.id,
-        project_id: r.project_id,
-        name: r.name,
-        created_at: r.created_at.to_rfc3339(),
+    Ok(rows.iter().map(|r| Tree {
+        id: r.try_get("id").unwrap_or_default(),
+        project_id: r.try_get("project_id").unwrap_or_default(),
+        name: r.try_get("name").unwrap_or_default(),
+        created_at: r.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_default(),
+        version: r.try_get("version").unwrap_or(1),
     }).collect())
 }
 
@@ -270,6 +280,7 @@ pub async fn get_tree_with_contents(
         project_id: tree_row.project_id,
         name: tree_row.name,
         created_at: tree_row.created_at.to_rfc3339(),
+        version: 1,
     };
 
     let node_models = node_rows.into_iter().map(|n| -> Result<TreeNode, sqlx::Error> {

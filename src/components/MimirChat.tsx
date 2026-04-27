@@ -1,11 +1,12 @@
 // src/components/MimirChat.tsx
 import { useState, useRef, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { useLocation } from "react-router-dom";
-import { Send, X, Loader2, ExternalLink, Trash2, BarChart2, Cpu } from "lucide-react";
+import { useLocation, useNavigate } from "react-router-dom";
+import { emit } from "@tauri-apps/api/event";
+import { Send, X, Loader2, ExternalLink, Trash2, BarChart2, Cpu, CheckCircle, ArrowRight, HelpCircle, Plus, Search } from "lucide-react";
 import { useMimirContext } from "../contexts/MimirContext";
 import { validateOrLog, MimirChatResponseSchema } from "../lib/validators";
-import type { NodeChatContext } from "../types";
+import type { NodeChatContext, Suggestion } from "../types";
 
 interface Source {
   title: string;
@@ -21,6 +22,7 @@ interface ChatMessage {
   role: "user" | "mimir";
   content: string;
   sources?: Source[];
+  suggestions?: Suggestion[];
   createdAt?: string;
 }
 
@@ -35,6 +37,7 @@ interface StoredChatMessage {
 interface MimirChatResponse {
   answer: string;
   sources: Source[];
+  suggestions: Suggestion[];
 }
 
 interface RetrievalStats {
@@ -76,12 +79,15 @@ interface PromptStats {
 export default function MimirChat({
   open,
   onToggle,
+  onOpenCoverage,
 }: {
   open: boolean;
   onToggle: () => void;
+  onOpenCoverage?: () => void;
 }) {
   const location = useLocation();
-  const { treeId, nodeId, nodeTitle } = useMimirContext();
+  const navigate = useNavigate();
+  const { treeId, nodeId, nodeTitle, projectName, treeName } = useMimirContext();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [resumed, setResumed] = useState(false);
   const [input, setInput] = useState("");
@@ -91,6 +97,8 @@ export default function MimirChat({
   const [showPromptStats, setShowPromptStats] = useState(false);
   const [promptStats, setPromptStats] = useState<PromptStats | null>(null);
   const [nodeContext, setNodeContext] = useState<NodeChatContext | null>(null);
+  const [suggestionTapped, setSuggestionTapped] = useState(false);
+  const [shouldAutoSend, setShouldAutoSend] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const loadedSessionKey = useRef<string | null>(null);
@@ -99,6 +107,13 @@ export default function MimirChat({
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  // Auto-send for explain_prereq suggestion
+  useEffect(() => {
+    if (!shouldAutoSend) return;
+    setShouldAutoSend(false);
+    handleSend();
+  }, [shouldAutoSend]); // handleSend excluded — called after input is set
 
   // Focus textarea when panel opens
   useEffect(() => {
@@ -196,9 +211,12 @@ export default function MimirChat({
         treeId,
         nodeId,
         nodeTitle,
+        projectName,
+        treeName,
       });
       const response = validateOrLog(MimirChatResponseSchema, raw, 'mimir_chat') as MimirChatResponse;
       setResumed(false);
+      setSuggestionTapped(false);
 
       setMessages((prev) => [
         ...prev,
@@ -206,6 +224,7 @@ export default function MimirChat({
           role: "mimir",
           content: response.answer,
           sources: response.sources,
+          suggestions: response.suggestions ?? [],
         },
       ]);
     } catch (e) {
@@ -227,6 +246,44 @@ export default function MimirChat({
       handleSend();
     }
   }
+
+  const handleSuggestion = useCallback(async (suggestion: Suggestion) => {
+    setSuggestionTapped(true);
+
+    switch (suggestion.action) {
+      case "mark_complete": {
+        const nid = (suggestion.payload?.action === "mark_complete" ? suggestion.payload.node_id : null) ?? nodeId;
+        if (!nid) break;
+        try {
+          await invoke("update_tree_node", { nodeId: nid, progress: 100 });
+          await emit("ygg-checkpoint-completed", { nodeId: nid });
+        } catch { /* best-effort */ }
+        break;
+      }
+      case "next_quest": {
+        if (!nodeContext || nodeContext.siblings.length === 0) break;
+        // siblings are titles; we can't navigate by title alone — send a pre-filled follow-up
+        setInput(`Tell me about the next checkpoint: ${nodeContext.siblings[0]}`);
+        break;
+      }
+      case "explain_prereq": {
+        setInput("Can you explain the prerequisites for this concept?");
+        setShouldAutoSend(true);
+        break;
+      }
+      case "add_resource": {
+        const url = suggestion.payload?.action === "add_resource" ? suggestion.payload.url : undefined;
+        navigate("/resources" + (url ? `?prefill=${encodeURIComponent(url)}` : ""));
+        break;
+      }
+      case "find_gaps": {
+        const tid = treeId;
+        await emit("ygg-open-coverage", { treeId: tid });
+        onOpenCoverage?.();
+        break;
+      }
+    }
+  }, [nodeId, nodeContext, navigate, onOpenCoverage]);
 
   return (
     <div
@@ -552,7 +609,13 @@ export default function MimirChat({
             </div>
           )}
 
-          {messages.map((msg, i) => (
+          {(() => {
+            // Index of last mimir message — only that one shows chips
+            let lastMimirIdx = -1;
+            for (let k = messages.length - 1; k >= 0; k--) {
+              if (messages[k].role === "mimir") { lastMimirIdx = k; break; }
+            }
+            return messages.map((msg, i) => (
             <div key={i}>
               {i === 0 && msg.createdAt && (
                 <div
@@ -621,10 +684,71 @@ export default function MimirChat({
                       ))}
                     </div>
                   )}
+                  {/* Suggestion chips — only on last mimir message, disappear after tap */}
+                  {i === lastMimirIdx && !suggestionTapped && msg.suggestions && msg.suggestions.length > 0 && !loading && (
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginTop: 8 }}>
+                      {msg.suggestions.map((sug, j) => {
+                        const chipMeta: Record<string, { icon: React.ReactNode; color: string; bg: string; border: string }> = {
+                          mark_complete: {
+                            icon: <CheckCircle size={11} />,
+                            color: "#6ee7b7",
+                            bg: "rgba(16,185,129,0.1)",
+                            border: "rgba(16,185,129,0.3)",
+                          },
+                          next_quest: {
+                            icon: <ArrowRight size={11} />,
+                            color: "#93c5fd",
+                            bg: "rgba(59,130,246,0.1)",
+                            border: "rgba(59,130,246,0.3)",
+                          },
+                          explain_prereq: {
+                            icon: <HelpCircle size={11} />,
+                            color: "#fcd34d",
+                            bg: "rgba(245,158,11,0.1)",
+                            border: "rgba(245,158,11,0.3)",
+                          },
+                          add_resource: {
+                            icon: <Plus size={11} />,
+                            color: "#c4b5fd",
+                            bg: "rgba(139,92,246,0.1)",
+                            border: "rgba(139,92,246,0.3)",
+                          },
+                          find_gaps: {
+                            icon: <Search size={11} />,
+                            color: "#94a3b8",
+                            bg: "rgba(100,116,139,0.1)",
+                            border: "rgba(100,116,139,0.3)",
+                          },
+                        };
+                        const meta = chipMeta[sug.action] ?? chipMeta["find_gaps"];
+                        return (
+                          <button
+                            key={j}
+                            onClick={() => handleSuggestion(sug)}
+                            style={{
+                              display: "flex", alignItems: "center", gap: 4,
+                              padding: "4px 9px", borderRadius: 20, fontSize: 11,
+                              background: meta.bg,
+                              border: `1px solid ${meta.border}`,
+                              color: meta.color,
+                              cursor: "pointer", fontFamily: "inherit",
+                              transition: "opacity 0.15s",
+                            }}
+                            onMouseEnter={e => (e.currentTarget.style.opacity = "0.75")}
+                            onMouseLeave={e => (e.currentTarget.style.opacity = "1")}
+                          >
+                            {meta.icon}
+                            {sug.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
               )}
             </div>
-          ))}
+            ));
+          })()}
 
           {loading && (
             <div

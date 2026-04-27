@@ -7,6 +7,7 @@ import { useNavigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import * as d3 from 'd3';
+import { warn, logError } from '../lib/logger';
 import { ChevronDown, ChevronRight, ChevronLeft, Plus, ExternalLink, X, Loader2, Cpu, Code2, Layers } from 'lucide-react';
 
 // ─── Domain types ─────────────────────────────────────────────────────────────
@@ -620,7 +621,7 @@ function LeftPanel({
         // Skill sync to universal skills is handled server-side by the orchestrator
         await onRefresh();
       } catch (e) {
-        console.warn('Skill extraction failed:', e);
+        warn('Skill extraction failed:', e);
       } finally {
         setExtractingFor(prev => { const s = new Set(prev); s.delete(resource.id); return s; });
       }
@@ -633,7 +634,7 @@ function LeftPanel({
       await invoke('toggle_resource_completed', { resourceId });
       await onRefresh();
     } catch (e) {
-      console.warn('Toggle failed:', e);
+      warn('Toggle failed:', e);
     } finally {
       setTogglingFor(prev => { const s = new Set(prev); s.delete(resourceId); return s; });
     }
@@ -946,7 +947,7 @@ export default function WorkPage() {
       setGraph(g);
       setProjects(p);
     } catch (e) {
-      console.error('Failed to load work graph:', e);
+      logError('Failed to load work graph:', e);
     } finally {
       setLoading(false);
     }

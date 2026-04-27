@@ -8,9 +8,9 @@ Read `PRD.md` for the full vision. This file is your technical bible.
 
 ---
 
-## Current State (v2.4)
+## Current State (v2.5)
 
-**All core features shipped (Phases 0-5 complete):**
+**All core features shipped (Phases 0-6 complete):**
 - Project creation, listing, edit, delete
 - AI tree generation from PRD text and GitHub repo URL (two-phase: concept graph → tree)
 - `analyze_repo` accepts optional `paper_url: Option<String>` and `paper_pdf: Option<String>`; paper context is injected into Phase 1 concept graph extraction as well as the Phase 2 repo profile + per-skill expansion calls
@@ -20,21 +20,27 @@ Read `PRD.md` for the full vision. This file is your technical bible.
 - Mimir chat: hybrid retrieval (RRF over cosine + FTS), Groq LLaMA 3.3-70b synthesis, reranking, source citations (section title + page range)
 - Mimir chat: persistent session memory per (tree_id, node_id) — `mimir_chat_sessions` + `mimir_chat_messages` tables; last 10 messages injected into context on each query
 - Mimir chat: pre-matched chunks loaded eagerly from `mimir_node_links` (bypasses cold retrieval when node context is set)
+- Mimir chat: full tree context awareness — `mimir_chat` receives `project_name` + `tree_name`; section 5 builds a phase-breakdown block (overall %, per-phase checkpoints done/total, library coverage) via inline SQL; section 6 branches on `node_is_active` for checkpoint-tutor vs. tree-only mode
+- Mimir chat: GraphRAG traversal — concept-level graph walk before cosine search; prerequisite/successor context injected into synthesis prompt
 - Retrieval logging: every `mimir_chat` retrieval writes a row to `mimir_retrieval_logs` with full stats (k, threshold, candidate counts, hybrid metrics, sources JSONB)
 - Auto-matching resources to quest nodes on tree generation — `mimir_node_links` now persists `matched_chunk_id`, `matched_section_title`, `matched_page_start`, `matched_page_end` so node panels show exact citations
 - Resource library: search, tag filters, type/sort dropdowns, auto-tagging, completion tracking, per-video playlist completion
+- Resource gap finder: surfaces Mimir resources most relevant to unmastered checkpoints (agentic suggestions)
 - Work page: co-op tracker + D3 force galaxy visualization + AI skill extraction
 - Jobs page: kanban board + JD analysis + skill demand analytics + follow-up tracker
 - Resume page: paste/upload resume, AI parsing, skill pre-population
 - Ideas page: scratchpad with tags, pin, promote to project
-- Universal Skill Tree: D3 force galaxy, skill dependencies, gap analysis, multi-source sync; domain-agnostic schema (concept/technical/soft/practical/domain/unclassified kinds); skill canonicalization via `skill_aliases` table + merge UI; human-curation columns (`review_needed`, `status`); first-class `skill_evidence` rows
+- Universal Skill Tree V2: canvas-rendered radial tree, domain classification, skill-to-concept edges, gap analysis; domain-agnostic schema (concept/technical/soft/practical/domain/unclassified kinds); skill canonicalization via `skill_aliases` table + merge UI; human-curation columns (`review_needed`, `status`); first-class `skill_evidence` rows
 - Daily Eisenhower Matrix: 2x2 quadrant triage for quests + free-form tasks, day navigation
 - Tree export as ZIP
+- Tree versioning: `tree_versions` table (migration 034); `concept_id`/`concept_slug` stable identity columns; `regenerate_tree` carries mastered concepts forward via KG→tree bridge and runs diff-based state carry-over
 - Background async job queue (`orchestrator.rs`) — `JobQueue` struct with tokio mpsc channel; worker processes RematchAllNodes, ReembedResources, InferSkillDeps, AutoTagResources off the UI thread; emits `ygg-*` Tauri events for progress
 - Read-model helpers (`read_models.rs`) — `get_active_tree_for_project`, `get_node_chat_context`, `get_project_tree_summary`, `get_skill_graph_snapshot`; purpose-built query functions replacing ad-hoc frontend joins
 - Prompt/model version logging — `prompt_logs` table; `log_prompt_call` fire-and-forget helper in `brain.rs`; all `call_llm` sites instrumented (concept_graph, repo_profile, prd_profile, tree_outline, skill_expansion, mimir_chat, mimir_rerank, auto_tag, skill_deps); `get_prompt_stats` Tauri command + dev-only "Model logs" tab in MimirChat.tsx
+- Shared `reqwest::Client` managed as Tauri state — injected into all commands that call external APIs (brain, mimir modules, orchestrator)
+- God module splits: `brain.rs` → `llm_client.rs` + `github.rs` + `prompt_builders.rs` + `tree_persistence.rs`; `mimir.rs` → `mimir_ingest.rs` + `mimir_retrieval.rs` + `mimir_tags.rs` + `mimir_manage.rs`
 - Postgres on Neon with pgvector
-- All migrations (001-031) run automatically on startup
+- All migrations (001-035) run automatically on startup
 
 ---
 
@@ -66,9 +72,16 @@ Read `PRD.md` for the full vision. This file is your technical bible.
 │   ├── src/
 │   │   ├── main.rs                    # Command registration — register ALL new commands here
 │   │   ├── commands.rs                # Project CRUD
-│   │   ├── tree_commands.rs           # Tree/node CRUD + quest completion + unlock mechanics
-│   │   ├── brain.rs                   # AI generation + GitHub repo analysis + log_prompt_call helper
-│   │   ├── mimir.rs                   # Full Mimir implementation: ingest, hybrid RAG, rescrape, tags, completion, retrieval logging
+│   │   ├── tree_commands.rs           # Tree/node CRUD + quest completion + unlock mechanics + tree versioning
+│   │   ├── brain.rs                   # AI generation orchestration + log_prompt_call helper (thin coordinator)
+│   │   ├── llm_client.rs              # Shared HTTP client + call_llm helper (split from brain.rs)
+│   │   ├── github.rs                  # GitHub REST API fetching (split from brain.rs)
+│   │   ├── prompt_builders.rs         # Prompt template construction for all LLM calls (split from brain.rs)
+│   │   ├── tree_persistence.rs        # Tree/node DB writes after generation (split from brain.rs)
+│   │   ├── mimir_ingest.rs            # URL/PDF/text ingest pipeline, chunking, embeddings (split from mimir.rs)
+│   │   ├── mimir_retrieval.rs         # Hybrid RAG, GraphRAG traversal, session memory, tree context (split from mimir.rs)
+│   │   ├── mimir_tags.rs              # Auto-tagging, tag filter helpers (split from mimir.rs)
+│   │   ├── mimir_manage.rs            # Rescrape, re-embed, resource CRUD, completion (split from mimir.rs)
 │   │   ├── orchestrator.rs            # Background job queue (JobQueue + start_worker) + cascade handlers + ygg-* events
 │   │   ├── read_models.rs             # Purpose-built read-model Tauri commands (4 helpers)
 │   │   ├── work_commands.rs           # Co-op/topic/resource/skill commands
@@ -79,7 +92,7 @@ Read `PRD.md` for the full vision. This file is your technical bible.
 │   │   ├── daily_commands.rs          # Daily Eisenhower Matrix commands
 │   │   ├── export_commands.rs         # Tree ZIP export
 │   │   └── database.rs               # PgPool connection + migrations
-│   ├── migrations/                    # Auto-run on startup, sequential (001-031)
+│   ├── migrations/                    # Auto-run on startup, sequential (001-035)
 │   └── capabilities/
 │       └── default.json               # Tauri 2 capability grants (includes core:event:allow-listen)
 ├── scraper/                           # Python FastAPI scraper (port 3002)
@@ -101,7 +114,7 @@ Read `PRD.md` for the full vision. This file is your technical bible.
 | AI generation | OpenRouter (Gemini Flash for both tree gen + concept graphs) + Groq (LLaMA for chat/skills) |
 | Tree renderer | Custom HTML Canvas (tapered filled branches, polar layout — trunk/boughs/limbs/twigs + atmospheric roots) |
 | Work/Skills galaxy | D3 force simulation |
-| Mimir | Native Rust in mimir.rs — no sidecar process |
+| Mimir | Native Rust split across mimir_ingest / mimir_retrieval / mimir_tags / mimir_manage — no sidecar |
 | Scraper | Python FastAPI (port 3002) — URL scraping, PDF extraction (pymupdf), playlist |
 | Embeddings | Perplexity pplx-embed-v1-0.6b (1024 dimensions) via OpenRouter |
 | Vector search | pgvector on Neon — vector(1024) column |
@@ -304,7 +317,7 @@ const result = await invoke<ReturnType>('command_name', { paramName: value });
 3. Call from frontend with `invoke('command_name', { params })`
 
 ### Add a Migration
-Create `src-tauri/migrations/NNN_description.sql` — runs automatically on startup. Never modify existing migrations. Current highest: **031**.
+Create `src-tauri/migrations/NNN_description.sql` — runs automatically on startup. Never modify existing migrations. Current highest: **035**.
 
 ### Add a New Page
 1. Create `src/pages/NewPage.tsx`
@@ -362,7 +375,7 @@ MIMIR_PORT=3001   # unused — Mimir is now native Rust, no port
 
 ## AI Generation Rules
 
-### Tree generation (brain.rs) — Two-Phase Approach
+### Tree generation (brain.rs + prompt_builders.rs + tree_persistence.rs) — Two-Phase Approach
 Tree generation uses a two-phase pipeline via OpenRouter:
 
 **Phase 1: Concept Graph Extraction**
@@ -387,8 +400,9 @@ Every `call_llm` invocation records a row to `prompt_logs` via `log_prompt_call`
 - ALLOWED: "Read Chapter X", "Watch lecture on Y", "Work through exercises Z"
 - FORBIDDEN: "Implement X", "Build Y", "Create Z", "Code W"
 - Structure: 3-5 phases → 2-4 skills each → 3 quests each
-- GitHub repo analysis: fetch README + dependency files + directory structure + key source files
+- GitHub repo analysis: fetch README + dependency files + directory structure + key source files (via `github.rs`)
 - Paper input: arXiv URLs are auto-rewritten `/abs/` → `/pdf/`; other URLs are scraped via the Python scraper `/fetch`; base64 PDFs go directly to `/fetch-pdf`; all paper handling is non-fatal (failure logs a warning and proceeds without paper context)
+- `regenerate_tree`: reads mastered concepts from `universal_skills` (via KG→tree bridge), passes them as already-known context to Phase 1 so regenerated trees skip mastered prerequisites; diff-based carry-over preserves notes + completion state by matching `concept_id`
 
 ### Skill extraction (work_commands.rs + job_commands.rs)
 - Max 6 tags per resource (Work page)
@@ -400,17 +414,17 @@ Every `call_llm` invocation records a row to `prompt_logs` via `log_prompt_call`
 
 ## Mimir (Native Rust)
 
-Mimir is fully implemented in `src-tauri/src/mimir.rs`. There is no Node.js sidecar.
+Mimir is fully implemented across `mimir_ingest.rs`, `mimir_retrieval.rs`, `mimir_tags.rs`, and `mimir_manage.rs` (split from the former monolithic `mimir.rs`). There is no Node.js sidecar.
 
 ### Embedding Pipeline
 - Model: `perplexity/pplx-embed-v1-0.6b` via OpenRouter (`https://openrouter.ai/api/v1/embeddings`)
 - Output: 1024-dim float32 vector, L2-normalized
 - Storage: pgvector `vector(1024)` column (migration 017 widened from 384)
-- One `reqwest::Client` created per ingest operation and passed through to `get_embedding()`
+- Shared `reqwest::Client` is managed as Tauri state (injected into all commands that call external APIs); `mimir_ingest` receives it via Tauri state injection — do NOT create a new client per call
 - Do NOT add `"dimensions"` to the request body — pplx-embed does not support MRL truncation via API
 
 ### Hybrid Retrieval (RAG)
-Mimir chat uses Reciprocal Rank Fusion (RRF) over two retrieval lanes:
+Mimir chat (`mimir_retrieval.rs`) uses Reciprocal Rank Fusion (RRF) over two retrieval lanes:
 1. **Cosine (vector)** — pgvector similarity search on `mimir_embeddings`
 2. **FTS (lexical)** — Postgres `tsvector` full-text search on `mimir_chunks.fts_vector` (GIN index, migration 030)
 
@@ -419,6 +433,14 @@ RRF score: `Σ 1 / (60 + rank_i)` across lanes. Top candidates go to the LLaMA 3
 Pre-matched chunks (from `mimir_node_links`) are injected first when a `node_id` is provided, bypassing cold retrieval for the current checkpoint context.
 
 Every retrieval call writes a row to `mimir_retrieval_logs` (migration 028 + 030 columns).
+
+### GraphRAG Traversal
+Before cosine search, `mimir_chat` looks up concept nodes in `tree_nodes` matching the query topic, walks prerequisite and successor edges in `tree_edges`, and injects adjacent concept titles + descriptions as graph context into the Groq synthesis prompt. This produces responses that reference where the concept sits in the learning graph ("You'll need Chain Rule first…").
+
+### Tree Context Awareness
+`mimir_chat` receives `project_name: Option<String>` and `tree_name: Option<String>` from the frontend. Section 5 of the system prompt is a phase-breakdown block built from three inline SQL queries (overall progress %, per-trunk-node checkpoint counts, matched resource count). Section 6 branches on `node_is_active`:
+- **Node active** → checkpoint-tutor mode: condensed progress line + full tutor block + tree block
+- **No node** → tree-only mode: "viewing your learning tree for '…'" guidance + tree block
 
 ### Chat Session Memory
 Sessions are persisted in `mimir_chat_sessions` (unique on `(tree_id, node_id)`) and `mimir_chat_messages`. The last 10 messages of the current session are injected into the Groq context on every query. `get_chat_session` and `clear_chat_session` Tauri commands manage lifecycle.

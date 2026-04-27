@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { ZodSchema } from 'zod';
+import { warn } from './logger';
 
 // ── Core helper ──────────────────────────────────────────────────────────────
 
@@ -11,7 +12,7 @@ import type { ZodSchema } from 'zod';
 export function validateOrLog<T>(schema: ZodSchema<T>, data: unknown, label: string): T {
   const result = schema.safeParse(data);
   if (result.success) return result.data;
-  console.warn(`[validation] ${label}:`, result.error.flatten());
+  warn(`[validation] ${label}:`, result.error.flatten());
   return data as T;
 }
 
@@ -27,9 +28,16 @@ export const SourceSchema = z.object({
   pageEnd: z.number().nullable(),
 });
 
+export const SuggestionSchema = z.object({
+  action: z.string(),
+  label: z.string(),
+  payload: z.unknown().optional(),
+});
+
 export const MimirChatResponseSchema = z.object({
   answer: z.string(),
   sources: z.array(SourceSchema),
+  suggestions: z.array(SuggestionSchema).default([]),
 });
 
 export const StoredChatMessageSchema = z.object({
