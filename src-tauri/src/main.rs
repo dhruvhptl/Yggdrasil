@@ -166,6 +166,7 @@ fn main() {
             read_models::get_tree_resource_gaps,
             read_models::get_node_neighborhood,
             read_models::get_growth_recommendations,
+            read_models::get_prereq_path,
             orchestrator::enqueue_rematch,
             orchestrator::enqueue_reembed,
             orchestrator::enqueue_autotag,

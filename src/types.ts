@@ -121,18 +121,36 @@ export interface UniversalSkill {
   state: string;
 }
 
+export interface PathNode {
+  skillId: string;
+  skillName: string;
+  state: string;
+  origin: string;
+  level: number;
+  hasResources: boolean;
+}
+
+export interface PrereqPath {
+  targetSkill: string;
+  targetSkillId: string;
+  path: PathNode[];
+  totalHops: number;
+  nearestSeed: string | null;
+  isReachable: boolean;
+}
+
 export interface GrowthTarget {
   skillId: string;
   skillName: string;
-  jobFrequency: number;
-  isRequiredCount: number;
-  totalJobCount: number;
+  rationale: string;
+  jobRelevanceScore: number;
   prereqDistance: number;
-  prereqPath: string[];
+  nearestSeed: string;
+  prereqPath: PathNode[];
   hasResources: boolean;
+  jobCount: number;
+  finalScore: number;
   isReachable: boolean;
-  score: number;
-  season: string | null;
 }
 
 export interface SkillGap {
@@ -196,6 +214,7 @@ export interface NodeNeighborhood {
   prerequisites: NeighborNode[];
   dependents: NeighborNode[];
   siblings: NeighborNode[];
+  prereqPath: PrereqPath | null;
 }
 
 export interface NodeChatContext {

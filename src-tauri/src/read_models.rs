@@ -724,6 +724,7 @@ pub struct NodeNeighborhood {
     pub prerequisites: Vec<NeighborNode>,
     pub dependents: Vec<NeighborNode>,
     pub siblings: Vec<NeighborNode>,
+    pub prereq_path: Option<PrereqPath>,
 }
 
 async fn fetch_neighbor_resources(pool: &sqlx::PgPool, node_id: &str) -> Vec<MatchedResource> {
@@ -907,7 +908,224 @@ pub async fn get_node_neighborhood(
     let prerequisites = build_neighbor_nodes(pool, prereq_rows, &skill_level_by_slug).await;
     let dependents = build_neighbor_nodes(pool, dependent_rows, &skill_level_by_slug).await;
 
-    Ok(NodeNeighborhood { node_id, prerequisites, dependents, siblings })
+    // Compute prereq path for this node's skill (if it has one mapped to universal_skills)
+    let prereq_path = if let Some(ref sid) = skill_id {
+        let skill_meta_rows = sqlx::query(
+            "SELECT id, name, COALESCE(state, 'adjacent') AS state,
+                    COALESCE(origin, 'tree_quest') AS origin, COALESCE(level, 0) AS level
+             FROM universal_skills"
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+        let skill_meta: std::collections::HashMap<String, (String, String, String, i32)> = skill_meta_rows.iter()
+            .filter_map(|r| {
+                let id: String = r.try_get("id").ok()?;
+                let name: String = r.try_get("name").ok()?;
+                let state: String = r.try_get("state").ok()?;
+                let origin: String = r.try_get("origin").ok()?;
+                let level: i32 = r.try_get("level").unwrap_or(0);
+                Some((id, (name, state, origin, level)))
+            })
+            .collect();
+
+        let resource_titles_lower: Vec<String> = sqlx::query("SELECT title FROM mimir_resources")
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|r| r.try_get::<String, _>("title").ok())
+            .map(|t| t.to_lowercase())
+            .collect();
+
+        let result = compute_prereq_path(pool, sid, &skill_meta, &resource_titles_lower, 4).await;
+        Some(result)
+    } else {
+        None
+    };
+
+    Ok(NodeNeighborhood { node_id, prerequisites, dependents, siblings, prereq_path })
+}
+
+// ─── PrereqPath ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PathNode {
+    pub skill_id: String,
+    pub skill_name: String,
+    pub state: String,
+    pub origin: String,
+    pub level: i32,
+    pub has_resources: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PrereqPath {
+    pub target_skill: String,
+    pub target_skill_id: String,
+    pub path: Vec<PathNode>,
+    pub total_hops: i32,
+    pub nearest_seed: Option<String>,
+    pub is_reachable: bool,
+}
+
+/// BFS backward from `target_skill_id` through `skill_dependencies` looking for
+/// a seed node (state = 'seed').  Returns the shortest path seed → … → target,
+/// or `is_reachable: false` if no seed is found within `max_depth` hops.
+///
+/// Edge direction: `source_skill_id → target_skill_id` means "source depends on target"
+/// (i.e. target is a prerequisite of source).  Walking *backwards* from the target
+/// means following rows WHERE target_skill_id = current, giving us the skills that
+/// list `current` as a prerequisite — which is the *forward* learning direction.
+/// To find "what do I need to learn before target" we walk WHERE source_skill_id = current
+/// and follow target_skill_id.
+pub async fn compute_prereq_path(
+    pool: &sqlx::PgPool,
+    target_skill_id: &str,
+    skill_meta: &std::collections::HashMap<String, (String, String, String, i32)>, // id → (name, state, origin, level)
+    resource_titles_lower: &[String],
+    max_depth: i32,
+) -> PrereqPath {
+    let target_name = skill_meta.get(target_skill_id)
+        .map(|(n, _, _, _)| n.clone())
+        .unwrap_or_else(|| target_skill_id.to_string());
+
+    // BFS backward: from target, walk prerequisites (edges WHERE source_skill_id = node)
+    // We want the path from seed→target, so we BFS from target backward and then reverse.
+    struct BfsState {
+        skill_id: String,
+        depth: i32,
+        came_from: Option<String>, // child in forward direction
+    }
+
+    let mut visited: std::collections::HashMap<String, (i32, Option<String>)> = std::collections::HashMap::new();
+    visited.insert(target_skill_id.to_string(), (0, None));
+    let mut queue: std::collections::VecDeque<BfsState> = std::collections::VecDeque::new();
+    queue.push_back(BfsState { skill_id: target_skill_id.to_string(), depth: 0, came_from: None });
+
+    let mut seed_found: Option<String> = None;
+
+    'bfs: while let Some(state) = queue.pop_front() {
+        if state.depth >= max_depth { continue; }
+
+        // Check if current node is a seed
+        if let Some((_, node_state, _, _)) = skill_meta.get(&state.skill_id) {
+            if node_state == "seed" && state.skill_id != target_skill_id {
+                seed_found = Some(state.skill_id.clone());
+                break 'bfs;
+            }
+        }
+
+        // Walk prerequisites of this node: rows WHERE source_skill_id = current
+        // target_skill_id in that row is a prerequisite of current
+        let prereq_rows = sqlx::query(
+            "SELECT target_skill_id FROM skill_dependencies
+             WHERE source_skill_id = $1
+               AND relationship IN ('prerequisite', 'part_of')"
+        )
+        .bind(&state.skill_id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+        for r in &prereq_rows {
+            let prereq_id: String = r.try_get("target_skill_id").unwrap_or_default();
+            if prereq_id.is_empty() || visited.contains_key(&prereq_id) { continue; }
+            visited.insert(prereq_id.clone(), (state.depth + 1, Some(state.skill_id.clone())));
+            // Check if this is a seed — early exit next iteration
+            queue.push_back(BfsState { skill_id: prereq_id, depth: state.depth + 1, came_from: Some(state.skill_id.clone()) });
+        }
+    }
+
+    let Some(seed_id) = seed_found else {
+        return PrereqPath {
+            target_skill: target_name,
+            target_skill_id: target_skill_id.to_string(),
+            path: vec![],
+            total_hops: -1,
+            nearest_seed: None,
+            is_reachable: false,
+        };
+    };
+
+    // Reconstruct path: seed → ... → target by walking came_from backward from seed
+    // came_from[node] = the node we arrived at `node` from (i.e. the child in forward direction)
+    // so seed's came_from = Some(next_node), and target's came_from = None
+    // Walk from seed following came_from until None
+    let mut path_ids: Vec<String> = vec![seed_id.clone()];
+    let mut cur = seed_id.clone();
+    loop {
+        let next = visited.get(&cur).and_then(|(_, parent)| parent.clone());
+        match next {
+            None => break,
+            Some(n) => { path_ids.push(n.clone()); cur = n; }
+        }
+    }
+    // path_ids is now seed → ... → target (forward learning direction)
+
+    let path: Vec<PathNode> = path_ids.iter().map(|id| {
+        let (name, state, origin, level) = skill_meta.get(id)
+            .map(|(n, s, o, l)| (n.clone(), s.clone(), o.clone(), *l))
+            .unwrap_or_else(|| (id.clone(), "adjacent".to_string(), "tree_quest".to_string(), 0));
+        let name_lower = name.to_lowercase();
+        let has_resources = resource_titles_lower.iter().any(|t| t.contains(&name_lower));
+        PathNode { skill_id: id.clone(), skill_name: name, state, origin, level, has_resources }
+    }).collect();
+
+    let total_hops = (path.len() as i32).saturating_sub(1);
+    let nearest_seed = path.first().map(|p| p.skill_name.clone());
+    let seed_name = nearest_seed.clone();
+
+    PrereqPath {
+        target_skill: target_name,
+        target_skill_id: target_skill_id.to_string(),
+        path,
+        total_hops,
+        nearest_seed: seed_name,
+        is_reachable: true,
+    }
+}
+
+#[tauri::command]
+pub async fn get_prereq_path(
+    skill_id: String,
+    database: State<'_, Database>,
+) -> Result<PrereqPath, String> {
+    let pool = &database.pool;
+
+    let skill_rows = sqlx::query(
+        "SELECT id, name, COALESCE(state, 'adjacent') AS state,
+                COALESCE(origin, 'tree_quest') AS origin, COALESCE(level, 0) AS level
+         FROM universal_skills"
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let skill_meta: std::collections::HashMap<String, (String, String, String, i32)> = skill_rows.iter()
+        .filter_map(|r| {
+            let id: String = r.try_get("id").ok()?;
+            let name: String = r.try_get("name").ok()?;
+            let state: String = r.try_get("state").ok()?;
+            let origin: String = r.try_get("origin").ok()?;
+            let level: i32 = r.try_get("level").unwrap_or(0);
+            Some((id, (name, state, origin, level)))
+        })
+        .collect();
+
+    let resource_titles_lower: Vec<String> = sqlx::query("SELECT title FROM mimir_resources")
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| r.try_get::<String, _>("title").ok())
+        .map(|t| t.to_lowercase())
+        .collect();
+
+    Ok(compute_prereq_path(pool, &skill_id, &skill_meta, &resource_titles_lower, 4).await)
 }
 
 // ─── GrowthTarget ─────────────────────────────────────────────────────────────
@@ -921,7 +1139,7 @@ pub struct GrowthTarget {
     pub job_relevance_score: f32,
     pub prereq_distance: i32,
     pub nearest_seed: String,
-    pub prereq_path: Vec<String>,
+    pub prereq_path: Vec<PathNode>,
     pub has_resources: bool,
     pub job_count: i64,
     pub final_score: f32,
@@ -977,15 +1195,29 @@ pub async fn get_growth_recommendations(
         return Ok(vec![]);
     }
 
-    // 2. Load all universal_skills (id, name, state, level)
+    // 2. Load all universal_skills with full metadata for compute_prereq_path
     let skill_rows = sqlx::query(
-        "SELECT id, name, state, level FROM universal_skills"
+        "SELECT id, name, COALESCE(state, 'adjacent') AS state,
+                COALESCE(origin, 'tree_quest') AS origin, COALESCE(level, 0) AS level
+         FROM universal_skills"
     )
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
 
-    // name (lowercase) → (id, state, level)
+    // Build skill_meta map: id → (name, state, origin, level) — used by compute_prereq_path
+    let skill_meta: std::collections::HashMap<String, (String, String, String, i32)> = skill_rows.iter()
+        .filter_map(|r| {
+            let id: String = r.try_get("id").ok()?;
+            let name: String = r.try_get("name").ok()?;
+            let state: String = r.try_get("state").ok()?;
+            let origin: String = r.try_get("origin").ok()?;
+            let level: i32 = r.try_get("level").unwrap_or(0);
+            Some((id, (name, state, origin, level)))
+        })
+        .collect();
+
+    // name (lowercase) → (id, state, level) — for job demand matching
     let skill_by_name: std::collections::HashMap<String, (String, String, i32)> = skill_rows.iter()
         .filter_map(|r| {
             let name: String = r.try_get("name").ok()?;
@@ -996,7 +1228,18 @@ pub async fn get_growth_recommendations(
         })
         .collect();
 
-    // 3. Load skill_dependencies into adjacency map: source → Vec<target>
+    // 3. Check resources: load all resource titles once for batch matching
+    let resource_titles: Vec<String> = sqlx::query("SELECT title FROM mimir_resources")
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| r.try_get::<String, _>("title").ok())
+        .map(|t| t.to_lowercase())
+        .collect();
+
+    // 4. Simple forward BFS from seeds (depth ≤ 3) to quickly check reachability
+    //    before calling the full compute_prereq_path for reachable targets only.
     let dep_rows = sqlx::query(
         "SELECT source_skill_id, target_skill_id FROM skill_dependencies"
     )
@@ -1013,7 +1256,6 @@ pub async fn get_growth_recommendations(
         }
     }
 
-    // 4. Seed IDs and names
     let seeds: Vec<(String, String)> = skill_rows.iter()
         .filter_map(|r| {
             let state: String = r.try_get("state").ok()?;
@@ -1024,73 +1266,31 @@ pub async fn get_growth_recommendations(
         })
         .collect();
 
-    // 5. Check resources: load all resource titles once for batch matching
-    let resource_titles: Vec<String> = sqlx::query("SELECT title FROM mimir_resources")
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|r| r.try_get::<String, _>("title").ok())
-        .map(|t| t.to_lowercase())
-        .collect();
-
-    // 6. Multi-source BFS from all seeds simultaneously, max depth 3
-    // visited: skill_id → (distance, path_of_names, nearest_seed_name)
-    let id_to_name: std::collections::HashMap<String, String> = skill_rows.iter()
-        .filter_map(|r| {
-            let id: String = r.try_get("id").ok()?;
-            let name: String = r.try_get("name").ok()?;
-            Some((id, name))
-        })
-        .collect();
-
-    struct BfsEntry {
-        skill_id: String,
-        distance: i32,
-        path: Vec<String>,
-        seed_name: String,
-    }
-
-    let mut visited: std::collections::HashMap<String, (i32, Vec<String>, String)> = std::collections::HashMap::new();
-    let mut queue: std::collections::VecDeque<BfsEntry> = std::collections::VecDeque::new();
-
-    for (seed_id, seed_name) in &seeds {
-        if !visited.contains_key(seed_id) {
-            visited.insert(seed_id.clone(), (0, vec![seed_name.clone()], seed_name.clone()));
-            queue.push_back(BfsEntry {
-                skill_id: seed_id.clone(),
-                distance: 0,
-                path: vec![seed_name.clone()],
-                seed_name: seed_name.clone(),
-            });
+    // Forward BFS: seed → reachable skill_ids (distance ≤ 3)
+    let mut reachability: std::collections::HashMap<String, (i32, String)> = std::collections::HashMap::new(); // id → (dist, seed_name)
+    {
+        struct FwdEntry { skill_id: String, dist: i32, seed_name: String }
+        let mut queue: std::collections::VecDeque<FwdEntry> = std::collections::VecDeque::new();
+        for (seed_id, seed_name) in &seeds {
+            if !reachability.contains_key(seed_id) {
+                reachability.insert(seed_id.clone(), (0, seed_name.clone()));
+                queue.push_back(FwdEntry { skill_id: seed_id.clone(), dist: 0, seed_name: seed_name.clone() });
+            }
         }
-    }
-
-    while let Some(entry) = queue.pop_front() {
-        if entry.distance >= 3 { continue; }
-        if let Some(neighbors) = adj.get(&entry.skill_id) {
-            for neighbor_id in neighbors {
-                if visited.contains_key(neighbor_id) { continue; }
-                let neighbor_name = id_to_name.get(neighbor_id).cloned().unwrap_or_default();
-                let mut new_path = entry.path.clone();
-                new_path.push(neighbor_name.clone());
-                visited.insert(neighbor_id.clone(), (
-                    entry.distance + 1,
-                    new_path.clone(),
-                    entry.seed_name.clone(),
-                ));
-                queue.push_back(BfsEntry {
-                    skill_id: neighbor_id.clone(),
-                    distance: entry.distance + 1,
-                    path: new_path,
-                    seed_name: entry.seed_name.clone(),
-                });
+        while let Some(e) = queue.pop_front() {
+            if e.dist >= 3 { continue; }
+            if let Some(neighbors) = adj.get(&e.skill_id) {
+                for nid in neighbors {
+                    if reachability.contains_key(nid) { continue; }
+                    reachability.insert(nid.clone(), (e.dist + 1, e.seed_name.clone()));
+                    queue.push_back(FwdEntry { skill_id: nid.clone(), dist: e.dist + 1, seed_name: e.seed_name.clone() });
+                }
             }
         }
     }
 
-    // 7. Build growth targets from job demand
-    let mut reachable: Vec<GrowthTarget> = Vec::new();
+    // 5. Build growth targets from job demand
+    let mut reachable_targets: Vec<GrowthTarget> = Vec::new();
     let mut disconnected: Vec<GrowthTarget> = Vec::new();
 
     for row in &job_rows {
@@ -1109,11 +1309,15 @@ pub async fn get_growth_recommendations(
         let has_resources = resource_titles.iter().any(|t| t.contains(&name_lower));
 
         let skill_entry = skill_by_name.get(&name_lower);
-        let bfs_result = skill_entry.and_then(|(id, _, _)| visited.get(id));
+        let reach = skill_entry.and_then(|(id, _, _)| reachability.get(id));
 
-        let (is_reachable, prereq_distance, nearest_seed, prereq_path) = match bfs_result {
-            Some((dist, path, seed_name)) if *dist > 0 => {
-                (true, *dist, seed_name.clone(), path.clone())
+        let (is_reachable, prereq_distance, nearest_seed, prereq_path) = match reach {
+            Some((dist, seed_name)) if *dist > 0 => {
+                // Compute full path for reachable targets
+                let sid = skill_entry.map(|(id, _, _)| id.as_str()).unwrap_or("");
+                let path_result = compute_prereq_path(pool, sid, &skill_meta, &resource_titles, 4).await;
+                let path = path_result.path;
+                (true, *dist, seed_name.clone(), path)
             }
             _ => (false, -1i32, String::new(), vec![]),
         };
@@ -1154,16 +1358,16 @@ pub async fn get_growth_recommendations(
         };
 
         if is_reachable {
-            reachable.push(target);
+            reachable_targets.push(target);
         } else {
             disconnected.push(target);
         }
     }
 
-    reachable.sort_by(|a, b| b.final_score.partial_cmp(&a.final_score).unwrap_or(std::cmp::Ordering::Equal));
+    reachable_targets.sort_by(|a, b| b.final_score.partial_cmp(&a.final_score).unwrap_or(std::cmp::Ordering::Equal));
     disconnected.sort_by(|a, b| b.job_count.cmp(&a.job_count));
 
-    let mut result: Vec<GrowthTarget> = reachable.into_iter().take(3).collect();
+    let mut result: Vec<GrowthTarget> = reachable_targets.into_iter().take(3).collect();
     result.extend(disconnected.into_iter().take(2));
 
     Ok(result)

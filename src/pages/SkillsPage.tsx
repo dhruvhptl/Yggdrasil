@@ -9,7 +9,7 @@ import {
   Briefcase, X, Wand2, GitMerge, Check, Search, Eye, Download, ChevronDown, ChevronRight,
   PanelLeftClose, PanelLeftOpen, RotateCcw, TrendingUp, Zap,
 } from 'lucide-react';
-import type { UniversalSkill, SkillGap, SkillDependency, SkillAlias, SkillGraphSnapshot, GrowthTarget } from '../types';
+import type { UniversalSkill, SkillGap, SkillDependency, SkillAlias, SkillGraphSnapshot, GrowthTarget, PathNode, PrereqPath } from '../types';
 import { validateOrLog, SkillSchema } from '../lib/validators';
 import { log } from '../lib/logger';
 import { z } from 'zod';
@@ -774,7 +774,7 @@ function EvidenceIcon({ type }: { type: string }) {
 // ─── Skill Detail Panel ───────────────────────────────────────────────────────
 
 function SkillPanel({
-  skill, gap, aliases, deps, skills, onClose,
+  skill, gap, aliases, deps, skills, onClose, onSelectSkill,
 }: {
   skill: UniversalSkill | null;
   gap: SkillGap | null;
@@ -782,7 +782,20 @@ function SkillPanel({
   deps: SkillDependency[];
   skills: UniversalSkill[];
   onClose: () => void;
+  onSelectSkill?: (name: string) => void;
 }) {
+  const [prereqPath, setPrereqPath] = useState<PrereqPath | null>(null);
+  const [prereqPathLoading, setPrereqPathLoading] = useState(false);
+
+  useEffect(() => {
+    if (!skill || skill.state === 'seed') { setPrereqPath(null); return; }
+    setPrereqPathLoading(true);
+    invoke<PrereqPath>('get_prereq_path', { skillId: skill.id })
+      .then(p => setPrereqPath(p))
+      .catch(() => setPrereqPath(null))
+      .finally(() => setPrereqPathLoading(false));
+  }, [skill?.id]);
+
   if (!skill && !gap) return null;
 
   const skillAliases = skill ? aliases.filter(a => a.canonicalSkillId === skill.id) : [];
@@ -856,6 +869,38 @@ function SkillPanel({
                   {skillAliases.map(a => (
                     <span key={a.id} style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, background: 'rgba(99,102,241,0.12)', color: '#818cf8', border: '1px solid rgba(99,102,241,0.2)' }}>{a.alias}</span>
                   ))}
+                </div>
+              </div>
+            )}
+            {/* Path from seeds */}
+            {skill.state !== 'seed' && (
+              <div style={{ marginBottom: 12 }}>
+                <div style={{ fontSize: 9, fontWeight: 600, color: '#475569', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6 }}>Path from your skills</div>
+                {prereqPathLoading && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 10, color: '#334155' }}>
+                    <Loader2 className="w-3 h-3 animate-spin" />Finding path…
+                  </div>
+                )}
+                {!prereqPathLoading && prereqPath && prereqPath.isReachable && (
+                  <PrereqPathBreadcrumb path={prereqPath.path} onSelectSkill={onSelectSkill} />
+                )}
+                {!prereqPathLoading && prereqPath && !prereqPath.isReachable && (
+                  <div style={{ fontSize: 10, color: '#334155', fontStyle: 'italic' }}>
+                    Run Infer Dependencies to discover prerequisites
+                  </div>
+                )}
+                {!prereqPathLoading && !prereqPath && (
+                  <div style={{ fontSize: 10, color: '#334155', fontStyle: 'italic' }}>
+                    Run Infer Dependencies to discover prerequisites
+                  </div>
+                )}
+              </div>
+            )}
+            {skill.state === 'seed' && (
+              <div style={{ marginBottom: 12, padding: '6px 8px', borderRadius: 6, background: 'rgba(245,158,11,0.07)', border: '1px solid rgba(245,158,11,0.18)' }}>
+                <div style={{ fontSize: 10, color: '#f59e0b', display: 'flex', alignItems: 'center', gap: 5 }}>
+                  <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#f59e0b', flexShrink: 0, display: 'inline-block' }} />
+                  This is a baseline seed — start here
                 </div>
               </div>
             )}
@@ -969,17 +1014,18 @@ function MergeModal({ skills, onClose, onMerged }: { skills: UniversalSkill[]; o
 // ─── Growth Plan Panel ────────────────────────────────────────────────────────
 
 function GrowthPlanPanel({
-  targets, loading, expandingGraph, onClose, onExpandGraph,
+  targets, loading, expandingGraph, onClose, onExpandGraph, onSelectSkill,
 }: {
   targets: GrowthTarget[];
   loading: boolean;
   expandingGraph: boolean;
   onClose: () => void;
   onExpandGraph: () => void;
+  onSelectSkill?: (name: string) => void;
 }) {
   const reachable     = targets.filter(t => t.isReachable).slice(0, 3);
   const disconnected  = targets.filter(t => !t.isReachable).slice(0, 2);
-  const maxScore      = Math.max(...targets.map(t => t.score), 1);
+  const maxScore      = Math.max(...targets.map(t => t.finalScore), 1);
 
   return (
     <div
@@ -1036,7 +1082,7 @@ function GrowthPlanPanel({
               Reachable from your seeds
             </div>
             {reachable.map(t => (
-              <GrowthTargetRow key={t.skillId} target={t} maxScore={maxScore} />
+              <GrowthTargetRow key={t.skillId} target={t} maxScore={maxScore} onSelectSkill={onSelectSkill} />
             ))}
           </div>
         )}
@@ -1047,7 +1093,7 @@ function GrowthPlanPanel({
               High-demand (no path yet)
             </div>
             {disconnected.map(t => (
-              <GrowthTargetRow key={t.skillId} target={t} maxScore={maxScore} />
+              <GrowthTargetRow key={t.skillId} target={t} maxScore={maxScore} onSelectSkill={onSelectSkill} />
             ))}
           </div>
         )}
@@ -1056,9 +1102,43 @@ function GrowthPlanPanel({
   );
 }
 
-function GrowthTargetRow({ target, maxScore }: { target: GrowthTarget; maxScore: number }) {
-  const scorePct = Math.round((target.score / maxScore) * 100);
-  const prereqLabel = target.prereqPath.length > 0 ? target.prereqPath.join(' → ') : null;
+function PathNodeChip({ node, isLast, onSelect }: { node: PathNode; isLast: boolean; onSelect?: (name: string) => void }) {
+  const nodeColor = node.state === 'seed' ? '#f59e0b' : isLast ? '#34d399' : '#64748b';
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+      <span
+        onClick={() => onSelect?.(node.skillName)}
+        style={{
+          fontSize: 9, padding: '1px 5px', borderRadius: 4, cursor: onSelect ? 'pointer' : 'default',
+          background: node.state === 'seed' ? 'rgba(245,158,11,0.15)' : isLast ? 'rgba(52,211,153,0.12)' : 'rgba(255,255,255,0.05)',
+          color: nodeColor,
+          border: '1px solid ' + (node.state === 'seed' ? 'rgba(245,158,11,0.3)' : isLast ? 'rgba(52,211,153,0.25)' : 'rgba(255,255,255,0.08)'),
+          fontWeight: node.state === 'seed' || isLast ? 600 : 400,
+        }}
+        title={node.hasResources ? 'Has learning resources' : undefined}
+      >
+        {node.state === 'seed' && <span style={{ display: 'inline-block', width: 4, height: 4, borderRadius: '50%', background: '#f59e0b', marginRight: 3, verticalAlign: 'middle' }} />}
+        {node.skillName}
+        {node.hasResources && <span style={{ marginLeft: 2, opacity: 0.7 }}>·</span>}
+      </span>
+      {!isLast && <span style={{ color: '#334155', fontSize: 9 }}>→</span>}
+    </span>
+  );
+}
+
+function PrereqPathBreadcrumb({ path, onSelectSkill }: { path: PathNode[]; onSelectSkill?: (name: string) => void }) {
+  if (path.length === 0) return null;
+  return (
+    <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 2, marginBottom: 6 }}>
+      {path.map((node, i) => (
+        <PathNodeChip key={node.skillId} node={node} isLast={i === path.length - 1} onSelect={onSelectSkill} />
+      ))}
+    </div>
+  );
+}
+
+function GrowthTargetRow({ target, maxScore, onSelectSkill }: { target: GrowthTarget; maxScore: number; onSelectSkill?: (name: string) => void }) {
+  const scorePct = Math.round((target.finalScore / maxScore) * 100);
 
   return (
     <div style={{ marginBottom: 10, padding: '8px 10px', borderRadius: 8, background: target.isReachable ? 'rgba(245,158,11,0.06)' : 'rgba(255,255,255,0.03)', border: '1px solid ' + (target.isReachable ? 'rgba(245,158,11,0.15)' : 'rgba(255,255,255,0.06)') }}>
@@ -1075,9 +1155,13 @@ function GrowthTargetRow({ target, maxScore }: { target: GrowthTarget; maxScore:
         </a>
       </div>
 
-      {prereqLabel && (
+      {target.prereqPath.length > 0 && (
+        <PrereqPathBreadcrumb path={target.prereqPath} onSelectSkill={onSelectSkill} />
+      )}
+
+      {!target.isReachable && (
         <div style={{ fontSize: 9, color: '#475569', marginBottom: 5, fontStyle: 'italic' }}>
-          Path: {prereqLabel.length > 50 ? prereqLabel.slice(0, 50) + '…' : prereqLabel}
+          No path from your seeds — run Infer Dependencies first
         </div>
       )}
 
@@ -1085,8 +1169,12 @@ function GrowthTargetRow({ target, maxScore }: { target: GrowthTarget; maxScore:
         <div style={{ flex: 1, height: 3, borderRadius: 2, background: 'rgba(255,255,255,0.06)', overflow: 'hidden' }}>
           <div style={{ width: `${scorePct}%`, height: '100%', borderRadius: 2, background: target.isReachable ? '#f59e0b' : '#475569', transition: 'width 0.4s ease' }} />
         </div>
-        <span style={{ fontSize: 9, color: '#334155', flexShrink: 0 }}>{target.jobFrequency} jobs</span>
+        <span style={{ fontSize: 9, color: '#334155', flexShrink: 0 }}>{target.jobCount} job{target.jobCount !== 1 ? 's' : ''}</span>
       </div>
+
+      {target.rationale && (
+        <div style={{ fontSize: 9, color: '#334155', marginTop: 4 }}>{target.rationale}</div>
+      )}
     </div>
   );
 }
@@ -1845,6 +1933,10 @@ export default function SkillsPage() {
             deps={deps}
             skills={skills}
             onClose={() => setSelectedId(null)}
+            onSelectSkill={name => {
+              const s = skills.find(sk => sk.name.toLowerCase() === name.toLowerCase());
+              if (s) setSelectedId(s.id);
+            }}
           />
         )}
 
@@ -1856,6 +1948,10 @@ export default function SkillsPage() {
             expandingGraph={expandingGraph}
             onClose={() => setShowGrowthPlan(false)}
             onExpandGraph={handleExpandSkillGraph}
+            onSelectSkill={name => {
+              const skill = skills.find(s => s.name.toLowerCase() === name.toLowerCase());
+              if (skill) setSelectedId(skill.id);
+            }}
           />
         )}
       </div>

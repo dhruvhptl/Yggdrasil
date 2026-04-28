@@ -7,7 +7,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
-import { MimirResource, NeighborNode, NodeNeighborhood, Project, Tree } from '../types';
+import { MimirResource, NeighborNode, NodeNeighborhood, PathNode, Project, Tree } from '../types';
 import { useMimirContext } from '../contexts/MimirContext';
 import { validateOrLog, TreeNodeSchema } from '../lib/validators';
 import { z } from 'zod';
@@ -940,15 +940,54 @@ function NeighborhoodSubsection({
   );
 }
 
+function PrereqPathInline({ path }: { path: PathNode[] }) {
+  if (path.length === 0) return null;
+  return (
+    <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 3, marginBottom: 8 }}>
+      {path.map((node, i) => {
+        const isLast = i === path.length - 1;
+        const color = node.state === 'seed' ? '#f59e0b' : isLast ? '#34d399' : '#64748b';
+        return (
+          <span key={node.skillId} style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+            <span style={{
+              fontSize: 9, padding: '1px 5px', borderRadius: 4,
+              background: node.state === 'seed' ? 'rgba(245,158,11,0.15)' : isLast ? 'rgba(52,211,153,0.12)' : 'rgba(255,255,255,0.05)',
+              color,
+              border: '1px solid ' + (node.state === 'seed' ? 'rgba(245,158,11,0.3)' : isLast ? 'rgba(52,211,153,0.25)' : 'rgba(255,255,255,0.08)'),
+              fontWeight: node.state === 'seed' || isLast ? 600 : 400,
+            }}>
+              {node.state === 'seed' && <span style={{ display: 'inline-block', width: 4, height: 4, borderRadius: '50%', background: '#f59e0b', marginRight: 3, verticalAlign: 'middle' }} />}
+              {node.skillName}
+            </span>
+            {!isLast && <span style={{ color: '#334155', fontSize: 9 }}>→</span>}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
 function NeighborhoodSection({ neighborhood, onSelectNode }: {
   neighborhood: NodeNeighborhood;
   onSelectNode: (id: string) => void;
 }) {
+  const prereqPath = neighborhood.prereqPath;
   return (
     <div style={{ marginTop: 12, paddingTop: 10, borderTop: '1px solid #1e293b' }}>
       <label style={{ display: 'block', fontSize: 10, color: '#64748b', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.07em' }}>
         Graph Neighborhood
       </label>
+      {prereqPath && prereqPath.isReachable && prereqPath.path.length > 0 && (
+        <div style={{ marginBottom: 8 }}>
+          <div style={{ fontSize: 9, color: '#475569', marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.07em' }}>Path from your skills</div>
+          <PrereqPathInline path={prereqPath.path} />
+        </div>
+      )}
+      {prereqPath && !prereqPath.isReachable && (
+        <div style={{ fontSize: 9, color: '#334155', fontStyle: 'italic', marginBottom: 8 }}>
+          No path from seed skills — infer dependencies first
+        </div>
+      )}
       <NeighborhoodSubsection label="Prerequisites" nodes={neighborhood.prerequisites} onSelectNode={onSelectNode} accent="#f59e0b" />
       <NeighborhoodSubsection label="Dependents" nodes={neighborhood.dependents} onSelectNode={onSelectNode} accent="#60a5fa" />
       <NeighborhoodSubsection label="Siblings" nodes={neighborhood.siblings} onSelectNode={onSelectNode} accent="#a78bfa" />
