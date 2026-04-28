@@ -7,7 +7,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
-import { MimirResource, Project, Tree } from '../types';
+import { MimirResource, NeighborNode, NodeNeighborhood, Project, Tree } from '../types';
 import { useMimirContext } from '../contexts/MimirContext';
 import { validateOrLog, TreeNodeSchema } from '../lib/validators';
 import { z } from 'zod';
@@ -836,6 +836,126 @@ function drawLeaves(
   });
 }
 
+// ─── Neighborhood Section ─────────────────────────────────────────────────────
+
+function NeighborRow({ n, onSelectNode }: { n: NeighborNode; onSelectNode: (id: string) => void }) {
+  const hasResources = n.resources.length > 0;
+  return (
+    <div style={{ marginBottom: 4 }}>
+      <button
+        onClick={() => onSelectNode(n.nodeId)}
+        style={{
+          width: '100%', textAlign: 'left', background: 'none',
+          border: '1px solid #1e293b', borderRadius: 5,
+          padding: '5px 8px', cursor: 'pointer',
+          display: 'flex', flexDirection: 'column', gap: 3,
+        }}
+        onMouseEnter={e => (e.currentTarget.style.borderColor = '#334155')}
+        onMouseLeave={e => (e.currentTarget.style.borderColor = '#1e293b')}
+      >
+        {/* Title row */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 5, minWidth: 0 }}>
+          {n.isLocked ? (
+            <span style={{ fontSize: 9, color: '#475569', flexShrink: 0 }}>🔒</span>
+          ) : (
+            <div style={{
+              flexShrink: 0, width: 28, height: 3, borderRadius: 2,
+              background: '#1e293b', overflow: 'hidden',
+            }}>
+              <div style={{
+                width: `${n.progress}%`, height: '100%',
+                background: n.progress >= 100 ? '#10b981' : n.progress > 0 ? '#059669' : '#334155',
+              }} />
+            </div>
+          )}
+          <span style={{
+            flex: 1, fontSize: 11, color: '#94a3b8', minWidth: 0,
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          }}>
+            {n.title}
+          </span>
+          {n.skillLevel != null && (
+            <span style={{
+              flexShrink: 0, fontSize: 9, fontWeight: 600,
+              padding: '1px 4px', borderRadius: 3,
+              background: 'rgba(99,102,241,0.15)', color: '#818cf8',
+            }}>
+              L{n.skillLevel}
+            </span>
+          )}
+        </div>
+        {/* Resource pills */}
+        {hasResources && (
+          <div style={{ display: 'flex', gap: 3, flexWrap: 'wrap', paddingLeft: 2 }}>
+            {n.resources.slice(0, 3).map(r => (
+              <span key={r.resourceId} style={{
+                fontSize: 9, color: '#64748b',
+                padding: '1px 5px', borderRadius: 3,
+                background: '#0f172a', border: '1px solid #1e293b',
+                maxWidth: 100, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+              }}>
+                {r.matchedSectionTitle ?? r.title}
+              </span>
+            ))}
+          </div>
+        )}
+      </button>
+    </div>
+  );
+}
+
+function NeighborhoodSubsection({
+  label, nodes, onSelectNode, accent,
+}: {
+  label: string;
+  nodes: NeighborNode[];
+  onSelectNode: (id: string) => void;
+  accent: string;
+}) {
+  const [open, setOpen] = useState(true);
+  if (nodes.length === 0) return null;
+  return (
+    <div style={{ marginBottom: 8 }}>
+      <button
+        onClick={() => setOpen(v => !v)}
+        style={{
+          display: 'flex', alignItems: 'center', gap: 5, width: '100%',
+          background: 'none', border: 'none', cursor: 'pointer', padding: '2px 0', marginBottom: 4,
+        }}
+      >
+        <span style={{ fontSize: 9, color: accent, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.07em' }}>
+          {label}
+        </span>
+        <span style={{ fontSize: 9, color: '#334155', marginLeft: 2 }}>
+          ({nodes.length})
+        </span>
+        <span style={{ fontSize: 9, color: '#475569', marginLeft: 'auto' }}>
+          {open ? '▴' : '▾'}
+        </span>
+      </button>
+      {open && nodes.map(n => (
+        <NeighborRow key={n.nodeId} n={n} onSelectNode={onSelectNode} />
+      ))}
+    </div>
+  );
+}
+
+function NeighborhoodSection({ neighborhood, onSelectNode }: {
+  neighborhood: NodeNeighborhood;
+  onSelectNode: (id: string) => void;
+}) {
+  return (
+    <div style={{ marginTop: 12, paddingTop: 10, borderTop: '1px solid #1e293b' }}>
+      <label style={{ display: 'block', fontSize: 10, color: '#64748b', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.07em' }}>
+        Graph Neighborhood
+      </label>
+      <NeighborhoodSubsection label="Prerequisites" nodes={neighborhood.prerequisites} onSelectNode={onSelectNode} accent="#f59e0b" />
+      <NeighborhoodSubsection label="Dependents" nodes={neighborhood.dependents} onSelectNode={onSelectNode} accent="#60a5fa" />
+      <NeighborhoodSubsection label="Siblings" nodes={neighborhood.siblings} onSelectNode={onSelectNode} accent="#a78bfa" />
+    </div>
+  );
+}
+
 // ─── Node Panel ───────────────────────────────────────────────────────────────
 
 interface NodePanelProps {
@@ -845,9 +965,10 @@ interface NodePanelProps {
   onClose: () => void;
   onAddChild: () => void;
   onDelete: () => void;
+  onSelectNode: (nodeId: string) => void;
 }
 
-function NodePanel({ node, skillLocked, onSave, onClose, onAddChild, onDelete }: NodePanelProps) {
+function NodePanel({ node, skillLocked, onSave, onClose, onAddChild, onDelete, onSelectNode }: NodePanelProps) {
   const [title, setTitle] = useState(node.title);
   const [description, setDescription] = useState(node.description);
   const [resources, setResources] = useState<string[]>(
@@ -855,6 +976,7 @@ function NodePanel({ node, skillLocked, onSave, onClose, onAddChild, onDelete }:
   );
   const [mimiResources, setMimiResources] = useState<MimirResource[]>([]);
   const [matching, setMatching] = useState(false);
+  const [neighborhood, setNeighborhood] = useState<NodeNeighborhood | null>(null);
   const { setMimirContext, openMimir } = useMimirContext();
   const checkpoint = node.type === 'leaf'
     ? (Array.isArray(node.tasks)
@@ -880,9 +1002,15 @@ function NodePanel({ node, skillLocked, onSave, onClose, onAddChild, onDelete }:
     setNotesText(cp?.notes ?? '');
     if (notesTimerRef.current) clearTimeout(notesTimerRef.current);
     setMimiResources([]);
+    setNeighborhood(null);
     invoke<MimirResource[]>('get_node_resources', { nodeId: node.id })
       .then(setMimiResources)
       .catch(() => {});
+    if (node.type === 'leaf') {
+      invoke<NodeNeighborhood>('get_node_neighborhood', { nodeId: node.id })
+        .then(setNeighborhood)
+        .catch(() => {});
+    }
   }, [node.id]);
 
   useEffect(() => {
@@ -948,7 +1076,12 @@ function NodePanel({ node, skillLocked, onSave, onClose, onAddChild, onDelete }:
     const newCompleted = !checkpoint.completed;
     onSave({
       progress: newCompleted ? 100 : 0,
-      tasks: { ...checkpoint, completed: newCompleted },
+      tasks: {
+        mastery_criteria: checkpoint.mastery_criteria ?? '',
+        exercises: checkpoint.exercises ?? [],
+        notes: checkpoint.notes ?? '',
+        completed: newCompleted,
+      },
     });
   }
 
@@ -1254,7 +1387,7 @@ function NodePanel({ node, skillLocked, onSave, onClose, onAddChild, onDelete }:
         </div>
 
         {/* Mimir Library matches */}
-        <div style={{ marginBottom: 12 }}>
+        <div style={{ marginBottom: neighborhood && (neighborhood.prerequisites.length > 0 || neighborhood.dependents.length > 0 || neighborhood.siblings.length > 0) ? 0 : 12 }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
             <label style={{ display: 'block', fontSize: 10, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.07em' }}>
               From Library
@@ -1360,6 +1493,13 @@ function NodePanel({ node, skillLocked, onSave, onClose, onAddChild, onDelete }:
             })
           )}
         </div>
+
+        {/* Graph Neighborhood — leaf nodes only, shown when any section has content */}
+        {node.type === 'leaf' && neighborhood && (
+          neighborhood.prerequisites.length > 0 || neighborhood.dependents.length > 0 || neighborhood.siblings.length > 0
+        ) && (
+          <NeighborhoodSection neighborhood={neighborhood} onSelectNode={onSelectNode} />
+        )}
       </div>
 
       {/* Footer buttons */}
@@ -1787,6 +1927,10 @@ export default function YggdrasilTree({ projectId, externalSelectedNodeId }: Ygg
           onClose={() => setSelectedNode(null)}
           onAddChild={handleAddChild}
           onDelete={handleDelete}
+          onSelectNode={(id) => {
+            const n = nodeById.get(id);
+            if (n) setSelectedNode(n);
+          }}
         />
       )}
     </div>

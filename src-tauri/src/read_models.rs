@@ -396,6 +396,19 @@ pub async fn get_project_tree_summary(
 
 // ─── TreeResourceGaps ────────────────────────────────────────────────────────
 
+/// How well a checkpoint gap is understood by the knowledge graph.
+///
+/// - LibraryGap:   KG entry + prerequisite edges exist — library just doesn't cover it yet
+/// - KnowledgeGap: no universal_skills row — genuinely unknown territory
+/// - PartialKGGap: KG entry exists but no prerequisite edges yet
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+pub enum GapType {
+    LibraryGap,
+    KnowledgeGap,
+    PartialKGGap,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckpointGap {
@@ -406,6 +419,12 @@ pub struct CheckpointGap {
     pub skill_name: String,
     pub progress: i32,
     pub is_locked: bool,
+    pub has_weak_matches: bool,
+    pub concept_slug: Option<String>,
+    pub search_terms: Vec<String>,
+    pub mastery_criteria: Option<String>,
+    pub gap_type: GapType,
+    pub prerequisite_concepts: Vec<String>, // human names of prerequisite skills
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -413,10 +432,19 @@ pub struct CheckpointGap {
 pub struct TreeResourceGaps {
     pub tree_id: String,
     pub total_checkpoints: i32,
-    pub matched_checkpoints: i32,
+    pub green_matched_checkpoints: i32,
     pub unmatched_checkpoints: i32,
     pub coverage_percent: f32,
+    pub library_gap_count: i32,
+    pub knowledge_gap_count: i32,
+    pub partial_kg_gap_count: i32,
     pub gaps: Vec<CheckpointGap>,
+}
+
+/// Deslugify a concept_slug into a human search term.
+/// "linear_algebra_foundations" → "linear algebra foundations"
+fn deslugify(slug: &str) -> String {
+    slug.replace('_', " ")
 }
 
 #[tauri::command]
@@ -424,27 +452,31 @@ pub async fn get_tree_resource_gaps(
     tree_id: String,
     database: State<'_, Database>,
 ) -> Result<TreeResourceGaps, String> {
-    // Fetch all leaf nodes with their parent chain (skill→phase) via two joins.
-    // LEFT JOIN mimir_node_links to detect whether any resource is matched.
+    // Fetch all leaf nodes with parent chain + green/weak match counts.
+    // green = relevance_score < 0.3 (cosine distance); weak = any match but no green.
     let rows = sqlx::query(
         "SELECT
-             lf.id          AS node_id,
-             lf.title       AS title,
-             COALESCE(lf.description, '') AS description,
-             COALESCE(lf.progress, 0)     AS progress,
+             lf.id                         AS node_id,
+             lf.title                      AS title,
+             COALESCE(lf.description, '')  AS description,
+             COALESCE(lf.progress, 0)      AS progress,
              COALESCE(lf.is_locked, false) AS is_locked,
-             lf.order_index               AS leaf_order,
-             br.title       AS skill_name,
-             br.order_index AS skill_order,
-             ph.title       AS phase_name,
-             ph.order_index AS phase_order,
-             COUNT(mnl.id)  AS link_count
+             lf.order_index                AS leaf_order,
+             lf.concept_slug               AS concept_slug,
+             lf.tasks                      AS tasks,
+             br.title                      AS skill_name,
+             br.order_index                AS skill_order,
+             ph.title                      AS phase_name,
+             ph.order_index                AS phase_order,
+             COUNT(mnl.id) FILTER (WHERE mnl.relevance_score < 0.3)  AS green_count,
+             COUNT(mnl.id) FILTER (WHERE mnl.relevance_score >= 0.3) AS weak_count
          FROM tree_nodes lf
          JOIN tree_nodes br ON br.id = lf.parent_id AND br.tree_id = lf.tree_id
          JOIN tree_nodes ph ON ph.id = br.parent_id AND ph.tree_id = lf.tree_id
          LEFT JOIN mimir_node_links mnl ON mnl.node_id = lf.id
          WHERE lf.tree_id = $1 AND lf.type = 'leaf'
          GROUP BY lf.id, lf.title, lf.description, lf.progress, lf.is_locked, lf.order_index,
+                  lf.concept_slug, lf.tasks,
                   br.title, br.order_index,
                   ph.title, ph.order_index"
     )
@@ -454,7 +486,7 @@ pub async fn get_tree_resource_gaps(
     .map_err(|e| e.to_string())?;
 
     let total_checkpoints = rows.len() as i32;
-    let mut matched_checkpoints = 0i32;
+    let mut green_matched_checkpoints = 0i32;
     let mut gaps: Vec<CheckpointGap> = Vec::new();
 
     struct RawRow {
@@ -464,11 +496,14 @@ pub async fn get_tree_resource_gaps(
         progress: i32,
         is_locked: bool,
         leaf_order: i32,
+        concept_slug: Option<String>,
+        tasks: serde_json::Value,
         skill_name: String,
         skill_order: i32,
         phase_name: String,
         phase_order: i32,
-        link_count: i64,
+        green_count: i64,
+        weak_count: i64,
     }
 
     let parsed: Vec<RawRow> = rows.iter().map(|r| {
@@ -479,35 +514,161 @@ pub async fn get_tree_resource_gaps(
             progress: r.try_get::<i32, _>("progress").map_err(|e: sqlx::Error| e.to_string())?,
             is_locked: r.try_get::<bool, _>("is_locked").map_err(|e: sqlx::Error| e.to_string())?,
             leaf_order: r.try_get::<i32, _>("leaf_order").unwrap_or(0),
+            concept_slug: r.try_get("concept_slug").unwrap_or(None),
+            tasks: r.try_get("tasks").unwrap_or(serde_json::Value::Null),
             skill_name: r.try_get("skill_name").map_err(|e: sqlx::Error| e.to_string())?,
             skill_order: r.try_get::<i32, _>("skill_order").unwrap_or(0),
             phase_name: r.try_get("phase_name").map_err(|e: sqlx::Error| e.to_string())?,
             phase_order: r.try_get::<i32, _>("phase_order").unwrap_or(0),
-            link_count: r.try_get("link_count").map_err(|e: sqlx::Error| e.to_string())?,
+            green_count: r.try_get("green_count").map_err(|e: sqlx::Error| e.to_string())?,
+            weak_count: r.try_get("weak_count").map_err(|e: sqlx::Error| e.to_string())?,
         })
     }).collect::<Result<Vec<_>, String>>()?;
 
-    for row in &parsed {
-        if row.link_count > 0 {
-            matched_checkpoints += 1;
-        } else {
-            gaps.push(CheckpointGap {
-                node_id: row.node_id.clone(),
-                title: row.title.clone(),
-                description: row.description.clone(),
-                phase_name: row.phase_name.clone(),
-                skill_name: row.skill_name.clone(),
-                progress: row.progress,
-                is_locked: row.is_locked,
-            });
+    // Gather concept_slugs for all gap nodes so we can do two batch queries:
+    //   1. Which slugs have a universal_skills row?
+    //   2. Which of those have skill_dependencies prerequisite edges?
+    let gap_slugs: Vec<String> = parsed.iter()
+        .filter(|r| r.green_count == 0)
+        .filter_map(|r| r.concept_slug.clone())
+        .collect();
+
+    // slug → skill (id, name) — tells us if the concept is in the KG
+    struct SkillEntry { id: String, name: String }
+    let skill_by_slug: std::collections::HashMap<String, SkillEntry> = if !gap_slugs.is_empty() {
+        let skill_rows = sqlx::query(
+            "SELECT id, name, concept_slug
+             FROM universal_skills
+             WHERE concept_slug = ANY($1) AND concept_slug IS NOT NULL"
+        )
+        .bind(&gap_slugs)
+        .fetch_all(&database.pool)
+        .await
+        .unwrap_or_default();
+
+        skill_rows.iter().filter_map(|r| {
+            let slug: Option<String> = r.try_get("concept_slug").ok()?;
+            let slug = slug?;
+            let id: String = r.try_get("id").ok()?;
+            let name: String = r.try_get("name").ok()?;
+            Some((slug, SkillEntry { id, name }))
+        }).collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    // skill_id → Vec<(prereq_slug, prereq_name)> for skills that have prerequisite edges
+    let kg_skill_ids: Vec<String> = skill_by_slug.values().map(|e| e.id.clone()).collect();
+    struct PrereqEntry { slug: String, name: String }
+    let prereq_map: std::collections::HashMap<String, Vec<PrereqEntry>> = if !kg_skill_ids.is_empty() {
+        let prereq_rows = sqlx::query(
+            "SELECT sd.source_skill_id,
+                    COALESCE(up.concept_slug, '') AS prereq_slug,
+                    up.name AS prereq_name
+             FROM skill_dependencies sd
+             JOIN universal_skills up ON up.id = sd.target_skill_id
+             WHERE sd.source_skill_id = ANY($1)
+               AND sd.relationship = 'prerequisite'"
+        )
+        .bind(&kg_skill_ids)
+        .fetch_all(&database.pool)
+        .await
+        .unwrap_or_default();
+
+        let mut map: std::collections::HashMap<String, Vec<PrereqEntry>> = std::collections::HashMap::new();
+        for row in &prereq_rows {
+            let src_id: String = row.try_get("source_skill_id").unwrap_or_default();
+            let prereq_slug: String = row.try_get("prereq_slug").unwrap_or_default();
+            let prereq_name: String = row.try_get("prereq_name").unwrap_or_default();
+            if !src_id.is_empty() {
+                map.entry(src_id).or_default().push(PrereqEntry { slug: prereq_slug, name: prereq_name });
+            }
         }
+        map
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    for row in &parsed {
+        if row.green_count > 0 {
+            green_matched_checkpoints += 1;
+            continue;
+        }
+
+        let has_weak_matches = row.weak_count > 0;
+
+        let mastery_criteria = row.tasks.get("mastery_criteria")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+
+        // Classify gap and build search_terms / prerequisite_concepts
+        let (gap_type, search_terms, prerequisite_concepts) = match &row.concept_slug {
+            None => {
+                // No concept slug at all — treat as KnowledgeGap
+                let search_terms = vec![row.title.clone(), row.skill_name.clone()];
+                (GapType::KnowledgeGap, search_terms, vec![])
+            }
+            Some(slug) => {
+                match skill_by_slug.get(slug.as_str()) {
+                    None => {
+                        // Slug present but no KG entry → unknown territory
+                        let search_terms = vec![deslugify(slug), row.skill_name.clone()];
+                        (GapType::KnowledgeGap, search_terms, vec![])
+                    }
+                    Some(skill_entry) => {
+                        let prereqs = prereq_map.get(&skill_entry.id);
+                        let is_empty = prereqs.map_or(true, |p| p.is_empty());
+                        if is_empty {
+                            // KG entry exists but no prerequisite edges yet
+                            let search_terms = vec![deslugify(slug)];
+                            (GapType::PartialKGGap, search_terms, vec![])
+                        } else {
+                            let prereqs = prereqs.unwrap();
+                            // Full KG context — search on prerequisites + own slug
+                            let mut search_terms: Vec<String> = prereqs.iter()
+                                .filter(|p| !p.slug.is_empty())
+                                .map(|p| deslugify(&p.slug))
+                                .collect();
+                            search_terms.push(deslugify(slug));
+                            let prerequisite_concepts: Vec<String> = prereqs.iter()
+                                .map(|p| p.name.clone())
+                                .collect();
+                            (GapType::LibraryGap, search_terms, prerequisite_concepts)
+                        }
+                    }
+                }
+            }
+        };
+
+        gaps.push(CheckpointGap {
+            node_id: row.node_id.clone(),
+            title: row.title.clone(),
+            description: row.description.clone(),
+            phase_name: row.phase_name.clone(),
+            skill_name: row.skill_name.clone(),
+            progress: row.progress,
+            is_locked: row.is_locked,
+            has_weak_matches,
+            concept_slug: row.concept_slug.clone(),
+            search_terms,
+            mastery_criteria,
+            gap_type,
+            prerequisite_concepts,
+        });
     }
 
-    // Sort: unlocked first (can act on them now), then by phase→skill→leaf order
+    // Sort: unlocked first, then LibraryGap before PartialKG before Knowledge,
+    // then by phase→skill→leaf order
+    let gap_type_order = |g: &GapType| match g {
+        GapType::LibraryGap   => 0u8,
+        GapType::PartialKGGap => 1,
+        GapType::KnowledgeGap => 2,
+    };
     gaps.sort_by(|a, b| {
         a.is_locked.cmp(&b.is_locked)
+            .then_with(|| gap_type_order(&a.gap_type).cmp(&gap_type_order(&b.gap_type)))
             .then_with(|| {
-                // Recover phase/skill order from parsed rows for stable sort
                 let pa = parsed.iter().find(|r| r.node_id == a.node_id);
                 let pb = parsed.iter().find(|r| r.node_id == b.node_id);
                 match (pa, pb) {
@@ -521,19 +682,232 @@ pub async fn get_tree_resource_gaps(
 
     let unmatched_checkpoints = gaps.len() as i32;
     let coverage_percent = if total_checkpoints > 0 {
-        (matched_checkpoints as f32 / total_checkpoints as f32) * 100.0
+        (green_matched_checkpoints as f32 / total_checkpoints as f32) * 100.0
     } else {
         100.0
     };
+    let library_gap_count = gaps.iter().filter(|g| g.gap_type == GapType::LibraryGap).count() as i32;
+    let knowledge_gap_count = gaps.iter().filter(|g| g.gap_type == GapType::KnowledgeGap).count() as i32;
+    let partial_kg_gap_count = gaps.iter().filter(|g| g.gap_type == GapType::PartialKGGap).count() as i32;
 
     Ok(TreeResourceGaps {
         tree_id,
         total_checkpoints,
-        matched_checkpoints,
+        green_matched_checkpoints,
         unmatched_checkpoints,
         coverage_percent,
+        library_gap_count,
+        knowledge_gap_count,
+        partial_kg_gap_count,
         gaps,
     })
+}
+
+// ─── NodeNeighborhood ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NeighborNode {
+    pub node_id: String,
+    pub title: String,
+    pub progress: i32,
+    pub is_locked: bool,
+    pub concept_slug: Option<String>,
+    pub skill_level: Option<i32>,
+    pub resources: Vec<MatchedResource>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeNeighborhood {
+    pub node_id: String,
+    pub prerequisites: Vec<NeighborNode>,
+    pub dependents: Vec<NeighborNode>,
+    pub siblings: Vec<NeighborNode>,
+}
+
+async fn fetch_neighbor_resources(pool: &sqlx::PgPool, node_id: &str) -> Vec<MatchedResource> {
+    let rows = sqlx::query(
+        "SELECT mr.id AS resource_id, mr.title, mr.url, mr.type AS resource_type,
+                mnl.matched_section_title, mnl.matched_page_start, mnl.matched_page_end,
+                mnl.relevance_score
+         FROM mimir_node_links mnl
+         JOIN mimir_resources mr ON mr.id = mnl.resource_id
+         WHERE mnl.node_id = $1
+         ORDER BY mnl.relevance_score ASC NULLS LAST
+         LIMIT 3"
+    )
+    .bind(node_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    rows.iter().filter_map(|r| {
+        Some(MatchedResource {
+            resource_id: r.try_get("resource_id").ok()?,
+            title: r.try_get("title").ok()?,
+            url: r.try_get("url").ok()?,
+            resource_type: r.try_get("resource_type").ok()?,
+            matched_section_title: r.try_get("matched_section_title").unwrap_or(None),
+            matched_page_start: r.try_get("matched_page_start").unwrap_or(None),
+            matched_page_end: r.try_get("matched_page_end").unwrap_or(None),
+            relevance_score: r.try_get("relevance_score").unwrap_or(None),
+        })
+    }).collect()
+}
+
+async fn build_neighbor_nodes(
+    pool: &sqlx::PgPool,
+    rows: Vec<sqlx::postgres::PgRow>,
+    skill_level_by_slug: &std::collections::HashMap<String, i32>,
+) -> Vec<NeighborNode> {
+    let mut nodes = Vec::new();
+    for r in &rows {
+        let node_id: String = match r.try_get("node_id") { Ok(v) => v, Err(_) => continue };
+        let title: String = r.try_get("title").unwrap_or_default();
+        let progress: i32 = r.try_get::<Option<i32>, _>("progress").unwrap_or(None).unwrap_or(0);
+        let is_locked: bool = r.try_get("is_locked").unwrap_or(false);
+        let concept_slug: Option<String> = r.try_get("concept_slug").unwrap_or(None);
+        let skill_level = concept_slug.as_deref().and_then(|s| skill_level_by_slug.get(s).copied());
+        let resources = fetch_neighbor_resources(pool, &node_id).await;
+        nodes.push(NeighborNode { node_id, title, progress, is_locked, concept_slug, skill_level, resources });
+    }
+    nodes
+}
+
+#[tauri::command]
+pub async fn get_node_neighborhood(
+    node_id: String,
+    database: State<'_, Database>,
+) -> Result<NodeNeighborhood, String> {
+    let pool = &database.pool;
+
+    // Get this node's parent_id and concept_slug
+    let node_row = sqlx::query(
+        "SELECT parent_id, concept_slug FROM tree_nodes WHERE id = $1"
+    )
+    .bind(&node_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("Node not found: {}", node_id))?;
+
+    let parent_id: Option<String> = node_row.try_get("parent_id").unwrap_or(None);
+    let concept_slug: Option<String> = node_row.try_get("concept_slug").unwrap_or(None);
+
+    // Siblings: other leaf nodes under same parent
+    let sibling_rows = if let Some(ref pid) = parent_id {
+        sqlx::query(
+            "SELECT id AS node_id, title, COALESCE(progress, 0) AS progress,
+                    COALESCE(is_locked, false) AS is_locked, concept_slug
+             FROM tree_nodes
+             WHERE parent_id = $1 AND id != $2 AND type = 'leaf'
+             ORDER BY order_index ASC"
+        )
+        .bind(pid)
+        .bind(&node_id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+    } else {
+        vec![]
+    };
+
+    // Resolve concept_slug → universal_skills.id for prerequisite/dependent lookup
+    let skill_id: Option<String> = if let Some(ref slug) = concept_slug {
+        sqlx::query(
+            "SELECT id FROM universal_skills WHERE concept_slug = $1 LIMIT 1"
+        )
+        .bind(slug)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.try_get::<String, _>("id").ok())
+    } else {
+        None
+    };
+
+    // Prerequisite neighbor nodes: skills whose concept_slug is a prerequisite of this node's skill
+    // sd.source_skill_id = this_skill, sd.target_skill_id = prereq_skill
+    let prereq_rows = if let Some(ref sid) = skill_id {
+        sqlx::query(
+            "SELECT tn.id AS node_id, tn.title, COALESCE(tn.progress, 0) AS progress,
+                    COALESCE(tn.is_locked, false) AS is_locked, tn.concept_slug
+             FROM skill_dependencies sd
+             JOIN universal_skills us ON us.id = sd.target_skill_id
+             JOIN tree_nodes tn ON tn.concept_slug = us.concept_slug
+             WHERE sd.source_skill_id = $1
+               AND sd.relationship IN ('prerequisite', 'part_of')
+               AND tn.type = 'leaf'
+             ORDER BY tn.order_index ASC
+             LIMIT 8"
+        )
+        .bind(sid)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+    } else {
+        vec![]
+    };
+
+    // Dependent neighbor nodes: skills that depend on this node's skill
+    // sd.source_skill_id = dependent_skill, sd.target_skill_id = this_skill
+    let dependent_rows = if let Some(ref sid) = skill_id {
+        sqlx::query(
+            "SELECT tn.id AS node_id, tn.title, COALESCE(tn.progress, 0) AS progress,
+                    COALESCE(tn.is_locked, false) AS is_locked, tn.concept_slug
+             FROM skill_dependencies sd
+             JOIN universal_skills us ON us.id = sd.source_skill_id
+             JOIN tree_nodes tn ON tn.concept_slug = us.concept_slug
+             WHERE sd.target_skill_id = $1
+               AND sd.relationship IN ('prerequisite', 'part_of')
+               AND tn.type = 'leaf'
+             ORDER BY tn.order_index ASC
+             LIMIT 8"
+        )
+        .bind(sid)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+    } else {
+        vec![]
+    };
+
+    // Gather all concept_slugs from all neighbor sets to batch-fetch skill levels
+    let all_slugs: Vec<String> = sibling_rows.iter()
+        .chain(prereq_rows.iter())
+        .chain(dependent_rows.iter())
+        .filter_map(|r| r.try_get::<Option<String>, _>("concept_slug").ok().flatten())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    let skill_level_by_slug: std::collections::HashMap<String, i32> = if !all_slugs.is_empty() {
+        sqlx::query(
+            "SELECT concept_slug, level FROM universal_skills
+             WHERE concept_slug = ANY($1) AND concept_slug IS NOT NULL"
+        )
+        .bind(&all_slugs)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| {
+            let slug: Option<String> = r.try_get("concept_slug").ok()?;
+            let level: Option<i32> = r.try_get("level").ok()?;
+            Some((slug?, level?))
+        })
+        .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    let siblings = build_neighbor_nodes(pool, sibling_rows, &skill_level_by_slug).await;
+    let prerequisites = build_neighbor_nodes(pool, prereq_rows, &skill_level_by_slug).await;
+    let dependents = build_neighbor_nodes(pool, dependent_rows, &skill_level_by_slug).await;
+
+    Ok(NodeNeighborhood { node_id, prerequisites, dependents, siblings })
 }
 
 // ─── SkillGraphSnapshot ───────────────────────────────────────────────────────

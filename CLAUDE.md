@@ -40,7 +40,10 @@ Read `PRD.md` for the full vision. This file is your technical bible.
 - Shared `reqwest::Client` managed as Tauri state — injected into all commands that call external APIs (brain, mimir modules, orchestrator)
 - God module splits: `brain.rs` → `llm_client.rs` + `github.rs` + `prompt_builders.rs` + `tree_persistence.rs`; `mimir.rs` → `mimir_ingest.rs` + `mimir_retrieval.rs` + `mimir_tags.rs` + `mimir_manage.rs`
 - Postgres on Neon with pgvector
-- All migrations (001-035) run automatically on startup
+- All migrations (001-036) run automatically on startup
+- HNSW index on `tree_nodes.title_embedding vector(1024)` (migration 036) — used for async resource→node ANN matching
+- Background async job queue now includes `MatchResourceToNodes { resource_id: String }` — enqueued by `on_resource_ingested_async` after auto-tag completes; worker calls `run_match_resource_to_nodes` with in-memory reranking (same-tree boost -0.05, lexical overlap boost -0.03; top-5, threshold < 0.55)
+- `get_node_neighborhood` command in `read_models.rs` — returns `NodeNeighborhood { prerequisites, dependents, siblings }` each as `Vec<NeighborNode>`; traverses `concept_slug → universal_skills → skill_dependencies → tree_nodes`; top-3 resources per neighbor via `mimir_node_links`
 
 ---
 
@@ -82,8 +85,8 @@ Read `PRD.md` for the full vision. This file is your technical bible.
 │   │   ├── mimir_retrieval.rs         # Hybrid RAG, GraphRAG traversal, session memory, tree context (split from mimir.rs)
 │   │   ├── mimir_tags.rs              # Auto-tagging, tag filter helpers (split from mimir.rs)
 │   │   ├── mimir_manage.rs            # Rescrape, re-embed, resource CRUD, completion (split from mimir.rs)
-│   │   ├── orchestrator.rs            # Background job queue (JobQueue + start_worker) + cascade handlers + ygg-* events
-│   │   ├── read_models.rs             # Purpose-built read-model Tauri commands (4 helpers)
+│   │   ├── orchestrator.rs            # Background job queue (JobQueue + start_worker) + cascade handlers + ygg-* events; MatchResourceToNodes variant
+│   │   ├── read_models.rs             # Purpose-built read-model Tauri commands (5 helpers, incl. get_node_neighborhood)
 │   │   ├── work_commands.rs           # Co-op/topic/resource/skill commands
 │   │   ├── job_commands.rs            # Job application commands
 │   │   ├── idea_commands.rs           # Ideas CRUD + promote to project
@@ -92,7 +95,7 @@ Read `PRD.md` for the full vision. This file is your technical bible.
 │   │   ├── daily_commands.rs          # Daily Eisenhower Matrix commands
 │   │   ├── export_commands.rs         # Tree ZIP export
 │   │   └── database.rs               # PgPool connection + migrations
-│   ├── migrations/                    # Auto-run on startup, sequential (001-035)
+│   ├── migrations/                    # Auto-run on startup, sequential (001-036)
 │   └── capabilities/
 │       └── default.json               # Tauri 2 capability grants (includes core:event:allow-listen)
 ├── scraper/                           # Python FastAPI scraper (port 3002)
@@ -134,8 +137,9 @@ trees             -- id, project_id FK, name, version INT, parent_tree_id FK, ar
 tree_nodes        -- id, tree_id FK, parent_id FK, type (trunk/branch/leaf),
                   -- title, description, progress, tasks JSONB, resources JSONB,
                   -- x, y, order_index, is_locked,
-                  -- concept_id TEXT,   ← stable identity across tree versions
-                  -- concept_slug TEXT  ← URL-safe slug for same
+                  -- concept_id TEXT,              ← stable identity across tree versions
+                  -- concept_slug TEXT,            ← URL-safe slug for same
+                  -- title_embedding vector(1024)  ← HNSW index (migration 036) for ANN resource matching
 tree_edges        -- id, tree_id FK, source_node_id FK, target_node_id FK
 disciplines       -- id, name, description, color
 ```
@@ -205,6 +209,8 @@ universal_skills     -- id, name, domain TEXT (legacy), domain_id FK skill_domai
                      -- concept_slug TEXT UNIQUE, parent_skill_id FK,
                      -- review_needed BOOLEAN DEFAULT false,
                      -- status TEXT CHECK(active|unclassified|archived)
+                     -- origin TEXT (planned: resume_seed|tree_quest|inferred|manual)
+                     -- state TEXT (planned: seed|adjacent|gap|growth_target|mastered)
 
 skill_aliases        -- id, canonical_skill_id FK, alias TEXT UNIQUE, created_at
                      -- alias lookups are case-insensitive (idx on LOWER(alias))
@@ -317,7 +323,7 @@ const result = await invoke<ReturnType>('command_name', { paramName: value });
 3. Call from frontend with `invoke('command_name', { params })`
 
 ### Add a Migration
-Create `src-tauri/migrations/NNN_description.sql` — runs automatically on startup. Never modify existing migrations. Current highest: **035**.
+Create `src-tauri/migrations/NNN_description.sql` — runs automatically on startup. Never modify existing migrations. Current highest: **036**.
 
 ### Add a New Page
 1. Create `src/pages/NewPage.tsx`
@@ -497,9 +503,12 @@ pub(crate) enum OrchestratorJob {
     InferSkillDeps,
     RescrapeResources { resource_ids: Vec<String> },   // currently unused
     AutoTagResources { resource_ids: Vec<String> },
+    MatchResourceToNodes { resource_id: String },      // enqueued after ingest auto-tag completes
 }
 ```
 `start_worker(pool, app_handle)` is called in `main.rs` setup; the returned `JobQueue` is managed as Tauri state. Channel capacity: 64.
+
+`MatchResourceToNodes` flow: `on_resource_ingested_async` awaits `auto_tag_single` → enqueues job → worker calls `run_match_resource_to_nodes` → embeds first chunk → ANN top-10 via HNSW on `title_embedding` → in-memory rerank (same-tree boost -0.05, lexical overlap -0.03) → sort ascending → top-5, threshold < 0.55 → upsert `mimir_node_links`.
 
 ### ygg-* Events emitted
 Workers emit progress/completion events via `app.emit()`. Frontend components subscribe with `listen()` and must call `unlisten()` on completion — not in `finally`.
@@ -508,7 +517,7 @@ Workers emit progress/completion events via `app.emit()`. Frontend components su
 
 ## Read Models
 
-`src-tauri/src/read_models.rs` exposes four purpose-built Tauri commands:
+`src-tauri/src/read_models.rs` exposes five purpose-built Tauri commands:
 
 | Command | Returns | Purpose |
 |---|---|---|
@@ -516,8 +525,18 @@ Workers emit progress/completion events via `app.emit()`. Frontend components su
 | `get_node_chat_context` | `NodeChatContext` | Node title + description + linked resources for Mimir context |
 | `get_project_tree_summary` | `ProjectTreeSummary` | Full project + tree + phase completion stats |
 | `get_skill_graph_snapshot` | `SkillGraphSnapshot` | Skills + dependencies + gaps in one round trip |
+| `get_node_neighborhood` | `NodeNeighborhood` | Prerequisites, dependents, siblings for a leaf node — each with top-3 resources and skill level |
 
 All structs use `#[serde(rename_all = "camelCase")]`.
+
+### get_node_neighborhood
+Query logic:
+- Siblings: `WHERE parent_id = $1 AND id != $2 AND type = 'leaf' ORDER BY order_index`
+- Resolve `concept_slug` → `universal_skills.id` for the focal node
+- Prerequisites: `skill_dependencies WHERE source_skill_id = focal AND relationship IN ('prerequisite','part_of')` → join `universal_skills → tree_nodes` via `concept_slug`
+- Dependents: `skill_dependencies WHERE target_skill_id = focal` → same join direction reversed
+- Batch skill levels: collect all `concept_slug`s from all three sets → single `ANY($1)` query
+- Resources per neighbor: `mimir_node_links JOIN mimir_resources LIMIT 3` per node
 
 ---
 

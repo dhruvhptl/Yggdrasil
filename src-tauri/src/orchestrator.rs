@@ -21,6 +21,7 @@ pub(crate) enum OrchestratorJob {
     ReembedResources { resource_ids: Vec<String> },
     InferSkillDeps,
     AutoTagResources { resource_ids: Vec<String> },
+    MatchResourceToNodes { resource_id: String },
 }
 
 // ─── JobQueue (managed Tauri state) ──────────────────────────────────────────
@@ -59,6 +60,11 @@ pub fn start_worker(pool: PgPool, app: AppHandle, client: reqwest::Client) -> Jo
                 OrchestratorJob::AutoTagResources { resource_ids } => {
                     run_autotag_resources(&pool, &app, &client, resource_ids).await;
                 }
+                OrchestratorJob::MatchResourceToNodes { resource_id } => {
+                    println!("🔍 [worker/debug] dispatching MatchResourceToNodes resource={}", resource_id);
+                    run_match_resource_to_nodes(&pool, &app, &client, &resource_id).await;
+                    println!("🔍 [worker/debug] MatchResourceToNodes done resource={}", resource_id);
+                }
             }
         }
     });
@@ -92,6 +98,13 @@ pub async fn enqueue_autotag(
     queue.send(OrchestratorJob::AutoTagResources { resource_ids }).await
 }
 
+#[tauri::command]
+pub async fn enqueue_infer_deps(
+    queue: tauri::State<'_, JobQueue>,
+) -> Result<(), String> {
+    queue.send(OrchestratorJob::InferSkillDeps).await
+}
+
 // ─── Job implementations ──────────────────────────────────────────────────────
 
 async fn run_rematch_all_nodes(pool: &PgPool, app: &AppHandle, client: &reqwest::Client, tree_id: &str) {
@@ -117,7 +130,29 @@ async fn run_rematch_all_nodes(pool: &PgPool, app: &AppHandle, client: &reqwest:
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         match crate::mimir_retrieval::match_node_impl(pool, client, node_id).await {
-            Ok(_) => {}
+            Ok(_) => {
+                // Cache the title embedding so MatchResourceToNodes can use the HNSW index
+                if let Ok(Some(row)) = sqlx::query(
+                    "SELECT title FROM tree_nodes WHERE id = $1 AND title_embedding IS NULL"
+                )
+                .bind(node_id)
+                .fetch_optional(pool)
+                .await
+                {
+                    if let Ok(title) = row.try_get::<String, _>("title") {
+                        if let Ok(emb) = crate::mimir_ingest::get_embedding(client, &title).await {
+                            let vec_str = crate::mimir_ingest::vector_str(&emb);
+                            let _ = sqlx::query(
+                                "UPDATE tree_nodes SET title_embedding = $1::vector WHERE id = $2"
+                            )
+                            .bind(&vec_str)
+                            .bind(node_id)
+                            .execute(pool)
+                            .await;
+                        }
+                    }
+                }
+            }
             Err(e) => println!("⚠️  [job/rematch] node {}: {}", node_id, e),
         }
         let _ = app.emit("ygg-rematch-progress", serde_json::json!({
@@ -208,24 +243,35 @@ pub async fn on_tree_generated(
 
 // ─── on_resource_ingested ─────────────────────────────────────────────────────
 
-pub async fn on_resource_ingested(
+pub async fn on_resource_ingested_async(
     pool: &PgPool,
     app: &AppHandle,
     client: &reqwest::Client,
     resource_id: &str,
+    queue: &JobQueue,
 ) {
+    println!("🔍 [orch/debug] on_resource_ingested_async START resource={}", resource_id);
+
+    println!("🔍 [orch/debug] calling auto_tag_single...");
     if let Err(e) = auto_tag_single(pool, client, resource_id).await {
         println!("⚠️  [orch] auto_tag_single failed for {}: {}", resource_id, e);
     }
+    println!("🔍 [orch/debug] auto_tag_single done");
 
-    if let Err(e) = match_resource_to_nodes(pool, client, resource_id).await {
-        println!("⚠️  [orch] match_resource_to_nodes failed for {}: {}", resource_id, e);
+    // Enqueue node matching as a background job — non-blocking.
+    println!("🔍 [orch/debug] sending MatchResourceToNodes to queue...");
+    match queue.send(OrchestratorJob::MatchResourceToNodes {
+        resource_id: resource_id.to_string(),
+    }).await {
+        Ok(()) => println!("🔍 [orch/debug] MatchResourceToNodes enqueued OK for {}", resource_id),
+        Err(e) => println!("⚠️  [orch] enqueue MatchResourceToNodes failed: {}", e),
     }
 
     let _ = app.emit("ygg-resource-ingested", serde_json::json!({
         "resourceId": resource_id,
     }));
     println!("📡 [orch] ygg-resource-ingested emitted (resource={})", resource_id);
+    println!("🔍 [orch/debug] on_resource_ingested_async END resource={}", resource_id);
 }
 
 // ─── on_resource_completed ────────────────────────────────────────────────────
@@ -293,6 +339,16 @@ pub async fn on_resource_completed(
         println!("⚠️  [orch] sync_trees_inner failed: {}", e);
     } else if let Err(e) = crate::skill_commands::recalculate_levels_inner(pool).await {
         println!("⚠️  [orch] recalculate_levels_inner failed: {}", e);
+    }
+
+    // Write skill evidence for every high-confidence (green) node match.
+    let skills_updated = write_mimir_resource_evidence(pool, resource_id).await;
+    if skills_updated > 0 {
+        if let Err(e) = crate::skill_commands::recalculate_levels_inner(pool).await {
+            println!("⚠️  [orch] recalculate_levels_inner (mimir evidence) failed: {}", e);
+        }
+        let _ = app.emit("ygg-skills-updated", serde_json::json!({}));
+        println!("📡 [orch] ygg-skills-updated emitted ({} skills from mimir evidence)", skills_updated);
     }
 
     let _ = app.emit("ygg-resource-completed", serde_json::json!({ "resourceId": resource_id }));
@@ -561,57 +617,295 @@ async fn auto_tag_single(pool: &PgPool, client: &reqwest::Client, resource_id: &
     Ok(())
 }
 
-async fn match_resource_to_nodes(pool: &PgPool, client: &reqwest::Client, resource_id: &str) -> Result<(), String> {
-    let chunk_row = sqlx::query(
-        "SELECT mc.content FROM mimir_chunks mc WHERE mc.resource_id = $1 LIMIT 1"
+/// For a just-completed resource, find all green-matched nodes (relevance_score < 0.3),
+/// upsert a universal_skill for each node title, and write a skill_evidence row.
+/// Returns the number of evidence rows written.
+async fn write_mimir_resource_evidence(pool: &PgPool, resource_id: &str) -> usize {
+    // Fetch resource title for the evidence payload.
+    let title: String = match sqlx::query(
+        "SELECT title FROM mimir_resources WHERE id = $1"
     )
     .bind(resource_id)
     .fetch_optional(pool)
     .await
-    .map_err(|e| e.to_string())?;
-
-    let first_content = match chunk_row {
-        Some(r) => r.try_get::<String, _>("content").unwrap_or_default(),
-        None => return Ok(()),
+    {
+        Ok(Some(r)) => r.try_get("title").unwrap_or_default(),
+        _ => String::new(),
     };
 
-    if first_content.is_empty() {
-        return Ok(());
-    }
-
-    let leaf_rows = sqlx::query(
-        "SELECT id FROM tree_nodes
-         WHERE type = 'leaf'
-           AND id NOT IN (
-               SELECT node_id FROM mimir_node_links WHERE resource_id = $1
-           )"
+    // Green matches: relevance_score is a cosine distance so lower = better match.
+    let rows = match sqlx::query(
+        "SELECT mnl.node_id, mnl.relevance_score, tn.title AS node_title
+         FROM mimir_node_links mnl
+         JOIN tree_nodes tn ON tn.id = mnl.node_id
+         WHERE mnl.resource_id = $1
+           AND mnl.relevance_score < 0.3"
     )
     .bind(resource_id)
     .fetch_all(pool)
     .await
-    .map_err(|e| e.to_string())?;
+    {
+        Ok(r) => r,
+        Err(e) => {
+            println!("⚠️  [orch] write_mimir_resource_evidence fetch failed: {}", e);
+            return 0;
+        }
+    };
 
-    if leaf_rows.is_empty() {
-        return Ok(());
+    if rows.is_empty() {
+        return 0;
     }
 
-    let mut matched = 0usize;
+    let mut written = 0usize;
 
-    for row in &leaf_rows {
-        let node_id: String = match row.try_get("id") {
-            Ok(v) => v,
-            Err(_) => continue,
+    for row in &rows {
+        let node_id: String = match row.try_get("node_id") {
+            Ok(v) => v, Err(_) => continue,
         };
-        match crate::mimir_retrieval::match_node_impl(pool, client, &node_id).await {
-            Ok(resources) if resources.iter().any(|r| r.id == resource_id) => matched += 1,
-            Ok(_) => {}
-            Err(e) => println!("⚠️  [orch] match_resource_to_nodes node {}: {}", node_id, e),
+        let relevance_score: f64 = match row.try_get("relevance_score") {
+            Ok(v) => v, Err(_) => continue,
+        };
+        let node_title: String = match row.try_get("node_title") {
+            Ok(v) => v, Err(_) => continue,
+        };
+        if node_title.is_empty() {
+            continue;
+        }
+
+        let evidence = serde_json::json!({
+            "type": "mimir_resource",
+            "resource_id": resource_id,
+            "resource_title": title,
+            "node_id": node_id,
+            "relevance_score": relevance_score,
+        });
+
+        let skill_id = match crate::skill_commands::upsert_skill(pool, &node_title, None, evidence.clone()).await {
+            Ok(id) => id,
+            Err(e) => {
+                println!("⚠️  [orch] upsert_skill '{}' failed: {}", node_title, e);
+                continue;
+            }
+        };
+
+        // Write the first-class skill_evidence row (idempotent via unique index).
+        let evidence_id = format!("se_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+        match sqlx::query(
+            "INSERT INTO skill_evidence (id, skill_id, source_type, source_id, payload, recorded_at)
+             VALUES ($1, $2, 'mimir_resource', $3, $4::jsonb, NOW())
+             ON CONFLICT DO NOTHING"
+        )
+        .bind(&evidence_id)
+        .bind(&skill_id)
+        .bind(resource_id)
+        .bind(evidence.to_string())
+        .execute(pool)
+        .await
+        {
+            Ok(r) if r.rows_affected() > 0 => {
+                written += 1;
+                println!("📚 [orch] skill evidence: '{}' ← resource '{}' (score={:.3})", node_title, title, relevance_score);
+            }
+            Ok(_) => {} // already exists
+            Err(e) => println!("⚠️  [orch] skill_evidence insert failed for '{}': {}", node_title, e),
         }
     }
 
-    if matched > 0 {
-        println!("🔗 [orch] new resource matched to {} nodes", matched);
+    written
+}
+
+async fn run_match_resource_to_nodes(pool: &PgPool, app: &AppHandle, client: &reqwest::Client, resource_id: &str) {
+    println!("🔍 [job/match-resource/debug] START resource={}", resource_id);
+
+    // Fetch resource title and the active tree for its project (for same-tree boost)
+    let meta_row = sqlx::query(
+        "SELECT mr.title, p.active_tree_id \
+         FROM mimir_resources mr \
+         LEFT JOIN mimir_node_links mnl ON mnl.resource_id = mr.id \
+         LEFT JOIN tree_nodes tn ON tn.id = mnl.node_id \
+         LEFT JOIN projects p ON p.active_tree_id = tn.tree_id \
+         WHERE mr.id = $1 \
+         LIMIT 1"
+    )
+    .bind(resource_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+
+    // Fallback: just get the title without the tree join
+    let (title, active_tree_id) = if let Some(row) = meta_row {
+        let t = row.try_get::<String, _>("title").unwrap_or_default();
+        let tree: Option<String> = row.try_get("active_tree_id").unwrap_or(None);
+        println!("🔍 [job/match-resource/debug] meta ok title=\"{}\" active_tree={:?}", t, tree);
+        (t, tree)
+    } else {
+        println!("🔍 [job/match-resource/debug] meta join returned no row, falling back to title-only query");
+        let t = sqlx::query("SELECT title FROM mimir_resources WHERE id = $1")
+            .bind(resource_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|r| r.try_get::<String, _>("title").ok())
+            .unwrap_or_default();
+        println!("🔍 [job/match-resource/debug] fallback title=\"{}\"", t);
+        (t, None)
+    };
+
+    // Get resource embedding from its first chunk
+    let embed_result: Result<Vec<f32>, String> = async {
+        let chunk_row = sqlx::query(
+            "SELECT mc.content FROM mimir_chunks mc WHERE mc.resource_id = $1 LIMIT 1"
+        )
+        .bind(resource_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let content = match chunk_row {
+            Some(r) => r.try_get::<String, _>("content").unwrap_or_default(),
+            None => return Err("no chunks".to_string()),
+        };
+        if content.is_empty() {
+            return Err("empty content".to_string());
+        }
+        crate::mimir_ingest::get_embedding(client, &content).await
+    }.await;
+
+    let embedding = match embed_result {
+        Ok(e) => { println!("🔍 [job/match-resource/debug] embed OK ({} dims)", e.len()); e }
+        Err(e) => {
+            println!("⚠️  [job/match-resource] embed failed for {}: {}", resource_id, e);
+            return;
+        }
+    };
+
+    let vec_str = crate::mimir_ingest::vector_str(&embedding);
+
+    // ANN search: top-10 leaf nodes by title_embedding cosine distance
+    println!("🔍 [job/match-resource/debug] running HNSW ANN query...");
+    let candidate_rows = match sqlx::query(
+        "SELECT tn.id, tn.title, tn.tree_id, \
+                tn.title_embedding <=> $1::vector AS distance \
+         FROM tree_nodes tn \
+         WHERE tn.type = 'leaf' \
+           AND tn.title_embedding IS NOT NULL \
+         ORDER BY tn.title_embedding <=> $1::vector \
+         LIMIT 10"
+    )
+    .bind(&vec_str)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => {
+            println!("🔍 [job/match-resource/debug] ANN returned {} candidates", rows.len());
+            rows
+        }
+        Err(e) => {
+            println!("⚠️  [job/match-resource] ANN query failed: {}", e);
+            vec![]
+        }
+    };
+
+    // Tokenize the resource title for lexical overlap boost
+    let stopwords: std::collections::HashSet<&str> = [
+        "the", "a", "an", "of", "in", "for", "to", "and", "or", "with",
+    ].iter().copied().collect();
+    let resource_tokens: std::collections::HashSet<String> = title
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty() && !stopwords.contains(*t))
+        .map(|t| t.to_string())
+        .collect();
+
+    // Rerank: apply boosts in-memory, collect (final_score, node_id, node_title, tree_id)
+    struct Candidate {
+        node_id: String,
+        final_score: f64,
     }
 
-    Ok(())
+    let mut candidates: Vec<Candidate> = Vec::with_capacity(candidate_rows.len());
+
+    for row in &candidate_rows {
+        let node_id: String = match row.try_get("id") { Ok(v) => v, Err(_) => continue };
+        let node_title: String = row.try_get("title").unwrap_or_default();
+        let node_tree_id: String = row.try_get("tree_id").unwrap_or_default();
+        let ann_distance: f64 = row.try_get("distance").unwrap_or(1.0);
+
+        let same_tree_boost = if active_tree_id.as_deref() == Some(node_tree_id.as_str()) {
+            0.05_f64
+        } else {
+            0.0
+        };
+
+        let node_tokens: std::collections::HashSet<String> = node_title
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty() && !stopwords.contains(*t))
+            .map(|t| t.to_string())
+            .collect();
+        let lexical_boost = if !resource_tokens.is_empty()
+            && resource_tokens.iter().any(|tok| node_tokens.contains(tok))
+        {
+            0.03_f64
+        } else {
+            0.0
+        };
+
+        let final_score = ann_distance - same_tree_boost - lexical_boost;
+        let _ = node_title; // used only for tokenization above
+        candidates.push(Candidate { node_id, final_score });
+    }
+
+    // Sort ascending (lower = better), keep top 5, apply threshold
+    candidates.sort_by(|a, b| a.final_score.partial_cmp(&b.final_score).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.truncate(5);
+
+    println!("🔍 [job/match-resource/debug] reranked: {} candidates after truncate, scores: {:?}",
+        candidates.len(),
+        candidates.iter().map(|c| format!("{:.3}", c.final_score)).collect::<Vec<_>>()
+    );
+
+    let top_score = candidates.first().map(|c| c.final_score).unwrap_or(1.0);
+    let mut matched = 0usize;
+    let mut any_green = false;
+
+    for candidate in &candidates {
+        if candidate.final_score >= 0.55 {
+            continue;
+        }
+
+        let link_id = uuid::Uuid::new_v4().to_string();
+        let _ = sqlx::query(
+            "INSERT INTO mimir_node_links (id, resource_id, node_id, relevance_score) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (resource_id, node_id) DO UPDATE SET \
+               relevance_score = EXCLUDED.relevance_score"
+        )
+        .bind(&link_id)
+        .bind(resource_id)
+        .bind(&candidate.node_id)
+        .bind(candidate.final_score as f32)
+        .execute(pool)
+        .await
+        .ok();
+
+        if candidate.final_score < 0.3 {
+            any_green = true;
+        }
+
+        matched += 1;
+    }
+
+    if any_green {
+        let _ = write_mimir_resource_evidence(pool, resource_id).await;
+    }
+
+    if matched > 0 {
+        println!("🔗 [job/match-resource] matched {} nodes for resource '{}' (top score: {:.3})", matched, title, top_score);
+    }
+
+    let _ = app.emit("ygg-resource-ingested", serde_json::json!({ "resourceId": resource_id }));
 }
+

@@ -165,6 +165,23 @@ export interface MatchedResource {
   relevanceScore: number | null;
 }
 
+export interface NeighborNode {
+  nodeId: string;
+  title: string;
+  progress: number;
+  isLocked: boolean;
+  conceptSlug: string | null;
+  skillLevel: number | null;
+  resources: MatchedResource[];
+}
+
+export interface NodeNeighborhood {
+  nodeId: string;
+  prerequisites: NeighborNode[];
+  dependents: NeighborNode[];
+  siblings: NeighborNode[];
+}
+
 export interface NodeChatContext {
   nodeId: string;
   title: string;

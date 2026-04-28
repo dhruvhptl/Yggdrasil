@@ -237,8 +237,6 @@ pub async fn match_node_impl(
         }
     }
 
-    println!("  ↳ node match: vector={} lexical={} candidates pre-merge",
-        vector_candidates.len(), lexical_candidates.len());
 
     // RRF merge, take top 10
     let mut merged = rrf_merge(vector_candidates, lexical_candidates);
@@ -656,8 +654,6 @@ pub async fn mimir_chat(
             .collect();
 
         lexical_candidates_count = lexical_candidates.len() as i32;
-        println!("  ↳ vector={} lexical={} candidates pre-merge",
-            vector_candidates.len(), lexical_candidates.len());
 
         // 3c. RRF merge + take top_k
         let mut candidates = rrf_merge(vector_candidates, lexical_candidates);

@@ -245,6 +245,55 @@ pub(crate) async fn get_mastered_concepts(pool: &sqlx::PgPool, tree_id: &str) ->
     slugs.into_iter().collect()
 }
 
+// ─── Node embedding backfill ────────────────────────────────────────────────
+
+/// Embed the title of every leaf node that doesn't yet have a cached embedding.
+/// Returns the count of nodes embedded. One-time warmup for the HNSW cache.
+#[tauri::command]
+pub async fn backfill_node_embeddings(
+    client: tauri::State<'_, reqwest::Client>,
+    database: tauri::State<'_, Database>,
+) -> Result<usize, String> {
+    let rows = sqlx::query(
+        "SELECT id, title FROM tree_nodes \
+         WHERE type = 'leaf' AND title_embedding IS NULL"
+    )
+    .fetch_all(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    println!("🔖 backfill_node_embeddings: {} nodes to embed", rows.len());
+    let mut count = 0usize;
+
+    for row in &rows {
+        let node_id: String = match row.try_get("id") { Ok(v) => v, Err(_) => continue };
+        let title: String = row.try_get("title").unwrap_or_default();
+        if title.is_empty() { continue; }
+
+        match crate::mimir_ingest::get_embedding(&*client, &title).await {
+            Ok(embedding) => {
+                let vec_str = crate::mimir_ingest::vector_str(&embedding);
+                let _ = sqlx::query(
+                    "UPDATE tree_nodes SET title_embedding = $1::vector WHERE id = $2"
+                )
+                .bind(&vec_str)
+                .bind(&node_id)
+                .execute(&database.pool)
+                .await;
+                count += 1;
+            }
+            Err(e) => println!("⚠️  backfill_node_embeddings: embed failed for {}: {}", node_id, e),
+        }
+    }
+
+    println!("✅ backfill_node_embeddings: embedded {} nodes", count);
+    Ok(count)
+}
+
 // ─── Mimir auto-matching ─────────────────────────────────────────────────────
 
 /// Semantically link library resources to each leaf node using native Mimir.

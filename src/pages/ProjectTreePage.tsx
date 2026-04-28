@@ -18,6 +18,8 @@ interface TreeRegenerationRecord {
   nodesDropped: number;
 }
 
+type GapType = 'libraryGap' | 'knowledgeGap' | 'partialKgGap';
+
 interface CheckpointGap {
   nodeId: string;
   title: string;
@@ -26,14 +28,23 @@ interface CheckpointGap {
   skillName: string;
   progress: number;
   isLocked: boolean;
+  hasWeakMatches: boolean;
+  conceptSlug: string | null;
+  searchTerms: string[];
+  masteryCriteria: string | null;
+  gapType: GapType;
+  prerequisiteConcepts: string[];
 }
 
 interface TreeResourceGaps {
   treeId: string;
   totalCheckpoints: number;
-  matchedCheckpoints: number;
+  greenMatchedCheckpoints: number;
   unmatchedCheckpoints: number;
   coveragePercent: number;
+  libraryGapCount: number;
+  knowledgeGapCount: number;
+  partialKgGapCount: number;
   gaps: CheckpointGap[];
 }
 
@@ -67,6 +78,10 @@ export default function ProjectTreePage() {
   const [coverageGaps, setCoverageGaps] = useState<TreeResourceGaps | null>(null);
   const [isCoverageLoading, setIsCoverageLoading] = useState(false);
   const [matchingNodeId, setMatchingNodeId] = useState<string | null>(null);
+  const [expandedGapId, setExpandedGapId] = useState<string | null>(null);
+  const [isInferringDeps, setIsInferringDeps] = useState(false);
+  const [isBackfillingEmbeddings, setIsBackfillingEmbeddings] = useState(false);
+  const [backfillToast, setBackfillToast] = useState<string | null>(null);
   const [externalSelectedNodeId, setExternalSelectedNodeId] = useState<string | null>(null);
   const pdfInputRef = React.useRef<HTMLInputElement>(null);
   const paperInputRef = React.useRef<HTMLInputElement>(null);
@@ -272,6 +287,34 @@ export default function ProjectTreePage() {
     } catch { /* non-fatal */ }
     finally { setMatchingNodeId(null); }
   }, [activeTreeId, loadCoverageGaps]);
+
+  const handleInferDeps = useCallback(async () => {
+    setIsInferringDeps(true);
+    try {
+      await invoke('enqueue_infer_deps');
+      // Reload gaps after a short delay to pick up any newly inferred edges
+      setTimeout(() => {
+        if (activeTreeId) loadCoverageGaps(activeTreeId);
+        setIsInferringDeps(false);
+      }, 2500);
+    } catch {
+      setIsInferringDeps(false);
+    }
+  }, [activeTreeId, loadCoverageGaps]);
+
+  const handleBackfillEmbeddings = useCallback(async () => {
+    setIsBackfillingEmbeddings(true);
+    try {
+      const count = await invoke<number>('backfill_node_embeddings');
+      setBackfillToast(count === 0 ? 'All nodes already embedded' : `Embedded ${count} node${count !== 1 ? 's' : ''}`);
+      setTimeout(() => setBackfillToast(null), 3000);
+    } catch (e) {
+      setBackfillToast('Backfill failed');
+      setTimeout(() => setBackfillToast(null), 3000);
+    } finally {
+      setIsBackfillingEmbeddings(false);
+    }
+  }, []);
 
   const handleFindAllMatches = useCallback(async () => {
     if (!activeTreeId) return;
@@ -682,7 +725,7 @@ export default function ProjectTreePage() {
                   <>
                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
                       <span style={{ fontSize: 11, color: '#64748b' }}>
-                        {coverageGaps.matchedCheckpoints}/{coverageGaps.totalCheckpoints} checkpoints
+                        {coverageGaps.greenMatchedCheckpoints}/{coverageGaps.totalCheckpoints} covered
                       </span>
                       <span style={{ fontSize: 12, fontWeight: 600, color: textColor }}>
                         {Math.round(pct)}%
@@ -691,6 +734,29 @@ export default function ProjectTreePage() {
                     <div style={{ height: 5, borderRadius: 3, background: '#1e293b', overflow: 'hidden' }}>
                       <div style={{ width: `${pct}%`, height: '100%', background: barColor, borderRadius: 3, transition: 'width 0.4s ease' }} />
                     </div>
+                    {/* Gap type breakdown */}
+                    {coverageGaps.unmatchedCheckpoints > 0 && (
+                      <div style={{ display: 'flex', gap: 8, marginTop: 7, flexWrap: 'wrap' }}>
+                        {coverageGaps.libraryGapCount > 0 && (
+                          <span style={{ fontSize: 9, color: '#60a5fa', display: 'flex', alignItems: 'center', gap: 3 }}>
+                            <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#3b82f6', display: 'inline-block' }} />
+                            {coverageGaps.libraryGapCount} missing resource
+                          </span>
+                        )}
+                        {coverageGaps.partialKgGapCount > 0 && (
+                          <span style={{ fontSize: 9, color: '#fcd34d', display: 'flex', alignItems: 'center', gap: 3 }}>
+                            <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#f59e0b', display: 'inline-block' }} />
+                            {coverageGaps.partialKgGapCount} weak coverage
+                          </span>
+                        )}
+                        {coverageGaps.knowledgeGapCount > 0 && (
+                          <span style={{ fontSize: 9, color: '#fca5a5', display: 'flex', alignItems: 'center', gap: 3 }}>
+                            <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#ef4444', display: 'inline-block' }} />
+                            {coverageGaps.knowledgeGapCount} unknown territory
+                          </span>
+                        )}
+                      </div>
+                    )}
                     <div style={{ display: 'flex', gap: 6, marginTop: 10 }}>
                       <button
                         onClick={handleFindAllMatches}
@@ -706,6 +772,18 @@ export default function ProjectTreePage() {
                       >
                         {matchingNodeId === 'all' ? 'Matching…' : 'Find all matches'}
                       </button>
+                      <button
+                        onClick={handleBackfillEmbeddings}
+                        disabled={isBackfillingEmbeddings}
+                        title="Cache node title embeddings for fast async matching"
+                        style={{
+                          padding: '5px 9px', borderRadius: 5, fontSize: 11,
+                          background: 'rgba(99,102,241,0.08)', border: '1px solid rgba(99,102,241,0.2)',
+                          color: isBackfillingEmbeddings ? '#475569' : '#a5b4fc',
+                          cursor: isBackfillingEmbeddings ? 'not-allowed' : 'pointer',
+                          fontFamily: 'inherit',
+                        }}
+                      >{isBackfillingEmbeddings ? '…' : 'Backfill'}</button>
                       <button
                         onClick={() => activeTreeId && loadCoverageGaps(activeTreeId)}
                         disabled={isCoverageLoading}
@@ -743,49 +821,153 @@ export default function ProjectTreePage() {
                       padding: '6px 14px 4px', fontSize: 10, fontWeight: 600,
                       color: '#475569', textTransform: 'uppercase', letterSpacing: '0.06em',
                     }}>{phase}</div>
-                    {gaps.map(gap => (
-                      <div
-                        key={gap.nodeId}
-                        style={{
-                          padding: '7px 14px',
-                          borderBottom: '1px solid rgba(30,41,59,0.5)',
-                          cursor: 'pointer',
-                          background: externalSelectedNodeId === gap.nodeId ? 'rgba(16,185,129,0.07)' : 'transparent',
-                          transition: 'background 0.12s',
-                        }}
-                        onClick={() => setExternalSelectedNodeId(gap.nodeId)}
-                        onMouseEnter={e => { if (externalSelectedNodeId !== gap.nodeId) (e.currentTarget as HTMLDivElement).style.background = 'rgba(30,41,59,0.4)'; }}
-                        onMouseLeave={e => { (e.currentTarget as HTMLDivElement).style.background = externalSelectedNodeId === gap.nodeId ? 'rgba(16,185,129,0.07)' : 'transparent'; }}
-                      >
-                        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 6 }}>
-                          <div style={{ flex: 1, minWidth: 0 }}>
-                            <div style={{ fontSize: 12, color: gap.isLocked ? '#475569' : '#e2e8f0', fontWeight: 500, lineHeight: 1.3, marginBottom: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                              {gap.isLocked && <span style={{ marginRight: 4, fontSize: 10 }}>🔒</span>}
-                              {gap.title}
-                            </div>
-                            <div style={{ fontSize: 10, color: '#475569' }}>
-                              {gap.skillName}
-                              {gap.progress > 0 && (
-                                <span style={{ marginLeft: 6, color: '#64748b' }}>{gap.progress}%</span>
-                              )}
-                            </div>
-                          </div>
-                          <button
-                            onClick={e => { e.stopPropagation(); handleFindMatches(gap.nodeId); }}
-                            disabled={matchingNodeId === gap.nodeId}
-                            style={{
-                              flexShrink: 0, padding: '3px 7px', borderRadius: 4, fontSize: 10,
-                              background: 'rgba(16,185,129,0.08)', border: '1px solid rgba(16,185,129,0.2)',
-                              color: matchingNodeId === gap.nodeId ? '#475569' : '#6ee7b7',
-                              cursor: matchingNodeId === gap.nodeId ? 'not-allowed' : 'pointer',
-                              fontFamily: 'inherit', whiteSpace: 'nowrap',
-                            }}
-                          >
-                            {matchingNodeId === gap.nodeId ? '…' : 'Find'}
-                          </button>
+                    {gaps.map(gap => {
+                      const isExpanded = expandedGapId === gap.nodeId;
+                      return (
+                        <div
+                          key={gap.nodeId}
+                          style={{
+                            padding: '8px 14px',
+                            borderBottom: '1px solid rgba(30,41,59,0.5)',
+                            cursor: 'pointer',
+                            background: externalSelectedNodeId === gap.nodeId ? 'rgba(16,185,129,0.07)' : 'transparent',
+                            transition: 'background 0.12s',
+                          }}
+                          onClick={() => setExternalSelectedNodeId(gap.nodeId)}
+                          onMouseEnter={e => { if (externalSelectedNodeId !== gap.nodeId) (e.currentTarget as HTMLDivElement).style.background = 'rgba(30,41,59,0.4)'; }}
+                          onMouseLeave={e => { (e.currentTarget as HTMLDivElement).style.background = externalSelectedNodeId === gap.nodeId ? 'rgba(16,185,129,0.07)' : 'transparent'; }}
+                        >
+                          {/* Per-type indicator color and label */}
+                          {(() => {
+                            const typeStyle = gap.gapType === 'libraryGap'
+                              ? { dot: '#3b82f6', label: 'Missing resource', labelColor: '#93c5fd' }
+                              : gap.gapType === 'knowledgeGap'
+                              ? { dot: '#ef4444', label: 'Unknown territory', labelColor: '#fca5a5' }
+                              : { dot: '#f59e0b', label: 'Weak coverage', labelColor: '#fcd34d' };
+
+                            return (
+                              <>
+                                {/* Row 1: title + action buttons */}
+                                <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 6 }}>
+                                  <div style={{ flex: 1, minWidth: 0 }}>
+                                    <div style={{ fontSize: 12, color: gap.isLocked ? '#475569' : '#e2e8f0', fontWeight: 500, lineHeight: 1.3, marginBottom: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                      {gap.isLocked && <span style={{ marginRight: 4, fontSize: 10 }}>🔒</span>}
+                                      {gap.title}
+                                    </div>
+                                    <div style={{ fontSize: 10, color: '#475569', display: 'flex', alignItems: 'center', gap: 5 }}>
+                                      <span>{gap.skillName}</span>
+                                      {gap.progress > 0 && <span style={{ color: '#64748b' }}>{gap.progress}%</span>}
+                                      <span style={{ width: 5, height: 5, borderRadius: '50%', background: typeStyle.dot, display: 'inline-block', flexShrink: 0 }} />
+                                      <span style={{ color: typeStyle.labelColor, fontSize: 9 }}>{typeStyle.label}</span>
+                                    </div>
+                                  </div>
+                                  {/* Action buttons */}
+                                  <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
+                                    {(gap.gapType === 'libraryGap' || gap.gapType === 'partialKgGap') && (
+                                      <button
+                                        onClick={e => { e.stopPropagation(); handleFindMatches(gap.nodeId); }}
+                                        disabled={matchingNodeId === gap.nodeId}
+                                        style={{
+                                          padding: '3px 7px', borderRadius: 4, fontSize: 10,
+                                          background: 'rgba(16,185,129,0.08)', border: '1px solid rgba(16,185,129,0.2)',
+                                          color: matchingNodeId === gap.nodeId ? '#475569' : '#6ee7b7',
+                                          cursor: matchingNodeId === gap.nodeId ? 'not-allowed' : 'pointer',
+                                          fontFamily: 'inherit',
+                                        }}
+                                      >
+                                        {matchingNodeId === gap.nodeId ? '…' : 'Find'}
+                                      </button>
+                                    )}
+                                    {(gap.gapType === 'knowledgeGap' || gap.gapType === 'partialKgGap') && (
+                                      <button
+                                        onClick={e => { e.stopPropagation(); handleInferDeps(); }}
+                                        disabled={isInferringDeps}
+                                        title="Infer skill dependencies from your knowledge graph"
+                                        style={{
+                                          padding: '3px 7px', borderRadius: 4, fontSize: 10,
+                                          background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.2)',
+                                          color: isInferringDeps ? '#475569' : '#fcd34d',
+                                          cursor: isInferringDeps ? 'not-allowed' : 'pointer',
+                                          fontFamily: 'inherit', whiteSpace: 'nowrap',
+                                        }}
+                                      >
+                                        {isInferringDeps ? '…' : 'Infer deps'}
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
+
+                                {/* Guidance message */}
+                                <div style={{ fontSize: 9, color: '#475569', marginTop: 3, lineHeight: 1.4 }}>
+                                  {gap.gapType === 'libraryGap' && 'Your library is missing coverage for this concept. Search for:'}
+                                  {gap.gapType === 'knowledgeGap' && 'No knowledge graph entry yet. Run "Infer deps" to map prerequisites, then search for:'}
+                                  {gap.gapType === 'partialKgGap' && 'Concept is in your knowledge graph but has no mapped prerequisites yet.'}
+                                </div>
+
+                                {/* Prerequisite concepts (LibraryGap only) */}
+                                {gap.gapType === 'libraryGap' && gap.prerequisiteConcepts.length > 0 && (
+                                  <div style={{ fontSize: 9, color: '#64748b', marginTop: 2 }}>
+                                    Requires: {gap.prerequisiteConcepts.join(', ')}
+                                  </div>
+                                )}
+
+                                {/* Search term chips */}
+                                {gap.searchTerms.length > 0 && (
+                                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 5 }}>
+                                    {gap.searchTerms.map(term => (
+                                      <button
+                                        key={term}
+                                        onClick={e => { e.stopPropagation(); navigate(`/resources?q=${encodeURIComponent(term)}`); }}
+                                        style={{
+                                          padding: '2px 7px', borderRadius: 10, fontSize: 9,
+                                          background: gap.gapType === 'libraryGap'
+                                            ? 'rgba(59,130,246,0.1)' : gap.gapType === 'knowledgeGap'
+                                            ? 'rgba(239,68,68,0.1)' : 'rgba(245,158,11,0.1)',
+                                          border: gap.gapType === 'libraryGap'
+                                            ? '1px solid rgba(59,130,246,0.25)' : gap.gapType === 'knowledgeGap'
+                                            ? '1px solid rgba(239,68,68,0.25)' : '1px solid rgba(245,158,11,0.25)',
+                                          color: typeStyle.labelColor,
+                                          cursor: 'pointer', fontFamily: 'inherit', whiteSpace: 'nowrap',
+                                        }}
+                                      >
+                                        {term}
+                                      </button>
+                                    ))}
+                                  </div>
+                                )}
+
+                                {/* Mastery criteria collapsible */}
+                                {gap.masteryCriteria && (
+                                  <div style={{ marginTop: 5 }}>
+                                    <button
+                                      onClick={e => { e.stopPropagation(); setExpandedGapId(isExpanded ? null : gap.nodeId); }}
+                                      style={{
+                                        background: 'none', border: 'none', padding: 0, cursor: 'pointer',
+                                        fontSize: 9, color: '#475569', fontFamily: 'inherit',
+                                        display: 'flex', alignItems: 'center', gap: 3,
+                                      }}
+                                    >
+                                      <span style={{ transform: isExpanded ? 'rotate(90deg)' : 'rotate(0deg)', display: 'inline-block', transition: 'transform 0.15s' }}>▶</span>
+                                      Mastery criteria
+                                    </button>
+                                    {isExpanded && (
+                                      <div style={{
+                                        marginTop: 4, padding: '5px 8px',
+                                        background: 'rgba(15,23,42,0.6)', borderRadius: 4,
+                                        border: '1px solid rgba(30,41,59,0.8)',
+                                        fontSize: 10, color: '#94a3b8', lineHeight: 1.5,
+                                      }}>
+                                        {gap.masteryCriteria}
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
+                              </>
+                            );
+                          })()}
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 ));
               })()}
@@ -856,6 +1038,18 @@ export default function ProjectTreePage() {
               onClick={() => setRegenToast(null)}
               style={{ background: 'none', border: 'none', color: '#475569', cursor: 'pointer', fontSize: 14, lineHeight: 1, padding: '0 2px', marginLeft: 4 }}
             >×</button>
+          </div>
+        )}
+
+        {/* Backfill embeddings toast */}
+        {backfillToast && (
+          <div style={{
+            position: 'absolute', bottom: 20, right: showCoveragePanel ? 316 : 16,
+            zIndex: 80, background: 'rgba(15,23,42,0.96)', border: '1px solid #312e81',
+            borderRadius: 8, padding: '8px 14px', fontSize: 12, color: '#a5b4fc',
+            display: 'flex', alignItems: 'center', gap: 8,
+          }}>
+            {backfillToast}
           </div>
         )}
       </main>

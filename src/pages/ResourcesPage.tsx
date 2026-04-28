@@ -1,5 +1,6 @@
 // src/pages/ResourcesPage.tsx
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { Trash2, Link, FileText, Globe, BookOpen, X, RefreshCw, CheckCircle2, Minus, XCircle, Filter, Search, ChevronDown, ChevronRight, Play, Tag, Wand2, Check } from 'lucide-react';
@@ -104,8 +105,9 @@ export default function ResourcesPage() {
   const [chunksLoaded, setChunksLoaded] = useState(false);
 
   // Filter + search + sort
+  const [searchParams] = useSearchParams();
   const [showThin, setShowThin] = useState(false);
-  const [searchQuery, setSearchQuery] = useState('');
+  const [searchQuery, setSearchQuery] = useState(() => searchParams.get('q') ?? '');
   const [typeFilter, setTypeFilter] = useState<string>('all');
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [sortBy, setSortBy] = useState<'newest' | 'oldest' | 'most_linked' | 'alpha'>('newest');

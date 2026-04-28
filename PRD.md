@@ -1,5 +1,5 @@
 # Yggdrasil — Product Requirements Document
-**Version:** 2.4  
+**Version:** 2.6  
 **Updated:** April 2026
 
 ---
@@ -91,9 +91,12 @@ Yggdrasil puts it all in one place.
 | Tree Versioning | ✅ Done | tree_versions table (migration 034); concept_id + concept_slug stable identity; diff-based state carry-over on regenerate |
 | Node panel — Source citations | ✅ Done | Shows section title + page range for every matched chunk from Mimir resources |
 | Auto-matching checkpoints to resources | ✅ Done | pgvector cosine match on checkpoint title + description; persists matched chunk + section + page range |
-| Background job queue | ✅ Done | orchestrator.rs JobQueue (tokio mpsc); RematchAllNodes, ReembedResources, InferSkillDeps, AutoTagResources; emits ygg-* events |
+| Resource matching — async + reranking | ✅ Done | MatchResourceToNodes job variant in orchestrator; in-memory reranking with same-tree boost + lexical overlap boost; top-5 at threshold < 0.55 |
+| HNSW index on tree_nodes.title_embedding | ✅ Done | migration 036; ANN search for resource→node matching; vector(1024) column on tree_nodes |
+| Background job queue | ✅ Done | orchestrator.rs JobQueue (tokio mpsc); RematchAllNodes, ReembedResources, InferSkillDeps, AutoTagResources, MatchResourceToNodes; emits ygg-* events |
 | Event-driven frontend | ✅ Done | UI subscribes to ygg-* Tauri events; Rust owns long-running state machines |
-| Read-model helpers | ✅ Done | 4 purpose-built Tauri commands in read_models.rs replacing ad-hoc frontend joins |
+| Read-model helpers | ✅ Done | 5 purpose-built Tauri commands in read_models.rs; get_node_neighborhood added |
+| Node panel — Graph Neighborhood | ✅ Done | Collapsible prerequisites/dependents/siblings section in NodePanel; clickable rows select node on canvas; progress bar, lock icon, skill level badge, resource pills |
 | Prompt & model version logging | ✅ Done | prompt_logs table; all call_llm sites instrumented; get_prompt_stats command; dev-only Model logs tab |
 | Shared reqwest::Client | ✅ Done | Single client managed as Tauri state; injected into brain, mimir, orchestrator commands |
 | God module splits | ✅ Done | brain.rs → llm_client + github + prompt_builders + tree_persistence; mimir.rs → mimir_ingest + mimir_retrieval + mimir_tags + mimir_manage |
@@ -194,8 +197,12 @@ In order — each depends on the previous being stable:
 5. ~~**Mimir agentic suggestions / resource gap finder**~~ ✅ Done — surfaces resources most relevant to unmastered checkpoints
 6. ~~**Universal Skill Tree visual rebuild**~~ ✅ Done — canvas-rendered radial tree with domain classification
 7. ~~**Tree versioning + diff-based updates**~~ ✅ Done — tree_versions table, concept_id stable identity, regenerate_tree KG bridge + diff carry-over
-8. **Smarter retrieval** — usage_weight column on mimir_chunks, feedback signals (mimir_feedback table), dynamic context injection
-9. **Browser extension** — one-click ingest of the current page into Mimir, auto-tag by domain, optional link-to-checkpoint picker
+8. ~~**Async resource→node matching with reranking**~~ ✅ Done — MatchResourceToNodes job variant; HNSW index on title_embedding; in-memory same-tree + lexical reranking
+9. ~~**Graph neighborhood panel**~~ ✅ Done — get_node_neighborhood command; NodePanel prerequisites/dependents/siblings section with clickable rows
+10. **Recursive prerequisite paths** (Phase 2 skill graph) — `get_gap_path` command; breadth-first walk from gap node to current seeds; ordered learning path per gap
+11. **Graph-aware gap planner** (Phase 3 skill graph) — aggregate growth targets, dedup shared prerequisites, produce ranked acquisition sequence for Daily Matrix
+12. **Smarter retrieval** — usage_weight column on mimir_chunks, feedback signals (mimir_feedback table), dynamic context injection
+13. **Browser extension** — one-click ingest of the current page into Mimir, auto-tag by domain, optional link-to-checkpoint picker
 
 ---
 
@@ -235,6 +242,50 @@ Checkpoints have no difficulty rating or estimated time. They're concepts — so
 ### Migration
 
 All existing leaf nodes (quests) are migrated to the checkpoint model. The `tasks` JSONB field on leaf nodes is repurposed: instead of a checklist of tasks, it holds `{ mastery_criteria, exercises, notes }`.
+
+---
+
+## Resume-Seeded Skill Graph
+
+### Vision
+
+The resume is not proof of mastery — it is a starting point. When you upload a resume, Yggdrasil seeds the Universal Skill Tree with baseline nodes representing what you claim to know. The graph then grows outward from those seeds via ontology-derived dependency edges: if you have "Backpropagation" on your resume, the graph automatically surfaces "Chain Rule" and "Matrix Calculus" as adjacent concepts that you may or may not actually understand.
+
+Job descriptions feed in from the opposite direction as directional signal: required skills become `gap` nodes that pull the graph toward them. The planner bridges the two — here's where you are, here's where the job needs you, here's the path.
+
+### Node States
+
+| State | Meaning | Primary Source |
+|---|---|---|
+| `seed` | Claimed on resume — baseline, not verified mastery | resume_profile parsed JSON |
+| `adjacent` | Ontology neighbor of a seed — probably relevant, not yet confirmed | skill_dependencies inference |
+| `gap` | Required by target JD(s) but absent or low-level in your graph | job_skills demand analysis |
+| `growth_target` | User-designated or planner-recommended next node to climb | user action / gap planner |
+
+### Edge Semantics
+
+| Edge type | Direction | Meaning |
+|---|---|---|
+| `prerequisite` | A → B | Must understand A before B makes sense |
+| `unlocks` | A → B | Mastering A opens B as a reasonable next step |
+| `related` | A ↔ B | Conceptually adjacent, no strict ordering |
+| `evidence` | Resource/Quest → Skill | This resource/quest provides evidence for the skill |
+
+### Build Roadmap
+
+**Phase 1 — Local neighborhoods (✅ Done)**
+`get_node_neighborhood` command returns prerequisites, dependents, and siblings for any checkpoint. Shown in the NodePanel `GRAPH NEIGHBORHOOD` section. Traversal uses `concept_slug` as the bridge between `tree_nodes` and `universal_skills → skill_dependencies`. Resource pills surface matched Mimir content per neighbor.
+
+**Phase 2 — Recursive prerequisite paths (next)**
+Given a `gap` node (e.g. a JD-required skill at level 0), walk the prerequisite chain recursively to find the full learning path from your current `seed` nodes to the gap. Surface as an ordered list of checkpoints, each linked to a tree or flagged for tree generation.
+- Query: breadth-first walk from gap node backward through `prerequisite` edges, stopping at any node already at level ≥ 2
+- Output: `GapPath { gap_skill, path: Vec<SkillStep>, estimated_depth: u32 }`
+- New Tauri command: `get_gap_path(skill_id: String) -> Result<GapPath, String>`
+
+**Phase 3 — Graph-aware gap planning (later)**
+The planner aggregates all `growth_target` nodes, computes shared prerequisite subtrees (dedup), and produces a ranked sequence of skills to acquire that maximally covers the most job gaps with the least total work.
+- Uses Steiner-tree approximation or greedy shared-subtree heuristic over the dependency graph
+- Output feeds the Daily Matrix as "schedule" quadrant suggestions
 
 ---
 
@@ -517,10 +568,13 @@ Infrastructure and architecture work that isn't a user-facing feature but unbloc
 Foundation work that every V2 feature benefits from. Worth doing before the next major build pass so later features don't pile more weight onto shaky ground.
 
 - ~~**Rust-owned orchestrator + event-driven UI**~~ ✅ Done — `orchestrator.rs` JobQueue + `ygg-*` events; frontend is event-driven.
-- **Local cache for hot desktop state** — a small SQLite or sled cache in `%APPDATA%` for frequently-read data (project list, active tree summary, skill totals). Cold-start feels instant; Postgres reads only on explicit invalidation.
 - ~~**Alias/canonicalization layer for skills**~~ ✅ Done — `skill_aliases` table + merge UI + case-insensitive lookups.
 - ~~**Boundary validation**~~ ✅ Done — Zod schemas at Tauri invoke call-sites.
-- **pgvector profiling and threshold tuning** — measure cosine score distributions across real resources, tune the auto-match threshold per-domain (PDFs vs videos vs web pages have different score floors), add an `ivfflat` index if query latency warrants it.
+- ~~**HNSW index + async resource matching**~~ ✅ Done — migration 036; `MatchResourceToNodes` orchestrator job; in-memory reranking.
+- ~~**Graph neighborhood in node panel**~~ ✅ Done — `get_node_neighborhood` command; prerequisites/dependents/siblings with resource pills.
+- **Recursive prerequisite paths** — `get_gap_path` command; breadth-first walk from gap skill back to seeds; powers Phase 2 of resume-seeded skill graph.
+- **Local cache for hot desktop state** — a small SQLite or sled cache in `%APPDATA%` for frequently-read data (project list, active tree summary, skill totals). Cold-start feels instant; Postgres reads only on explicit invalidation.
+- **pgvector profiling and threshold tuning** — measure cosine score distributions across real resources, tune the auto-match threshold per-domain (PDFs vs videos vs web pages have different score floors).
 
 ### Do As You Build Next Features
 

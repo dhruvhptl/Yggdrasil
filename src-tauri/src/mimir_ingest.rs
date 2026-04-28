@@ -465,6 +465,7 @@ pub async fn ingest_mimir_url(
     app: tauri::AppHandle,
     client: tauri::State<'_, reqwest::Client>,
     database: State<'_, Database>,
+    queue: tauri::State<'_, crate::orchestrator::JobQueue>,
 ) -> Result<IngestResult, String> {
     // Duplicate check by URL
     let dup = sqlx::query("SELECT id, title FROM mimir_resources WHERE url = $1")
@@ -533,8 +534,7 @@ pub async fn ingest_mimir_url(
 
     println!("✅ Ingested URL: \"{}\" ({})", page_title, resource_id);
 
-    // Fire-and-forget: auto-tag + match to nodes
-    crate::orchestrator::on_resource_ingested(&database.pool, &app, &*client, &resource_id).await;
+    crate::orchestrator::on_resource_ingested_async(&database.pool, &app, &*client, &resource_id, &queue).await;
 
     Ok(IngestResult {
         id: resource_id,
@@ -551,6 +551,7 @@ pub async fn ingest_mimir_text(
     app: tauri::AppHandle,
     client: tauri::State<'_, reqwest::Client>,
     database: State<'_, Database>,
+    queue: tauri::State<'_, crate::orchestrator::JobQueue>,
 ) -> Result<String, String> {
     let resource_title = title
         .as_ref()
@@ -598,7 +599,7 @@ pub async fn ingest_mimir_text(
 
     println!("✅ Ingested text: \"{}\" ({})", resource_title, resource_id);
 
-    crate::orchestrator::on_resource_ingested(&database.pool, &app, &*client, &resource_id).await;
+    crate::orchestrator::on_resource_ingested_async(&database.pool, &app, &*client, &resource_id, &queue).await;
 
     Ok(resource_id)
 }
@@ -610,6 +611,7 @@ pub async fn ingest_mimir_pdf(
     app: tauri::AppHandle,
     client: tauri::State<'_, reqwest::Client>,
     database: State<'_, Database>,
+    queue: tauri::State<'_, crate::orchestrator::JobQueue>,
 ) -> Result<PdfIngestResult, String> {
     let bytes = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD, &pdf_base64
@@ -700,7 +702,7 @@ pub async fn ingest_mimir_pdf(
     let text_preview = text.chars().take(500).collect::<String>();
     println!("✅ Ingested PDF: \"{}\" ({})", resource_title, resource_id);
 
-    crate::orchestrator::on_resource_ingested(&database.pool, &app, &*client, &resource_id).await;
+    crate::orchestrator::on_resource_ingested_async(&database.pool, &app, &*client, &resource_id, &queue).await;
 
     Ok(PdfIngestResult {
         id: resource_id,
