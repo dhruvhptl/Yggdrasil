@@ -107,4 +107,6 @@ export const SkillSchema = z.object({
   lastUpdated: z.string(),
   reviewNeeded: z.boolean().optional().default(false),
   status: z.string().optional().default('active'),
+  origin: z.string().optional().default('tree_quest'),
+  state: z.string().optional().default('adjacent'),
 });

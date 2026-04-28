@@ -7,9 +7,9 @@ import { listen } from '@tauri-apps/api/event';
 import {
   RefreshCw, Loader2, AlertTriangle, Sparkles, FileText, TreePine,
   Briefcase, X, Wand2, GitMerge, Check, Search, Eye, Download, ChevronDown, ChevronRight,
-  PanelLeftClose, PanelLeftOpen, RotateCcw,
+  PanelLeftClose, PanelLeftOpen, RotateCcw, TrendingUp, Zap,
 } from 'lucide-react';
-import type { UniversalSkill, SkillGap, SkillDependency, SkillAlias, SkillGraphSnapshot } from '../types';
+import type { UniversalSkill, SkillGap, SkillDependency, SkillAlias, SkillGraphSnapshot, GrowthTarget } from '../types';
 import { validateOrLog, SkillSchema } from '../lib/validators';
 import { log } from '../lib/logger';
 import { z } from 'zod';
@@ -474,12 +474,49 @@ function drawSkillNode(
   animTime: number,
   domainAlpha: number,       // 1 = full, 0.10 = dimmed
   growFrac: number,
+  isSeed: boolean = false,
+  isTarget: boolean = false,
 ) {
   if (growFrac < 0.01) return;
   const r = NODE_R[Math.max(1, Math.min(5, level))] * Math.min(growFrac * 2, 1);
   if (r < 0.5) return;
   const c = hexToRgb(color);
   ctx.globalAlpha = domainAlpha;
+
+  // Seed ring: warm gold outer ring
+  if (isSeed) {
+    const seedPulse = 0.6 + 0.4 * Math.sin(animTime * 1.8);
+    const seedR = r + 5;
+    ctx.beginPath();
+    ctx.arc(x, y, seedR, 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(245,158,11,${(0.70 * seedPulse * domainAlpha).toFixed(3)})`;
+    ctx.lineWidth = 1.8;
+    ctx.globalAlpha = 1;
+    ctx.stroke();
+    ctx.globalAlpha = domainAlpha;
+  }
+
+  // Target ring: double-intensity green pulse
+  if (isTarget) {
+    const tPulse = 0.5 + 0.5 * Math.sin(animTime * 2.4);
+    const tR1 = r + 6;
+    const tR2 = r + 10;
+    const tg = ctx.createRadialGradient(x, y, tR1, x, y, tR2);
+    tg.addColorStop(0, `rgba(52,211,153,${(0.50 * tPulse).toFixed(3)})`);
+    tg.addColorStop(1, `rgba(52,211,153,0)`);
+    ctx.beginPath();
+    ctx.arc(x, y, tR2, 0, Math.PI * 2);
+    ctx.fillStyle = tg;
+    ctx.globalAlpha = domainAlpha;
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(x, y, tR1, 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(52,211,153,${(0.80 * tPulse * domainAlpha).toFixed(3)})`;
+    ctx.lineWidth = 1.5;
+    ctx.globalAlpha = 1;
+    ctx.stroke();
+    ctx.globalAlpha = domainAlpha;
+  }
 
   // Outer glow
   const glowR = r * (2.8 + (isHovered ? 1.2 : 0));
@@ -929,6 +966,131 @@ function MergeModal({ skills, onClose, onMerged }: { skills: UniversalSkill[]; o
   );
 }
 
+// ─── Growth Plan Panel ────────────────────────────────────────────────────────
+
+function GrowthPlanPanel({
+  targets, loading, expandingGraph, onClose, onExpandGraph,
+}: {
+  targets: GrowthTarget[];
+  loading: boolean;
+  expandingGraph: boolean;
+  onClose: () => void;
+  onExpandGraph: () => void;
+}) {
+  const reachable     = targets.filter(t => t.isReachable).slice(0, 3);
+  const disconnected  = targets.filter(t => !t.isReachable).slice(0, 2);
+  const maxScore      = Math.max(...targets.map(t => t.score), 1);
+
+  return (
+    <div
+      style={{
+        position: 'absolute', top: 16, left: 16, zIndex: 50,
+        width: 300, maxHeight: 'calc(100% - 32px)',
+        background: 'rgba(4,8,20,0.94)',
+        backdropFilter: 'blur(16px)',
+        border: '1px solid rgba(245,158,11,0.2)',
+        borderRadius: 16,
+        overflow: 'auto',
+        boxShadow: '0 12px 48px rgba(0,0,0,0.85)',
+      }}
+      onClick={e => e.stopPropagation()}
+    >
+      {/* Header */}
+      <div style={{ padding: '14px 16px 10px', borderBottom: '1px solid rgba(255,255,255,0.05)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+          <TrendingUp size={13} style={{ color: '#f59e0b' }} />
+          <span style={{ fontSize: 13, fontWeight: 600, color: '#fef3c7' }}>Growth Plan</span>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+          <button
+            onClick={onExpandGraph}
+            disabled={expandingGraph}
+            title="Recompute seed adjacency"
+            style={{ background: 'none', border: 'none', color: expandingGraph ? '#334155' : '#475569', cursor: expandingGraph ? 'default' : 'pointer', padding: 2 }}
+          >
+            {expandingGraph ? <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} /> : <Zap size={12} />}
+          </button>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: '#475569', cursor: 'pointer', padding: 2 }}>
+            <X size={14} />
+          </button>
+        </div>
+      </div>
+
+      <div style={{ padding: '10px 16px' }}>
+        {loading && (
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '24px 0', gap: 8, color: '#475569', fontSize: 12 }}>
+            <Loader2 size={14} style={{ animation: 'spin 1s linear infinite' }} />Loading recommendations…
+          </div>
+        )}
+
+        {!loading && targets.length === 0 && (
+          <div style={{ fontSize: 11, color: '#475569', textAlign: 'center', padding: '20px 0', lineHeight: 1.6 }}>
+            No growth targets found.<br />
+            <span style={{ color: '#334155' }}>Parse a resume and sync skills to seed the graph, then infer dependencies.</span>
+          </div>
+        )}
+
+        {!loading && reachable.length > 0 && (
+          <div style={{ marginBottom: 14 }}>
+            <div style={{ fontSize: 9, fontWeight: 600, color: '#78350f', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 8 }}>
+              Reachable from your seeds
+            </div>
+            {reachable.map(t => (
+              <GrowthTargetRow key={t.skillId} target={t} maxScore={maxScore} />
+            ))}
+          </div>
+        )}
+
+        {!loading && disconnected.length > 0 && (
+          <div>
+            <div style={{ fontSize: 9, fontWeight: 600, color: '#334155', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 8 }}>
+              High-demand (no path yet)
+            </div>
+            {disconnected.map(t => (
+              <GrowthTargetRow key={t.skillId} target={t} maxScore={maxScore} />
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function GrowthTargetRow({ target, maxScore }: { target: GrowthTarget; maxScore: number }) {
+  const scorePct = Math.round((target.score / maxScore) * 100);
+  const prereqLabel = target.prereqPath.length > 0 ? target.prereqPath.join(' → ') : null;
+
+  return (
+    <div style={{ marginBottom: 10, padding: '8px 10px', borderRadius: 8, background: target.isReachable ? 'rgba(245,158,11,0.06)' : 'rgba(255,255,255,0.03)', border: '1px solid ' + (target.isReachable ? 'rgba(245,158,11,0.15)' : 'rgba(255,255,255,0.06)') }}>
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 8, marginBottom: 4 }}>
+        <div style={{ fontSize: 12, fontWeight: 600, color: target.isReachable ? '#fef3c7' : '#94a3b8', flex: 1 }}>
+          {target.skillName}
+        </div>
+        <a
+          href={`/?prefill=${encodeURIComponent(target.skillName)}`}
+          onClick={e => e.stopPropagation()}
+          style={{ fontSize: 9, padding: '2px 6px', borderRadius: 4, background: 'rgba(16,185,129,0.12)', color: '#34d399', border: '1px solid rgba(16,185,129,0.2)', textDecoration: 'none', flexShrink: 0, whiteSpace: 'nowrap' }}
+        >
+          Generate tree
+        </a>
+      </div>
+
+      {prereqLabel && (
+        <div style={{ fontSize: 9, color: '#475569', marginBottom: 5, fontStyle: 'italic' }}>
+          Path: {prereqLabel.length > 50 ? prereqLabel.slice(0, 50) + '…' : prereqLabel}
+        </div>
+      )}
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <div style={{ flex: 1, height: 3, borderRadius: 2, background: 'rgba(255,255,255,0.06)', overflow: 'hidden' }}>
+          <div style={{ width: `${scorePct}%`, height: '100%', borderRadius: 2, background: target.isReachable ? '#f59e0b' : '#475569', transition: 'width 0.4s ease' }} />
+        </div>
+        <span style={{ fontSize: 9, color: '#334155', flexShrink: 0 }}>{target.jobFrequency} jobs</span>
+      </div>
+    </div>
+  );
+}
+
 // ─── Easing ───────────────────────────────────────────────────────────────────
 
 function easeOutCubic(t: number) {
@@ -947,6 +1109,11 @@ export default function SkillsPage() {
   const [aliases, setAliases]   = useState<SkillAlias[]>([]);
   const [loading, setLoading]   = useState(true);
   const [syncing, setSyncing]   = useState(false);
+  const [stateFilter, setStateFilter] = useState<'all' | 'seed' | 'adjacent'>('all');
+  const [growthTargets, setGrowthTargets] = useState<GrowthTarget[]>([]);
+  const [showGrowthPlan, setShowGrowthPlan] = useState(false);
+  const [growthLoading, setGrowthLoading] = useState(false);
+  const [expandingGraph, setExpandingGraph] = useState(false);
   const [inferring, setInferring] = useState(false);
   const [classifying, setClassifying] = useState(false);
   const [resetting, setResetting]     = useState(false);
@@ -989,6 +1156,10 @@ export default function SkillsPage() {
     return names.map((_, i) => DOMAIN_COLORS[i % DOMAIN_COLORS.length]);
   }, [skills]);
 
+  const seedIds = useMemo(() => new Set(skills.filter(s => s.state === 'seed').map(s => s.id)), [skills]);
+  const targetSkillNames = useMemo(() => new Set(growthTargets.map(t => t.skillName.toLowerCase())), [growthTargets]);
+  const targetIds = useMemo(() => new Set(skills.filter(s => targetSkillNames.has(s.name.toLowerCase())).map(s => s.id)), [skills, targetSkillNames]);
+
   const aliasCountMap = useMemo(() => {
     const m = new Map<string, number>();
     for (const a of aliases) m.set(a.canonicalSkillId, (m.get(a.canonicalSkillId) ?? 0) + 1);
@@ -1016,7 +1187,8 @@ export default function SkillsPage() {
   }, [selectedId, placements]);
 
   const filteredDomainGroups = useMemo(() => {
-    const base = showReviewOnly ? skills.filter(s => s.reviewNeeded) : skills;
+    let base = showReviewOnly ? skills.filter(s => s.reviewNeeded) : skills;
+    if (stateFilter !== 'all') base = base.filter(s => s.state === stateFilter);
     const filtered = searchQuery.trim()
       ? base.filter(s => s.name.toLowerCase().includes(searchQuery.toLowerCase()))
       : base;
@@ -1027,7 +1199,7 @@ export default function SkillsPage() {
       map.get(d)!.push(s);
     }
     return map;
-  }, [skills, showReviewOnly, searchQuery]);
+  }, [skills, showReviewOnly, stateFilter, searchQuery]);
 
   const avgLevel     = skills.length > 0
     ? (skills.reduce((sum, s) => sum + s.level, 0) / skills.length).toFixed(1) : '0';
@@ -1122,7 +1294,9 @@ export default function SkillsPage() {
       const domAlpha   = selectedDomainIndex !== null && p.domainIndex !== selectedDomainIndex ? 0.10 : 1;
 
       if (p.skill) {
-        drawSkillNode(ctx, p.x, p.y, p.color, p.skill.level, isHovered, isSelected, animTime, domAlpha, growFrac);
+        const isSeed   = seedIds.has(p.skill.id);
+        const isTarget = targetIds.has(p.skill.id);
+        drawSkillNode(ctx, p.x, p.y, p.color, p.skill.level, isHovered, isSelected, animTime, domAlpha, growFrac, isSeed, isTarget);
       } else {
         drawGapNode(ctx, p.x, p.y, animTime, domAlpha);
       }
@@ -1160,7 +1334,7 @@ export default function SkillsPage() {
 
     ctx.restore();
   }, [branches, placements, domainLabels, selectedId, selectedDomainIndex, hoveredId,
-      size, renderTick, domainColors, skills, deps]);
+      size, renderTick, domainColors, skills, deps, seedIds, targetIds]);
 
   // ── RAF loop ──────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -1305,6 +1479,26 @@ export default function SkillsPage() {
     } catch (err) { console.error('mark_skill_reviewed failed:', err); }
   }
 
+  async function handleOpenGrowthPlan() {
+    setShowGrowthPlan(true);
+    if (growthTargets.length > 0) return;
+    setGrowthLoading(true);
+    try {
+      const targets = await invoke<GrowthTarget[]>('get_growth_recommendations', { season: null });
+      setGrowthTargets(targets);
+    } catch (e) { console.error('get_growth_recommendations failed:', e); }
+    finally { setGrowthLoading(false); }
+  }
+
+  async function handleExpandSkillGraph() {
+    setExpandingGraph(true);
+    try {
+      await invoke('expand_skill_graph');
+      await loadAll();
+    } catch (e) { console.error('expand_skill_graph failed:', e); }
+    finally { setExpandingGraph(false); }
+  }
+
   if (loading) {
     return (
       <div className="h-full flex items-center justify-center" style={{ background: '#01020a' }}>
@@ -1363,6 +1557,14 @@ export default function SkillsPage() {
                 style={{ background: syncing ? 'rgba(255,255,255,0.04)' : 'rgba(16,185,129,0.18)', color: syncing ? '#334155' : '#34d399', border: '1px solid rgba(16,185,129,0.25)' }}
               >
                 {syncing ? <><Loader2 className="w-3 h-3 animate-spin" />Syncing…</> : <><RefreshCw className="w-3 h-3" />Sync All Skills</>}
+              </button>
+
+              <button
+                onClick={handleOpenGrowthPlan}
+                className="w-full mt-1.5 py-1.5 text-xs rounded-lg transition-colors flex items-center justify-center gap-2"
+                style={{ background: 'rgba(245,158,11,0.12)', color: '#f59e0b', border: '1px solid rgba(245,158,11,0.25)' }}
+              >
+                <TrendingUp className="w-3 h-3" />Growth Plan
               </button>
 
               {skills.length >= 2 && (
@@ -1442,18 +1644,42 @@ export default function SkillsPage() {
             </button>
           </div>
         )}
-        {!sidebarCollapsed && reviewCount > 0 && (
-          <div style={{ padding: '6px 14px', borderBottom: '1px solid rgba(255,255,255,0.05)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <span className="text-[10px] text-orange-500/80 flex items-center gap-1.5">
-              <span className="w-1.5 h-1.5 rounded-full bg-orange-500 flex-shrink-0" />{reviewCount} to review
-            </span>
-            <button
-              onClick={() => setShowReviewOnly(!showReviewOnly)}
-              className="text-[9px] px-2 py-0.5 rounded transition-colors"
-              style={{ background: showReviewOnly ? 'rgba(249,115,22,0.12)' : 'rgba(255,255,255,0.04)', color: showReviewOnly ? '#f97316' : '#334155' }}
-            >
-              {showReviewOnly ? 'Filtering' : 'Show'}
-            </button>
+        {!sidebarCollapsed && (
+          <div style={{ padding: '6px 14px', borderBottom: '1px solid rgba(255,255,255,0.05)', display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+            {/* State filter chips */}
+            {(['all', 'seed', 'adjacent'] as const).map(f => (
+              <button
+                key={f}
+                onClick={() => setStateFilter(f)}
+                className="text-[9px] px-2 py-0.5 rounded transition-colors capitalize"
+                style={{
+                  background: stateFilter === f
+                    ? f === 'seed' ? 'rgba(245,158,11,0.15)' : f === 'adjacent' ? 'rgba(16,185,129,0.12)' : 'rgba(255,255,255,0.07)'
+                    : 'rgba(255,255,255,0.03)',
+                  color: stateFilter === f
+                    ? f === 'seed' ? '#f59e0b' : f === 'adjacent' ? '#34d399' : '#94a3b8'
+                    : '#334155',
+                  border: '1px solid ' + (stateFilter === f
+                    ? f === 'seed' ? 'rgba(245,158,11,0.3)' : f === 'adjacent' ? 'rgba(16,185,129,0.25)' : 'rgba(255,255,255,0.12)'
+                    : 'rgba(255,255,255,0.04)'),
+                }}
+              >
+                {f === 'seed' && <span style={{ display: 'inline-block', width: 5, height: 5, borderRadius: '50%', background: '#f59e0b', marginRight: 3, verticalAlign: 'middle' }} />}
+                {f}
+              </button>
+            ))}
+            {/* Review filter */}
+            {reviewCount > 0 && (
+              <button
+                onClick={() => setShowReviewOnly(!showReviewOnly)}
+                className="text-[9px] px-2 py-0.5 rounded transition-colors ml-auto"
+                style={{ background: showReviewOnly ? 'rgba(249,115,22,0.12)' : 'rgba(255,255,255,0.04)', color: showReviewOnly ? '#f97316' : '#334155', border: '1px solid ' + (showReviewOnly ? 'rgba(249,115,22,0.25)' : 'rgba(255,255,255,0.04)') }}
+                title={`${reviewCount} skills to review`}
+              >
+                <Eye className="w-2.5 h-2.5 inline mr-1" style={{ verticalAlign: 'middle' }} />
+                {reviewCount}
+              </button>
+            )}
           </div>
         )}
 
@@ -1619,6 +1845,17 @@ export default function SkillsPage() {
             deps={deps}
             skills={skills}
             onClose={() => setSelectedId(null)}
+          />
+        )}
+
+        {/* Growth Plan panel */}
+        {showGrowthPlan && (
+          <GrowthPlanPanel
+            targets={growthTargets}
+            loading={growthLoading}
+            expandingGraph={expandingGraph}
+            onClose={() => setShowGrowthPlan(false)}
+            onExpandGraph={handleExpandSkillGraph}
           />
         )}
       </div>

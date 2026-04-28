@@ -353,15 +353,24 @@ function LoadedState({
               <p className="text-sm text-slate-400">{resume.email}</p>
             )}
             {resume.skills.length > 0 && (
-              <div className="flex flex-wrap gap-2 mt-3">
-                {resume.skills.map((skill) => (
-                  <span
-                    key={skill}
-                    className="px-2 py-0.5 text-xs font-medium rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-300"
-                  >
-                    {skill}
-                  </span>
-                ))}
+              <div className="mt-3">
+                <div className="text-[10px] text-amber-500/70 font-semibold uppercase tracking-wider mb-1.5 flex items-center gap-1.5">
+                  <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#f59e0b', display: 'inline-block', flexShrink: 0 }} />
+                  Baseline Skills (seeds)
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {resume.skills.map((skill) => (
+                    <span
+                      key={skill}
+                      title="Seed skill from resume"
+                      className="px-2 py-0.5 text-xs font-medium rounded-full flex items-center gap-1"
+                      style={{ background: 'rgba(245,158,11,0.12)', border: '1px solid rgba(245,158,11,0.3)', color: '#fde68a' }}
+                    >
+                      <span style={{ width: 5, height: 5, borderRadius: '50%', background: '#f59e0b', flexShrink: 0 }} />
+                      {skill}
+                    </span>
+                  ))}
+                </div>
               </div>
             )}
           </div>

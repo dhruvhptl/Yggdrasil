@@ -910,6 +910,265 @@ pub async fn get_node_neighborhood(
     Ok(NodeNeighborhood { node_id, prerequisites, dependents, siblings })
 }
 
+// ─── GrowthTarget ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GrowthTarget {
+    pub skill_id: String,
+    pub skill_name: String,
+    pub rationale: String,
+    pub job_relevance_score: f32,
+    pub prereq_distance: i32,
+    pub nearest_seed: String,
+    pub prereq_path: Vec<String>,
+    pub has_resources: bool,
+    pub job_count: i64,
+    pub final_score: f32,
+    pub is_reachable: bool,
+}
+
+#[tauri::command]
+pub async fn get_growth_recommendations(
+    season: Option<String>,
+    database: State<'_, Database>,
+) -> Result<Vec<GrowthTarget>, String> {
+    let pool = &database.pool;
+
+    // 1. Load job skill demand (filtered by season)
+    let job_rows = if let Some(ref s) = season {
+        sqlx::query(
+            "SELECT js.skill_name,
+                    COUNT(DISTINCT js.job_id) AS job_count,
+                    (SELECT COUNT(*) FROM job_applications WHERE season = $1) AS total_jobs,
+                    SUM(CASE WHEN js.is_required THEN 1 ELSE 0 END)::float /
+                        NULLIF(COUNT(DISTINCT js.job_id), 0) AS is_required_ratio
+             FROM job_skills js
+             JOIN job_applications ja ON js.job_id = ja.id
+             WHERE ja.season = $1
+             GROUP BY js.skill_name"
+        )
+        .bind(s)
+        .fetch_all(pool)
+        .await
+    } else {
+        sqlx::query(
+            "SELECT js.skill_name,
+                    COUNT(DISTINCT js.job_id) AS job_count,
+                    (SELECT COUNT(*) FROM job_applications) AS total_jobs,
+                    SUM(CASE WHEN js.is_required THEN 1 ELSE 0 END)::float /
+                        NULLIF(COUNT(DISTINCT js.job_id), 0) AS is_required_ratio
+             FROM job_skills js
+             GROUP BY js.skill_name"
+        )
+        .fetch_all(pool)
+        .await
+    }
+    .map_err(|e| e.to_string())?;
+
+    if job_rows.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let total_jobs: i64 = job_rows.first()
+        .and_then(|r| r.try_get("total_jobs").ok())
+        .unwrap_or(1);
+    if total_jobs == 0 {
+        return Ok(vec![]);
+    }
+
+    // 2. Load all universal_skills (id, name, state, level)
+    let skill_rows = sqlx::query(
+        "SELECT id, name, state, level FROM universal_skills"
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // name (lowercase) → (id, state, level)
+    let skill_by_name: std::collections::HashMap<String, (String, String, i32)> = skill_rows.iter()
+        .filter_map(|r| {
+            let name: String = r.try_get("name").ok()?;
+            let id: String = r.try_get("id").ok()?;
+            let state: String = r.try_get("state").ok()?;
+            let level: i32 = r.try_get("level").unwrap_or(0);
+            Some((name.to_lowercase(), (id, state, level)))
+        })
+        .collect();
+
+    // 3. Load skill_dependencies into adjacency map: source → Vec<target>
+    let dep_rows = sqlx::query(
+        "SELECT source_skill_id, target_skill_id FROM skill_dependencies"
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut adj: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for r in &dep_rows {
+        let src: String = r.try_get("source_skill_id").unwrap_or_default();
+        let tgt: String = r.try_get("target_skill_id").unwrap_or_default();
+        if !src.is_empty() && !tgt.is_empty() {
+            adj.entry(src).or_default().push(tgt);
+        }
+    }
+
+    // 4. Seed IDs and names
+    let seeds: Vec<(String, String)> = skill_rows.iter()
+        .filter_map(|r| {
+            let state: String = r.try_get("state").ok()?;
+            if state != "seed" { return None; }
+            let id: String = r.try_get("id").ok()?;
+            let name: String = r.try_get("name").ok()?;
+            Some((id, name))
+        })
+        .collect();
+
+    // 5. Check resources: load all resource titles once for batch matching
+    let resource_titles: Vec<String> = sqlx::query("SELECT title FROM mimir_resources")
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| r.try_get::<String, _>("title").ok())
+        .map(|t| t.to_lowercase())
+        .collect();
+
+    // 6. Multi-source BFS from all seeds simultaneously, max depth 3
+    // visited: skill_id → (distance, path_of_names, nearest_seed_name)
+    let id_to_name: std::collections::HashMap<String, String> = skill_rows.iter()
+        .filter_map(|r| {
+            let id: String = r.try_get("id").ok()?;
+            let name: String = r.try_get("name").ok()?;
+            Some((id, name))
+        })
+        .collect();
+
+    struct BfsEntry {
+        skill_id: String,
+        distance: i32,
+        path: Vec<String>,
+        seed_name: String,
+    }
+
+    let mut visited: std::collections::HashMap<String, (i32, Vec<String>, String)> = std::collections::HashMap::new();
+    let mut queue: std::collections::VecDeque<BfsEntry> = std::collections::VecDeque::new();
+
+    for (seed_id, seed_name) in &seeds {
+        if !visited.contains_key(seed_id) {
+            visited.insert(seed_id.clone(), (0, vec![seed_name.clone()], seed_name.clone()));
+            queue.push_back(BfsEntry {
+                skill_id: seed_id.clone(),
+                distance: 0,
+                path: vec![seed_name.clone()],
+                seed_name: seed_name.clone(),
+            });
+        }
+    }
+
+    while let Some(entry) = queue.pop_front() {
+        if entry.distance >= 3 { continue; }
+        if let Some(neighbors) = adj.get(&entry.skill_id) {
+            for neighbor_id in neighbors {
+                if visited.contains_key(neighbor_id) { continue; }
+                let neighbor_name = id_to_name.get(neighbor_id).cloned().unwrap_or_default();
+                let mut new_path = entry.path.clone();
+                new_path.push(neighbor_name.clone());
+                visited.insert(neighbor_id.clone(), (
+                    entry.distance + 1,
+                    new_path.clone(),
+                    entry.seed_name.clone(),
+                ));
+                queue.push_back(BfsEntry {
+                    skill_id: neighbor_id.clone(),
+                    distance: entry.distance + 1,
+                    path: new_path,
+                    seed_name: entry.seed_name.clone(),
+                });
+            }
+        }
+    }
+
+    // 7. Build growth targets from job demand
+    let mut reachable: Vec<GrowthTarget> = Vec::new();
+    let mut disconnected: Vec<GrowthTarget> = Vec::new();
+
+    for row in &job_rows {
+        let skill_name: String = match row.try_get("skill_name") { Ok(v) => v, Err(_) => continue };
+        let job_count: i64 = row.try_get("job_count").unwrap_or(0);
+        let is_required_ratio: f64 = row.try_get::<Option<f64>, _>("is_required_ratio").unwrap_or(None).unwrap_or(0.0);
+
+        // Only surface as a growth target if level <= 1 (gap or absent)
+        let level = skill_by_name.get(&skill_name.to_lowercase())
+            .map(|(_, _, lvl)| *lvl)
+            .unwrap_or(0);
+        if level > 1 { continue; }
+
+        let job_frequency = job_count as f32 / total_jobs as f32;
+        let name_lower = skill_name.to_lowercase();
+        let has_resources = resource_titles.iter().any(|t| t.contains(&name_lower));
+
+        let skill_entry = skill_by_name.get(&name_lower);
+        let bfs_result = skill_entry.and_then(|(id, _, _)| visited.get(id));
+
+        let (is_reachable, prereq_distance, nearest_seed, prereq_path) = match bfs_result {
+            Some((dist, path, seed_name)) if *dist > 0 => {
+                (true, *dist, seed_name.clone(), path.clone())
+            }
+            _ => (false, -1i32, String::new(), vec![]),
+        };
+
+        let final_score = if is_reachable {
+            (job_frequency * 0.4)
+                + (is_required_ratio as f32 * 0.2)
+                + (1.0 / (prereq_distance + 1) as f32 * 0.3)
+                + (if has_resources { 0.1 } else { 0.0 })
+        } else {
+            job_frequency
+        };
+
+        let rationale = if is_reachable {
+            format!("Required by {} job{} · {} step{} from {}",
+                job_count, if job_count == 1 { "" } else { "s" },
+                prereq_distance, if prereq_distance == 1 { "" } else { "s" },
+                nearest_seed)
+        } else {
+            format!("Required by {} job{} · no path from your seeds",
+                job_count, if job_count == 1 { "" } else { "s" })
+        };
+
+        let skill_id = skill_entry.map(|(id, _, _)| id.clone()).unwrap_or_default();
+
+        let target = GrowthTarget {
+            skill_id,
+            skill_name,
+            rationale,
+            job_relevance_score: job_frequency,
+            prereq_distance,
+            nearest_seed,
+            prereq_path,
+            has_resources,
+            job_count,
+            final_score,
+            is_reachable,
+        };
+
+        if is_reachable {
+            reachable.push(target);
+        } else {
+            disconnected.push(target);
+        }
+    }
+
+    reachable.sort_by(|a, b| b.final_score.partial_cmp(&a.final_score).unwrap_or(std::cmp::Ordering::Equal));
+    disconnected.sort_by(|a, b| b.job_count.cmp(&a.job_count));
+
+    let mut result: Vec<GrowthTarget> = reachable.into_iter().take(3).collect();
+    result.extend(disconnected.into_iter().take(2));
+
+    Ok(result)
+}
+
 // ─── SkillGraphSnapshot ───────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -932,7 +1191,8 @@ pub async fn get_skill_graph_snapshot(
         sqlx::query(
             "SELECT us.id, us.name,
                     COALESCE(sd.name, us.domain) AS domain,
-                    us.level, us.evidence, us.last_updated, us.review_needed, us.status
+                    us.level, us.evidence, us.last_updated, us.review_needed, us.status,
+                    us.origin, us.state
              FROM universal_skills us
              LEFT JOIN skill_domains sd ON sd.id = us.domain_id
              ORDER BY us.review_needed DESC, us.level DESC, us.name ASC"
@@ -978,6 +1238,8 @@ pub async fn get_skill_graph_snapshot(
                 .map_err(|e: sqlx::Error| e.to_string())?,
             review_needed: r.try_get("review_needed").unwrap_or(false),
             status: r.try_get("status").unwrap_or_else(|_| "active".to_string()),
+            origin: r.try_get("origin").unwrap_or_else(|_| "tree_quest".to_string()),
+            state: r.try_get("state").unwrap_or_else(|_| "adjacent".to_string()),
         })
     }).collect::<Result<Vec<_>, String>>()?;
 

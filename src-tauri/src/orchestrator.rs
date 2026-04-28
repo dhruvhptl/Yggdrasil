@@ -680,7 +680,7 @@ async fn write_mimir_resource_evidence(pool: &PgPool, resource_id: &str) -> usiz
             "relevance_score": relevance_score,
         });
 
-        let skill_id = match crate::skill_commands::upsert_skill(pool, &node_title, None, evidence.clone()).await {
+        let skill_id = match crate::skill_commands::upsert_skill(pool, &node_title, None, evidence.clone(), "resource", "adjacent").await {
             Ok(id) => id,
             Err(e) => {
                 println!("⚠️  [orch] upsert_skill '{}' failed: {}", node_title, e);

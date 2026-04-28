@@ -117,6 +117,22 @@ export interface UniversalSkill {
   lastUpdated: string;
   reviewNeeded: boolean;
   status: string;
+  origin: string;
+  state: string;
+}
+
+export interface GrowthTarget {
+  skillId: string;
+  skillName: string;
+  jobFrequency: number;
+  isRequiredCount: number;
+  totalJobCount: number;
+  prereqDistance: number;
+  prereqPath: string[];
+  hasResources: boolean;
+  isReachable: boolean;
+  score: number;
+  season: string | null;
 }
 
 export interface SkillGap {

@@ -47,6 +47,8 @@ pub struct UniversalSkill {
     pub last_updated: String,
     pub review_needed: bool,
     pub status: String,
+    pub origin: String,
+    pub state: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +156,8 @@ pub(crate) async fn upsert_skill(
     name: &str,
     domain: Option<&str>,
     evidence_entry: serde_json::Value,
+    origin: &str,
+    state: &str,
 ) -> Result<String, String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -169,17 +173,19 @@ pub(crate) async fn upsert_skill(
     // New skills with no domain are flagged unclassified + review_needed so they
     // surface for human classification. On update we never flip review_needed back
     // to false — only the explicit mark_skill_reviewed command does that.
+    // origin is sticky (set once, never overwritten). state is recomputed on sync.
     let no_domain = domain.is_none();
     let row = sqlx::query(
         "INSERT INTO universal_skills
-             (id, name, concept_slug, domain, level, evidence, last_updated, status, review_needed)
+             (id, name, concept_slug, domain, level, evidence, last_updated, status, review_needed, origin, state)
          VALUES ($1, $2, $3, $4, 1, $5::jsonb, NOW(),
                  CASE WHEN $4 IS NULL THEN 'unclassified' ELSE 'active' END,
-                 $6)
+                 $6, $7, $8)
          ON CONFLICT (LOWER(name)) DO UPDATE SET
              evidence = universal_skills.evidence || $5::jsonb,
              concept_slug = COALESCE(universal_skills.concept_slug, EXCLUDED.concept_slug),
              domain = COALESCE($4, universal_skills.domain),
+             state = EXCLUDED.state,
              last_updated = NOW()
          RETURNING id"
     )
@@ -189,6 +195,8 @@ pub(crate) async fn upsert_skill(
     .bind(domain)
     .bind(&evidence_arr)
     .bind(no_domain)
+    .bind(origin)
+    .bind(state)
     .fetch_one(pool)
     .await
     .map_err(|e| format!("upsert_skill failed: {}", e))?;
@@ -220,7 +228,7 @@ pub(crate) async fn sync_resume_inner(pool: &PgPool) -> Result<SyncResult, Strin
             "type": "resume",
             "detail": "Listed on resume"
         });
-        upsert_skill(pool, skill_name, None, evidence).await?;
+        upsert_skill(pool, skill_name, None, evidence, "resume", "seed").await?;
         count += 1;
     }
 
@@ -263,7 +271,7 @@ pub(crate) async fn sync_trees_inner(pool: &PgPool) -> Result<SyncResult, String
             "progress": progress
         });
 
-        upsert_skill(pool, &title, None, evidence).await?;
+        upsert_skill(pool, &title, None, evidence, "tree_quest", "adjacent").await?;
         count += 1;
     }
 
@@ -297,7 +305,7 @@ pub(crate) async fn sync_work_inner(pool: &PgPool) -> Result<SyncResult, String>
             "resourceId": resource_id
         });
 
-        upsert_skill(pool, &skill_name, None, evidence).await?;
+        upsert_skill(pool, &skill_name, None, evidence, "work", "adjacent").await?;
         count += 1;
     }
 
@@ -439,6 +447,7 @@ pub async fn sync_all_skills(
     }
 
     recalculate_levels_inner(&database.pool).await?;
+    expand_seed_neighbors(&database.pool).await?;
 
     println!("🌳 Synced all skills: resume={}, trees={}, work={}", r1.upserted, r2.upserted, r3.upserted);
     Ok(vec![r1, r2, r3])
@@ -449,7 +458,7 @@ pub async fn get_universal_skills(
     database: State<'_, Database>,
 ) -> Result<Vec<UniversalSkill>, String> {
     let rows = sqlx::query(
-        "SELECT id, name, domain, level, evidence, last_updated, review_needed, status
+        "SELECT id, name, domain, level, evidence, last_updated, review_needed, status, origin, state
          FROM universal_skills ORDER BY review_needed DESC, level DESC, name ASC"
     )
     .fetch_all(&database.pool)
@@ -468,6 +477,8 @@ pub async fn get_universal_skills(
                 .map_err(|e| e.to_string())?,
             review_needed: r.try_get("review_needed").unwrap_or(false),
             status: r.try_get("status").unwrap_or_else(|_| "active".to_string()),
+            origin: r.try_get("origin").unwrap_or_else(|_| "tree_quest".to_string()),
+            state: r.try_get("state").unwrap_or_else(|_| "adjacent".to_string()),
         })
     }).collect()
 }
@@ -1100,6 +1111,37 @@ pub async fn reset_skill_domains(
 }
 
 // ─── Concept slug bridge ──────────────────────────────────────────────────────
+
+/// Full recompute of seed/adjacent states.
+/// Seeds = skills with origin='resume'. Everything else = adjacent.
+/// Returns total rows updated.
+pub(crate) async fn expand_seed_neighbors(pool: &PgPool) -> Result<usize, String> {
+    let seed_result = sqlx::query(
+        "UPDATE universal_skills SET state = 'seed' WHERE origin = 'resume'"
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let adjacent_result = sqlx::query(
+        "UPDATE universal_skills SET state = 'adjacent' WHERE origin != 'resume'"
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let total = (seed_result.rows_affected() + adjacent_result.rows_affected()) as usize;
+    println!("🌱 expand_seed_neighbors: {} seeds, {} adjacent",
+        seed_result.rows_affected(), adjacent_result.rows_affected());
+    Ok(total)
+}
+
+#[tauri::command]
+pub async fn expand_skill_graph(
+    database: State<'_, Database>,
+) -> Result<usize, String> {
+    expand_seed_neighbors(&database.pool).await
+}
 
 /// Copy concept_slug from tree_nodes onto universal_skills where the skill name
 /// matches the node title (case-insensitive, ILIKE).
