@@ -2004,7 +2004,7 @@ pub async fn get_resource_study_map(
         let rows = sqlx::query(
             "SELECT mnl.resource_id,
                     COUNT(DISTINCT mnl.node_id) AS coverage_count,
-                    AVG(mnl.relevance_score)    AS avg_relevance
+                    CAST(AVG(mnl.relevance_score) AS FLOAT8) AS avg_relevance
              FROM mimir_node_links mnl
              JOIN tree_nodes lf ON lf.id = mnl.node_id AND lf.type = 'leaf'
              LEFT JOIN tree_nodes br ON br.id = lf.parent_id AND br.type = 'branch'
@@ -2035,7 +2035,7 @@ pub async fn get_resource_study_map(
         let rows = sqlx::query(
             "SELECT mnl.resource_id,
                     COUNT(DISTINCT mnl.node_id) AS coverage_count,
-                    AVG(mnl.relevance_score)    AS avg_relevance
+                    CAST(AVG(mnl.relevance_score) AS FLOAT8) AS avg_relevance
              FROM mimir_node_links mnl
              JOIN tree_nodes lf ON lf.id = mnl.node_id AND lf.type = 'leaf'
              LEFT JOIN tree_nodes br ON br.id = lf.parent_id AND br.type = 'branch'
@@ -2093,18 +2093,36 @@ pub async fn get_resource_study_map(
     }
 
     // Fetch supported nodes
-    let node_rows = sqlx::query(
-        "SELECT mnl.resource_id, mnl.node_id, tn.title,
-                mnl.matched_section_title, mnl.matched_page_start, mnl.matched_page_end
-         FROM mimir_node_links mnl
-         JOIN tree_nodes tn ON tn.id = mnl.node_id
-         WHERE mnl.resource_id = ANY($1)
-           AND mnl.relevance_score < 0.55"
-    )
-    .bind(&top_resource_ids)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| e.to_string())?;
+    let node_rows = if filter_trees {
+        let ids = tree_ids.as_ref().unwrap();
+        sqlx::query(
+            "SELECT mnl.resource_id, mnl.node_id, tn.title,
+                    mnl.matched_section_title, mnl.matched_page_start, mnl.matched_page_end
+             FROM mimir_node_links mnl
+             JOIN tree_nodes tn ON tn.id = mnl.node_id
+             WHERE mnl.resource_id = ANY($1)
+               AND tn.tree_id = ANY($2)
+               AND mnl.relevance_score < 0.55"
+        )
+        .bind(&top_resource_ids)
+        .bind(ids)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?
+    } else {
+        sqlx::query(
+            "SELECT mnl.resource_id, mnl.node_id, tn.title,
+                    mnl.matched_section_title, mnl.matched_page_start, mnl.matched_page_end
+             FROM mimir_node_links mnl
+             JOIN tree_nodes tn ON tn.id = mnl.node_id
+             WHERE mnl.resource_id = ANY($1)
+               AND mnl.relevance_score < 0.55"
+        )
+        .bind(&top_resource_ids)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?
+    };
 
     let mut nodes_by_resource: std::collections::HashMap<String, Vec<StudyMapNode>> = std::collections::HashMap::new();
     for r in &node_rows {
