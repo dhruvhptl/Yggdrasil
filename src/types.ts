@@ -88,6 +88,7 @@ export interface MimirResource {
   matchedSectionTitle?: string | null;
   matchedPageStart?: number | null;
   matchedPageEnd?: number | null;
+  transcriptSource?: 'youtube_transcript_api' | 'youtubetranscript_dev' | 'metadata_only' | null;
 }
 
 // Universal Skill Tree types
@@ -276,6 +277,29 @@ export interface Suggestion {
 
 // Daily Eisenhower Matrix types
 
+// Learning Path types
+
+export interface LearningStep {
+  step: number;
+  skillId: string;
+  skillName: string;
+  skillState: string;
+  weightedDemand: number;
+  prereqPath: PathNode[];
+  jobsNeedingThis: string[];
+  rationale: string;
+  hasResources: boolean;
+  estimatedPrereqsComplete: number;
+}
+
+export interface LearningPath {
+  steps: LearningStep[];
+  totalGapSkills: number;
+  seededSkillsCount: number;
+  targetJobsCount: number;
+  season: string | null;
+}
+
 export interface DailyQuestLink {
   id: string;
   date: string;
@@ -294,4 +318,46 @@ export interface DailyLog {
   date: string;
   notes: string | null;
   links: DailyQuestLink[];
+}
+
+export interface TranscriptJobStats {
+  pending: number;
+  processing: number;
+  done: number;
+  failed: number;
+  skipped: number;
+}
+
+// Study Map types
+
+export interface StudyMapNode {
+  nodeId: string;
+  title: string;
+  matchedSectionTitle: string | null;
+  matchedPageStart: number | null;
+  matchedPageEnd: number | null;
+}
+
+export interface StudyMapTreeBreakdown {
+  treeId: string;
+  projectName: string;
+  nodeCount: number;
+}
+
+export interface StudyMapEntry {
+  resourceId: string;
+  title: string;
+  resourceType: string;
+  url: string | null;
+  coverageCount: number;
+  avgRelevance: number;
+  relevanceTier: 'green' | 'amber' | 'grey';
+  treeBreakdown: StudyMapTreeBreakdown[];
+  supportedNodes: StudyMapNode[];
+}
+
+export interface ResourceStudyMap {
+  entries: StudyMapEntry[];
+  totalResourcesWithLinks: number;
+  totalUnlockedNodes: number;
 }
