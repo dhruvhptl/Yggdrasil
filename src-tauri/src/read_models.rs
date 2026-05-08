@@ -1373,6 +1373,428 @@ pub async fn get_growth_recommendations(
     Ok(result)
 }
 
+// ─── LearningPath ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LearningStep {
+    pub step: i32,
+    pub skill_id: String,
+    pub skill_name: String,
+    pub skill_state: String,
+    pub weighted_demand: f32,
+    pub prereq_path: Vec<PathNode>,
+    pub jobs_needing_this: Vec<String>,
+    pub rationale: String,
+    pub has_resources: bool,
+    pub estimated_prereqs_complete: i32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LearningPath {
+    pub steps: Vec<LearningStep>,
+    pub total_gap_skills: i32,
+    pub seeded_skills_count: i32,
+    pub target_jobs_count: i32,
+    pub season: Option<String>,
+}
+
+fn normalize_skill_name(s: &str) -> String {
+    s.trim().to_lowercase()
+}
+
+#[tauri::command]
+pub async fn compute_learning_path(
+    season: Option<String>,
+    database: State<'_, Database>,
+) -> Result<LearningPath, String> {
+    let pool = &database.pool;
+
+    // 1. Load jobs with computed weights
+    // weight = sum of available ratings / max_possible; default 0.6 when all null
+    struct JobWeight { id: String, company: String, position: String, weight: f32 }
+    let job_rows = if let Some(ref s) = season {
+        sqlx::query(
+            "SELECT id, company, position,
+                    COALESCE(rating_location, 0) + COALESCE(rating_alignment, 0) +
+                    COALESCE(rating_salary, 0)   + COALESCE(rating_role, 0) AS rating_sum,
+                    (CASE WHEN rating_location IS NULL AND rating_alignment IS NULL
+                               AND rating_salary IS NULL AND rating_role IS NULL
+                          THEN 1 ELSE 0 END) AS all_null
+             FROM job_applications
+             WHERE season = $1 AND status NOT IN ('rejected', 'withdrawn')"
+        )
+        .bind(s)
+        .fetch_all(pool)
+        .await
+    } else {
+        sqlx::query(
+            "SELECT id, company, position,
+                    COALESCE(rating_location, 0) + COALESCE(rating_alignment, 0) +
+                    COALESCE(rating_salary, 0)   + COALESCE(rating_role, 0) AS rating_sum,
+                    (CASE WHEN rating_location IS NULL AND rating_alignment IS NULL
+                               AND rating_salary IS NULL AND rating_role IS NULL
+                          THEN 1 ELSE 0 END) AS all_null
+             FROM job_applications
+             WHERE status NOT IN ('rejected', 'withdrawn')"
+        )
+        .fetch_all(pool)
+        .await
+    }
+    .map_err(|e| e.to_string())?;
+
+    if job_rows.is_empty() {
+        return Ok(LearningPath { steps: vec![], total_gap_skills: 0, seeded_skills_count: 0, target_jobs_count: 0, season });
+    }
+
+    let jobs: Vec<JobWeight> = job_rows.iter().filter_map(|r| {
+        let id: String = r.try_get("id").ok()?;
+        let company: String = r.try_get("company").ok()?;
+        let position: String = r.try_get("position").ok()?;
+        let rating_sum: i32 = r.try_get::<Option<i32>, _>("rating_sum").ok().flatten().unwrap_or(0);
+        let all_null: i32 = r.try_get::<Option<i32>, _>("all_null").ok().flatten().unwrap_or(1);
+        let weight = if all_null == 1 { 0.6 } else { rating_sum as f32 / 20.0 };
+        Some(JobWeight { id, company, position, weight })
+    }).collect();
+
+    let target_jobs_count = jobs.len() as i32;
+    let job_weight_by_id: std::collections::HashMap<String, f32> = jobs.iter().map(|j| (j.id.clone(), j.weight)).collect();
+
+    // 2. Load job skills and aggregate weighted demand
+    let skill_rows = sqlx::query(
+        "SELECT js.skill_name, js.job_id, js.is_required FROM job_skills js
+         JOIN job_applications ja ON ja.id = js.job_id
+         WHERE ja.status NOT IN ('rejected', 'withdrawn')"
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // skill_name (normalized) → (weighted_demand, job_titles, job_count)
+    let mut demand_map: std::collections::HashMap<String, (f32, Vec<String>, i32)> = std::collections::HashMap::new();
+    for row in &skill_rows {
+        let skill_name: String = match row.try_get("skill_name") { Ok(v) => v, Err(_) => continue };
+        let job_id: String = row.try_get("job_id").unwrap_or_default();
+        let is_required: bool = row.try_get("is_required").unwrap_or(false);
+        let weight = job_weight_by_id.get(&job_id).copied().unwrap_or(0.6);
+        let factor = if is_required { 1.2 } else { 0.8 };
+
+        // Find company+position for this job
+        let job_title = jobs.iter().find(|j| j.id == job_id)
+            .map(|j| format!("{} — {}", j.company, j.position))
+            .unwrap_or_default();
+
+        let norm = normalize_skill_name(&skill_name);
+        let entry = demand_map.entry(norm).or_insert((0.0, vec![], 0));
+        entry.0 += weight * factor;
+        if !entry.1.contains(&job_title) { entry.1.push(job_title); }
+        entry.2 += 1;
+    }
+
+    // 3. Load all universal skills for matching
+    let us_rows = sqlx::query(
+        "SELECT id, name, COALESCE(state, 'adjacent') AS state,
+                COALESCE(origin, 'tree_quest') AS origin, COALESCE(level, 0) AS level
+         FROM universal_skills"
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let skill_meta: std::collections::HashMap<String, (String, String, String, i32)> = us_rows.iter()
+        .filter_map(|r| {
+            let id: String = r.try_get("id").ok()?;
+            let name: String = r.try_get("name").ok()?;
+            let state: String = r.try_get("state").ok()?;
+            let origin: String = r.try_get("origin").ok()?;
+            let level: i32 = r.try_get("level").unwrap_or(0);
+            Some((id, (name, state, origin, level)))
+        })
+        .collect();
+
+    // name → id, state, level (case-insensitive lookup)
+    let skill_by_norm_name: std::collections::HashMap<String, (String, String, i32)> = us_rows.iter()
+        .filter_map(|r| {
+            let name: String = r.try_get("name").ok()?;
+            let id: String = r.try_get("id").ok()?;
+            let state: String = r.try_get("state").ok()?;
+            let level: i32 = r.try_get("level").unwrap_or(0);
+            Some((normalize_skill_name(&name), (id, state, level)))
+        })
+        .collect();
+
+    let seeded_skills_count = us_rows.iter()
+        .filter(|r| r.try_get::<String, _>("state").unwrap_or_default() == "seed")
+        .count() as i32;
+
+    // 4. Filter to gap skills (level <= 1 or not in universal_skills)
+    let resource_titles: Vec<String> = sqlx::query("SELECT title FROM mimir_resources")
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| r.try_get::<String, _>("title").ok())
+        .map(|t| t.to_lowercase())
+        .collect();
+
+    struct GapCandidate {
+        skill_id: String,
+        skill_name: String,
+        skill_state: String,
+        weighted_demand: f32,
+        job_titles: Vec<String>,
+        job_count: i32,
+        has_resources: bool,
+        prereq_path: PrereqPath,
+    }
+
+    let max_demand = demand_map.values().map(|(d, _, _)| *d).fold(0.0f32, f32::max).max(1.0);
+
+    // Load dep graph for topological sort
+    let dep_rows = sqlx::query(
+        "SELECT source_skill_id, target_skill_id FROM skill_dependencies"
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut adj: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut in_degree: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for r in &dep_rows {
+        let src: String = r.try_get("source_skill_id").unwrap_or_default();
+        let tgt: String = r.try_get("target_skill_id").unwrap_or_default();
+        if !src.is_empty() && !tgt.is_empty() {
+            adj.entry(src.clone()).or_default().push(tgt.clone());
+            in_degree.entry(tgt).or_insert(0);
+            *in_degree.entry(src).or_insert(0) += 0; // ensure src exists
+        }
+    }
+
+    let mut candidates: Vec<GapCandidate> = Vec::new();
+
+    for (norm_name, (weighted_demand, job_titles, job_count)) in &demand_map {
+        let skill_entry = skill_by_norm_name.get(norm_name.as_str());
+        let level = skill_entry.map(|(_, _, l)| *l).unwrap_or(0);
+        if level > 1 { continue; } // already proficient — skip
+
+        let skill_id = skill_entry.map(|(id, _, _)| id.clone()).unwrap_or_default();
+        let skill_name = skill_entry.and_then(|(id, _, _)| skill_meta.get(id)).map(|(n, _, _, _)| n.clone())
+            .unwrap_or_else(|| {
+                // Fallback: capitalize first letter of each word
+                norm_name.split_whitespace().map(|w| {
+                    let mut c = w.chars();
+                    c.next().map_or(String::new(), |f| f.to_uppercase().collect::<String>() + c.as_str())
+                }).collect::<Vec<_>>().join(" ")
+            });
+        let skill_state = skill_entry.map(|(_, s, _)| s.clone()).unwrap_or_else(|| "gap".to_string());
+
+        let name_lower = skill_name.to_lowercase();
+        let has_resources = resource_titles.iter().any(|t| t.contains(&name_lower));
+
+        let prereq_path = if skill_id.is_empty() {
+            PrereqPath { target_skill: skill_name.clone(), target_skill_id: String::new(), path: vec![], total_hops: -1, nearest_seed: None, is_reachable: false }
+        } else {
+            compute_prereq_path(pool, &skill_id, &skill_meta, &resource_titles, 4).await
+        };
+
+        candidates.push(GapCandidate {
+            skill_id,
+            skill_name,
+            skill_state,
+            weighted_demand: *weighted_demand,
+            job_titles: job_titles.clone(),
+            job_count: *job_count,
+            has_resources,
+            prereq_path,
+        });
+    }
+
+    let total_gap_skills = candidates.len() as i32;
+
+    // 5. Score each gap skill
+    struct ScoredCandidate {
+        inner: GapCandidate,
+        score: f32,
+        prereqs_seeded: i32,
+    }
+
+    let scored: Vec<ScoredCandidate> = candidates.into_iter().map(|c| {
+        let prereqs_seeded = c.prereq_path.path.iter().filter(|n| n.state == "seed").count() as i32;
+        let path_cost = (c.prereq_path.path.len() as f32 + 1.0).max(1.0);
+        let prereq_ratio = prereqs_seeded as f32 / path_cost;
+        let score = (c.weighted_demand / max_demand * 0.5)
+            + (1.0 / path_cost * 0.3)
+            + (prereq_ratio * 0.1)
+            + (if c.has_resources { 0.1 } else { 0.0 });
+        ScoredCandidate { inner: c, score, prereqs_seeded }
+    }).collect();
+
+    // 6. Topological sort (Kahn's) — within same layer sort by score desc
+    // Build DAG from gap skill IDs only
+    let gap_ids: std::collections::HashSet<String> = scored.iter()
+        .filter(|s| !s.inner.skill_id.is_empty())
+        .map(|s| s.inner.skill_id.clone())
+        .collect();
+
+    // in_degree within gap candidates only
+    let mut gap_indegree: std::collections::HashMap<String, usize> = gap_ids.iter()
+        .map(|id| (id.clone(), 0))
+        .collect();
+    let mut gap_adj: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+
+    for r in &dep_rows {
+        let src: String = r.try_get("source_skill_id").unwrap_or_default();
+        let tgt: String = r.try_get("target_skill_id").unwrap_or_default();
+        // Only include edges where BOTH ends are gap candidates
+        if gap_ids.contains(&src) && gap_ids.contains(&tgt) {
+            gap_adj.entry(src.clone()).or_default().push(tgt.clone());
+            *gap_indegree.entry(tgt).or_insert(0) += 1;
+        }
+    }
+
+    // Kahn's BFS — use a Vec as a priority queue (re-sort each layer to avoid ordered_float dep)
+    let score_by_id: std::collections::HashMap<String, f32> = scored.iter()
+        .map(|s| (s.inner.skill_id.clone(), s.score))
+        .collect();
+
+    let mut ready: Vec<String> = gap_indegree.iter()
+        .filter(|(_, &deg)| deg == 0)
+        .map(|(id, _)| id.clone())
+        .collect();
+    // Sort ready queue: highest score first
+    ready.sort_by(|a, b| {
+        let sa = score_by_id.get(a).copied().unwrap_or(0.0);
+        let sb = score_by_id.get(b).copied().unwrap_or(0.0);
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut ordered_ids: Vec<String> = Vec::new();
+    while !ready.is_empty() {
+        // Pop best (first element after sort)
+        let id = ready.remove(0);
+        ordered_ids.push(id.clone());
+        if let Some(nexts) = gap_adj.get(&id) {
+            let mut newly_ready: Vec<String> = Vec::new();
+            for next in nexts {
+                let deg = gap_indegree.entry(next.clone()).or_insert(1);
+                *deg = deg.saturating_sub(1);
+                if *deg == 0 {
+                    newly_ready.push(next.clone());
+                }
+            }
+            // Sort newly ready by score and append to ready
+            newly_ready.sort_by(|a, b| {
+                let sa = score_by_id.get(a).copied().unwrap_or(0.0);
+                let sb = score_by_id.get(b).copied().unwrap_or(0.0);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            ready.extend(newly_ready);
+            // Re-sort to maintain priority within combined queue
+            ready.sort_by(|a, b| {
+                let sa = score_by_id.get(a).copied().unwrap_or(0.0);
+                let sb = score_by_id.get(b).copied().unwrap_or(0.0);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+    }
+
+    // Build two indexes: by_id for known skills, unknown vec for gap skills with no universal_skills row
+    let (unknown_vec, known_vec): (Vec<ScoredCandidate>, Vec<ScoredCandidate>) =
+        scored.into_iter().partition(|s| s.inner.skill_id.is_empty());
+
+    let mut by_id: std::collections::HashMap<String, ScoredCandidate> = known_vec.into_iter()
+        .map(|s| (s.inner.skill_id.clone(), s))
+        .collect();
+
+    // Append any cycles (remaining non-zero indegree) sorted by score
+    let mut remaining: Vec<String> = gap_indegree.iter()
+        .filter(|(_, &deg)| deg > 0)
+        .filter(|(id, _)| !id.is_empty())
+        .map(|(id, _)| id.clone())
+        .collect();
+    remaining.sort_by(|a, b| {
+        let sa = score_by_id.get(a).copied().unwrap_or(0.0);
+        let sb = score_by_id.get(b).copied().unwrap_or(0.0);
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for id in remaining { ordered_ids.push(id.clone()); }
+
+    // Gap skills with no skill_id (not in universal_skills at all) — append at end sorted by score
+    let mut unknown = unknown_vec;
+    unknown.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
+    // 7. Assemble ordered steps
+    let mut steps: Vec<LearningStep> = Vec::new();
+
+    for id in &ordered_ids {
+        let Some(s) = by_id.remove(id) else { continue };
+        let step_num = steps.len() as i32 + 1;
+        let top_jobs: Vec<String> = s.inner.job_titles.iter().take(3).cloned().collect();
+        let extra = if s.inner.job_titles.len() > 3 { format!(" +{} more", s.inner.job_titles.len() - 3) } else { String::new() };
+        let nearest_seed = s.inner.prereq_path.nearest_seed.clone().unwrap_or_else(|| "baseline".to_string());
+        let hops = s.inner.prereq_path.total_hops.max(0);
+        let rationale = format!(
+            "Required by {} job{} ({}{}) · {} step{} from {} · {}",
+            s.inner.job_count,
+            if s.inner.job_count == 1 { "" } else { "s" },
+            top_jobs.join(", "),
+            extra,
+            hops,
+            if hops == 1 { "" } else { "s" },
+            nearest_seed,
+            if s.inner.has_resources { "resources available" } else { "add resources" },
+        );
+
+        steps.push(LearningStep {
+            step: step_num,
+            skill_id: s.inner.skill_id,
+            skill_name: s.inner.skill_name,
+            skill_state: s.inner.skill_state,
+            weighted_demand: s.inner.weighted_demand,
+            prereq_path: s.inner.prereq_path.path,
+            jobs_needing_this: s.inner.job_titles,
+            rationale,
+            has_resources: s.inner.has_resources,
+            estimated_prereqs_complete: s.prereqs_seeded,
+        });
+    }
+
+    // Append unknown-skill gap candidates
+    for s in unknown {
+        let step_num = steps.len() as i32 + 1;
+        let top_jobs: Vec<String> = s.inner.job_titles.iter().take(3).cloned().collect();
+        let extra = if s.inner.job_titles.len() > 3 { format!(" +{} more", s.inner.job_titles.len() - 3) } else { String::new() };
+        let rationale = format!(
+            "Required by {} job{} ({}{}) · not yet in your skill graph",
+            s.inner.job_count,
+            if s.inner.job_count == 1 { "" } else { "s" },
+            top_jobs.join(", "),
+            extra,
+        );
+        steps.push(LearningStep {
+            step: step_num,
+            skill_id: s.inner.skill_id,
+            skill_name: s.inner.skill_name,
+            skill_state: s.inner.skill_state,
+            weighted_demand: s.inner.weighted_demand,
+            prereq_path: s.inner.prereq_path.path,
+            jobs_needing_this: s.inner.job_titles,
+            rationale,
+            has_resources: s.inner.has_resources,
+            estimated_prereqs_complete: s.prereqs_seeded,
+        });
+    }
+
+    Ok(LearningPath {
+        steps,
+        total_gap_skills,
+        seeded_skills_count,
+        target_jobs_count,
+        season,
+    })
+}
+
 // ─── SkillGraphSnapshot ───────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1499,5 +1921,264 @@ pub async fn get_skill_graph_snapshot(
         gaps,
         gap_count,
         review_count,
+    })
+}
+
+// ─── ResourceStudyMap ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StudyMapNode {
+    pub node_id: String,
+    pub title: String,
+    pub matched_section_title: Option<String>,
+    pub matched_page_start: Option<i32>,
+    pub matched_page_end: Option<i32>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StudyMapTreeBreakdown {
+    pub tree_id: String,
+    pub project_name: String,
+    pub node_count: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StudyMapEntry {
+    pub resource_id: String,
+    pub title: String,
+    pub resource_type: String,
+    pub url: Option<String>,
+    pub coverage_count: i64,
+    pub avg_relevance: f64,
+    pub relevance_tier: String,
+    pub tree_breakdown: Vec<StudyMapTreeBreakdown>,
+    pub supported_nodes: Vec<StudyMapNode>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceStudyMap {
+    pub entries: Vec<StudyMapEntry>,
+    pub total_resources_with_links: i64,
+    pub total_unlocked_nodes: i64,
+}
+
+#[tauri::command]
+pub async fn get_resource_study_map(
+    tree_ids: Option<Vec<String>>,
+    include_frontier: Option<bool>,
+    database: State<'_, Database>,
+) -> Result<ResourceStudyMap, String> {
+    let pool = &database.pool;
+    let include_frontier = include_frontier.unwrap_or(false);
+
+    // Count total unlocked leaf nodes
+    let total_unlocked: i64 = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM tree_nodes WHERE type = 'leaf' AND is_locked = false"
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+
+    // Count distinct resources that have at least one node link
+    let total_resources_with_links: i64 = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(DISTINCT resource_id) FROM mimir_node_links WHERE relevance_score < 0.55"
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+
+    let filter_trees = tree_ids.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
+
+    struct RankedRow {
+        resource_id: String,
+        coverage_count: i64,
+        avg_relevance: f64,
+    }
+
+    let ranked_rows: Vec<RankedRow> = if filter_trees {
+        let ids = tree_ids.as_ref().unwrap();
+        let rows = sqlx::query(
+            "SELECT mnl.resource_id,
+                    COUNT(DISTINCT mnl.node_id) AS coverage_count,
+                    AVG(mnl.relevance_score)    AS avg_relevance
+             FROM mimir_node_links mnl
+             JOIN tree_nodes lf ON lf.id = mnl.node_id AND lf.type = 'leaf'
+             LEFT JOIN tree_nodes br ON br.id = lf.parent_id AND br.type = 'branch'
+             WHERE mnl.relevance_score < 0.55
+               AND lf.tree_id = ANY($1)
+               AND (
+                   lf.is_locked = false
+                   OR ($2 = true AND br.progress > 0)
+               )
+             GROUP BY mnl.resource_id
+             ORDER BY coverage_count DESC, avg_relevance ASC
+             LIMIT 20"
+        )
+        .bind(ids)
+        .bind(include_frontier)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        rows.iter().filter_map(|r| {
+            Some(RankedRow {
+                resource_id: r.try_get("resource_id").ok()?,
+                coverage_count: r.try_get("coverage_count").ok()?,
+                avg_relevance: r.try_get::<f64, _>("avg_relevance").unwrap_or(0.5),
+            })
+        }).collect()
+    } else {
+        let rows = sqlx::query(
+            "SELECT mnl.resource_id,
+                    COUNT(DISTINCT mnl.node_id) AS coverage_count,
+                    AVG(mnl.relevance_score)    AS avg_relevance
+             FROM mimir_node_links mnl
+             JOIN tree_nodes lf ON lf.id = mnl.node_id AND lf.type = 'leaf'
+             LEFT JOIN tree_nodes br ON br.id = lf.parent_id AND br.type = 'branch'
+             WHERE mnl.relevance_score < 0.55
+               AND (
+                   lf.is_locked = false
+                   OR ($1 = true AND br.progress > 0)
+               )
+             GROUP BY mnl.resource_id
+             ORDER BY coverage_count DESC, avg_relevance ASC
+             LIMIT 20"
+        )
+        .bind(include_frontier)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        rows.iter().filter_map(|r| {
+            Some(RankedRow {
+                resource_id: r.try_get("resource_id").ok()?,
+                coverage_count: r.try_get("coverage_count").ok()?,
+                avg_relevance: r.try_get::<f64, _>("avg_relevance").unwrap_or(0.5),
+            })
+        }).collect()
+    };
+
+    if ranked_rows.is_empty() {
+        return Ok(ResourceStudyMap {
+            entries: vec![],
+            total_resources_with_links,
+            total_unlocked_nodes: total_unlocked,
+        });
+    }
+
+    let top_resource_ids: Vec<String> = ranked_rows.iter().map(|r| r.resource_id.clone()).collect();
+
+    // Fetch resource metadata
+    let resource_rows = sqlx::query(
+        "SELECT id, title, type AS resource_type, url
+         FROM mimir_resources
+         WHERE id = ANY($1)"
+    )
+    .bind(&top_resource_ids)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut resource_meta: std::collections::HashMap<String, (String, String, Option<String>)> = std::collections::HashMap::new();
+    for r in &resource_rows {
+        let id: String = r.try_get("id").unwrap_or_default();
+        let title: String = r.try_get("title").unwrap_or_default();
+        let rtype: String = r.try_get("resource_type").unwrap_or_default();
+        let url: Option<String> = r.try_get("url").unwrap_or(None);
+        resource_meta.insert(id, (title, rtype, url));
+    }
+
+    // Fetch supported nodes
+    let node_rows = sqlx::query(
+        "SELECT mnl.resource_id, mnl.node_id, tn.title,
+                mnl.matched_section_title, mnl.matched_page_start, mnl.matched_page_end
+         FROM mimir_node_links mnl
+         JOIN tree_nodes tn ON tn.id = mnl.node_id
+         WHERE mnl.resource_id = ANY($1)
+           AND mnl.relevance_score < 0.55"
+    )
+    .bind(&top_resource_ids)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut nodes_by_resource: std::collections::HashMap<String, Vec<StudyMapNode>> = std::collections::HashMap::new();
+    for r in &node_rows {
+        let resource_id: String = r.try_get("resource_id").unwrap_or_default();
+        let node_id: String = r.try_get("node_id").unwrap_or_default();
+        let title: String = r.try_get("title").unwrap_or_default();
+        let matched_section_title: Option<String> = r.try_get("matched_section_title").unwrap_or(None);
+        let matched_page_start: Option<i32> = r.try_get("matched_page_start").unwrap_or(None);
+        let matched_page_end: Option<i32> = r.try_get("matched_page_end").unwrap_or(None);
+        nodes_by_resource.entry(resource_id).or_default().push(StudyMapNode {
+            node_id,
+            title,
+            matched_section_title,
+            matched_page_start,
+            matched_page_end,
+        });
+    }
+
+    // Fetch tree breakdown
+    let breakdown_rows = sqlx::query(
+        "SELECT mnl.resource_id, tn.tree_id, p.name AS project_name,
+                COUNT(DISTINCT mnl.node_id) AS node_count
+         FROM mimir_node_links mnl
+         JOIN tree_nodes tn ON tn.id = mnl.node_id
+         JOIN trees t ON t.id = tn.tree_id
+         JOIN projects p ON p.id = t.project_id
+         WHERE mnl.resource_id = ANY($1)
+           AND mnl.relevance_score < 0.55
+         GROUP BY mnl.resource_id, tn.tree_id, p.name"
+    )
+    .bind(&top_resource_ids)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut breakdown_by_resource: std::collections::HashMap<String, Vec<StudyMapTreeBreakdown>> = std::collections::HashMap::new();
+    for r in &breakdown_rows {
+        let resource_id: String = r.try_get("resource_id").unwrap_or_default();
+        let tree_id: String = r.try_get("tree_id").unwrap_or_default();
+        let project_name: String = r.try_get("project_name").unwrap_or_default();
+        let node_count: i64 = r.try_get("node_count").unwrap_or(0);
+        breakdown_by_resource.entry(resource_id).or_default().push(StudyMapTreeBreakdown {
+            tree_id,
+            project_name,
+            node_count,
+        });
+    }
+
+    // Assemble entries in ranked order
+    let entries: Vec<StudyMapEntry> = ranked_rows.into_iter().filter_map(|rr| {
+        let (title, resource_type, url) = resource_meta.remove(&rr.resource_id)?;
+        let relevance_tier = if rr.avg_relevance < 0.30 {
+            "green".to_string()
+        } else if rr.avg_relevance < 0.45 {
+            "amber".to_string()
+        } else {
+            "grey".to_string()
+        };
+        Some(StudyMapEntry {
+            resource_id: rr.resource_id.clone(),
+            title,
+            resource_type,
+            url,
+            coverage_count: rr.coverage_count,
+            avg_relevance: rr.avg_relevance,
+            relevance_tier,
+            tree_breakdown: breakdown_by_resource.remove(&rr.resource_id).unwrap_or_default(),
+            supported_nodes: nodes_by_resource.remove(&rr.resource_id).unwrap_or_default(),
+        })
+    }).collect();
+
+    Ok(ResourceStudyMap {
+        entries,
+        total_resources_with_links,
+        total_unlocked_nodes: total_unlocked,
     })
 }
