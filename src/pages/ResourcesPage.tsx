@@ -3,8 +3,8 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { Trash2, Link, FileText, Globe, BookOpen, X, RefreshCw, CheckCircle2, Minus, XCircle, Filter, Search, ChevronDown, ChevronRight, Play, Tag, Wand2, Check } from 'lucide-react';
-import { MimirResource } from '../types';
+import { Trash2, Link, FileText, Globe, BookOpen, X, RefreshCw, CheckCircle2, Minus, XCircle, Filter, Search, ChevronDown, ChevronRight, ChevronUp, Play, Tag, Wand2, Check, Map as MapIcon, BookMarked, Loader2 } from 'lucide-react';
+import { MimirResource, TranscriptJobStats, ResourceStudyMap, StudyMapEntry } from '../types';
 import { validateOrLog, MimirResourceSchema } from '../lib/validators';
 import { log } from '../lib/logger';
 import { z } from 'zod';
@@ -96,6 +96,203 @@ function getYouTubeBadgeProps(n: number): { label: string; className: string } {
   return { label: `${n} chunks`, className: 'bg-emerald-950/40 text-emerald-500 border border-emerald-800/40' };
 }
 
+function RelevanceDot({ tier }: { tier: 'green' | 'amber' | 'grey' }) {
+  const colors = { green: 'bg-emerald-400', amber: 'bg-amber-400', grey: 'bg-slate-500' };
+  return <span className={`inline-block w-2 h-2 rounded-full flex-shrink-0 ${colors[tier]}`} />;
+}
+
+function StudyMapPanel({
+  studyMap,
+  loading,
+  frontier,
+  onFrontierChange,
+  treeFilter,
+  onTreeFilterChange,
+  expandedNodes,
+  onToggleNodes,
+}: {
+  studyMap: ResourceStudyMap | null;
+  loading: boolean;
+  frontier: boolean;
+  onFrontierChange: (v: boolean) => void;
+  treeFilter: string[];
+  onTreeFilterChange: (ids: string[]) => void;
+  expandedNodes: Set<string>;
+  onToggleNodes: (id: string) => void;
+}) {
+  const allTrees = useMemo(() => {
+    if (!studyMap) return [];
+    const seen = new Map<string, string>();
+    for (const entry of studyMap.entries) {
+      for (const tb of entry.treeBreakdown) {
+        if (!seen.has(tb.treeId)) seen.set(tb.treeId, tb.projectName);
+      }
+    }
+    return [...seen.entries()].map(([treeId, projectName]) => ({ treeId, projectName }));
+  }, [studyMap]);
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-16 text-slate-500">
+        <Loader2 className="w-5 h-5 animate-spin mr-2" />
+        Building study map…
+      </div>
+    );
+  }
+
+  if (!studyMap) return null;
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex items-center gap-3 flex-wrap">
+        {allTrees.length > 1 && (
+          <div className="flex items-center gap-1.5 flex-wrap">
+            {allTrees.map(({ treeId, projectName }) => {
+              const active = treeFilter.includes(treeId);
+              return (
+                <button
+                  key={treeId}
+                  onClick={() => onTreeFilterChange(
+                    active
+                      ? treeFilter.filter(id => id !== treeId)
+                      : [...treeFilter, treeId]
+                  )}
+                  className={`px-2 py-0.5 rounded-full text-xs font-medium transition-colors ${
+                    active
+                      ? 'bg-blue-900/60 text-blue-300 border border-blue-700/60'
+                      : 'bg-slate-800 text-slate-400 border border-slate-700 hover:text-slate-200'
+                  }`}
+                >
+                  {projectName}
+                </button>
+              );
+            })}
+          </div>
+        )}
+        <label className="flex items-center gap-1.5 cursor-pointer ml-auto">
+          <input
+            type="checkbox"
+            checked={frontier}
+            onChange={e => onFrontierChange(e.target.checked)}
+            className="w-3.5 h-3.5 rounded accent-blue-500"
+          />
+          <span className="text-xs text-slate-400">Include frontier</span>
+        </label>
+      </div>
+
+      <p className="text-xs text-slate-500">
+        Top {studyMap.entries.length} resources covering {studyMap.totalUnlockedNodes} unlocked nodes
+        {studyMap.totalResourcesWithLinks > 0 && ` · ${studyMap.totalResourcesWithLinks} total linked`}
+      </p>
+
+      <div className="flex items-center gap-1.5 flex-wrap">
+        {(['webpage', 'pdf', 'text'] as const).map(type => {
+          const count = studyMap.entries.filter((e: StudyMapEntry) => e.resourceType === type).length;
+          if (count === 0) return null;
+          const labels: Record<string, string> = { webpage: 'URL', pdf: 'PDF', text: 'Text' };
+          return (
+            <span key={type} className="px-2 py-0.5 rounded-full text-xs bg-slate-800 text-slate-400 border border-slate-700">
+              {labels[type]} · {count}
+            </span>
+          );
+        })}
+      </div>
+
+      {studyMap.entries.length === 0 ? (
+        <div className="flex flex-col items-center justify-center py-12 gap-3 text-slate-500">
+          <BookMarked className="w-8 h-8 opacity-30" />
+          <p className="text-sm">No matched resources yet.</p>
+          <p className="text-xs text-slate-600">Ingest resources and run Re-match to populate the Study Map.</p>
+        </div>
+      ) : (
+        <div className="flex flex-col gap-3">
+          {studyMap.entries.map((entry: StudyMapEntry, idx: number) => {
+            const nodesExpanded = expandedNodes.has(entry.resourceId);
+            return (
+              <div
+                key={entry.resourceId}
+                className="bg-slate-900 border border-slate-800 rounded-lg p-4 flex flex-col gap-2"
+              >
+                <div className="flex items-start gap-2">
+                  <span className="text-xs text-slate-600 font-mono w-5 flex-shrink-0 mt-0.5">{idx + 1}</span>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <RelevanceDot tier={entry.relevanceTier} />
+                      {entry.url ? (
+                        <a
+                          href={entry.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-sm font-medium text-slate-100 hover:text-blue-300 truncate"
+                        >
+                          {entry.title}
+                        </a>
+                      ) : (
+                        <span className="text-sm font-medium text-slate-100 truncate">{entry.title}</span>
+                      )}
+                      <span className="text-xs text-slate-500 bg-slate-800 px-1.5 py-0.5 rounded capitalize flex-shrink-0">
+                        {entry.resourceType === 'webpage' ? 'URL' : entry.resourceType.toUpperCase()}
+                      </span>
+                    </div>
+                  </div>
+                  <span className="flex-shrink-0 text-xs font-semibold text-emerald-400 bg-emerald-950/50 border border-emerald-800/50 rounded px-2 py-0.5">
+                    {entry.coverageCount} node{entry.coverageCount !== 1 ? 's' : ''}
+                  </span>
+                </div>
+
+                {entry.treeBreakdown.length > 0 && (
+                  <div className="flex items-center gap-1.5 flex-wrap pl-7">
+                    {entry.treeBreakdown.map(tb => (
+                      <span
+                        key={tb.treeId}
+                        className="text-xs text-blue-300 bg-blue-950/40 border border-blue-800/40 rounded-full px-2 py-0.5"
+                      >
+                        {tb.projectName} · {tb.nodeCount}
+                      </span>
+                    ))}
+                  </div>
+                )}
+
+                {entry.supportedNodes.length > 0 && (
+                  <div className="pl-7">
+                    <button
+                      onClick={() => onToggleNodes(entry.resourceId)}
+                      className="flex items-center gap-1 text-xs text-slate-500 hover:text-slate-300 transition-colors mb-1"
+                    >
+                      {nodesExpanded
+                        ? <ChevronUp className="w-3 h-3" />
+                        : <ChevronDown className="w-3 h-3" />}
+                      {nodesExpanded ? 'Hide' : 'Show'} {entry.supportedNodes.length} quest{entry.supportedNodes.length !== 1 ? 's' : ''}
+                    </button>
+                    {nodesExpanded && (
+                      <div className="flex flex-col gap-1">
+                        {entry.supportedNodes.map(node => (
+                          <div key={node.nodeId} className="flex items-center gap-2 text-xs text-slate-400">
+                            <span className="w-1 h-1 rounded-full bg-slate-600 flex-shrink-0" />
+                            <span className="truncate">{node.title}</span>
+                            {node.matchedSectionTitle && (
+                              <span className="text-slate-600 truncate">— {node.matchedSectionTitle}</span>
+                            )}
+                            {node.matchedPageStart != null && (
+                              <span className="text-slate-600 flex-shrink-0">
+                                p.{node.matchedPageStart}{node.matchedPageEnd != null && node.matchedPageEnd !== node.matchedPageStart ? `–${node.matchedPageEnd}` : ''}
+                              </span>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function ResourcesPage() {
   const [resources, setResources] = useState<MimirResource[]>([]);
   const [loading, setLoading] = useState(true);
@@ -166,6 +363,16 @@ export default function ResourcesPage() {
   const [discoverProgress, setDiscoverProgress] = useState<{ current: number; total: number } | null>(null);
   const [discoverDone, setDiscoverDone] = useState(false);
   const [scraperDown, setScraperDown] = useState(false);
+  const [transcriptStats, setTranscriptStats] = useState<TranscriptJobStats | null>(null);
+  const [showTranscriptPopover, setShowTranscriptPopover] = useState(false);
+
+  // Study Map state
+  const [showStudyMap, setShowStudyMap] = useState(false);
+  const [studyMap, setStudyMap] = useState<ResourceStudyMap | null>(null);
+  const [studyMapLoading, setStudyMapLoading] = useState(false);
+  const [studyMapFrontier, setStudyMapFrontier] = useState(false);
+  const [studyMapTreeFilter, setStudyMapTreeFilter] = useState<string[]>([]);
+  const [studyMapExpandedNodes, setStudyMapExpandedNodes] = useState<Set<string>>(new Set());
 
   // External links modal state (after URL ingest of resource_list pages)
   const [extLinksData, setExtLinksData] = useState<{ parentId: string; parentTitle: string; links: ExternalLinkItem[] } | null>(null);
@@ -185,6 +392,21 @@ export default function ResourcesPage() {
       console.error('Failed to load resources:', err);
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function loadStudyMap() {
+    setStudyMapLoading(true);
+    try {
+      const result = await invoke<ResourceStudyMap>('get_resource_study_map', {
+        treeIds: studyMapTreeFilter.length > 0 ? studyMapTreeFilter : null,
+        includeFrontier: studyMapFrontier,
+      });
+      setStudyMap(result);
+    } catch (err) {
+      console.error('Study Map load failed:', err);
+    } finally {
+      setStudyMapLoading(false);
     }
   }
 
@@ -332,17 +554,35 @@ export default function ResourcesPage() {
     loadResources();
     loadChunkCounts();
     loadTags();
+
+    // Load transcript job stats on mount, then poll every 30s when jobs are pending
+    async function fetchTranscriptStats() {
+      try {
+        const stats = await invoke<TranscriptJobStats>('get_transcript_job_status');
+        setTranscriptStats(stats);
+      } catch {
+        // ignore — command may not be available in older builds
+      }
+    }
+    fetchTranscriptStats();
+    const intervalId = setInterval(async () => {
+      const stats = await invoke<TranscriptJobStats>('get_transcript_job_status').catch(() => null);
+      if (stats) setTranscriptStats(stats);
+    }, 30_000);
+    return () => clearInterval(intervalId);
   }, []);
 
   // Reload list when orchestrator finishes ingesting or completing a resource
   useEffect(() => {
     const unlistenIngested = listen('ygg-resource-ingested', () => { loadResources(); loadTags(); });
     const unlistenCompleted = listen('ygg-resource-completed', () => { loadResources(); });
+    const unlistenRematch = listen('ygg-rematch-complete', () => { if (showStudyMap) { void loadStudyMap(); } });
     return () => {
       unlistenIngested.then(fn => fn());
       unlistenCompleted.then(fn => fn());
+      unlistenRematch.then(fn => fn());
     };
-  }, []);
+  }, [showStudyMap]);
 
   useEffect(() => {
     const t = setTimeout(() => {
@@ -360,6 +600,10 @@ export default function ResourcesPage() {
       if (playlistIds.length > 0) setExpandedParents(new Set(playlistIds));
     }
   }, [resources]);
+
+  useEffect(() => {
+    if (showStudyMap) loadStudyMap();
+  }, [showStudyMap, studyMapFrontier, studyMapTreeFilter]);
 
   async function handleAdd() {
     if (adding) return;
@@ -802,7 +1046,42 @@ export default function ResourcesPage() {
     <div className="p-6 max-w-3xl mx-auto flex flex-col gap-6">
       {/* Header */}
       <div>
-        <h1 className="text-xl font-semibold text-slate-100">Mimir Library</h1>
+        <div className="flex items-center gap-3">
+          <h1 className="text-xl font-semibold text-slate-100">Mimir Library</h1>
+          {transcriptStats && (transcriptStats.pending + transcriptStats.processing) > 0 && (
+            <div className="relative">
+              <button
+                onClick={() => setShowTranscriptPopover(v => !v)}
+                className="flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium bg-amber-900/50 text-amber-300 border border-amber-700/60 hover:bg-amber-900/70 transition-colors"
+              >
+                <span className="animate-pulse w-1.5 h-1.5 rounded-full bg-amber-400 inline-block" />
+                {transcriptStats.pending + transcriptStats.processing} transcript{transcriptStats.pending + transcriptStats.processing !== 1 ? 's' : ''} pending
+              </button>
+              {showTranscriptPopover && (
+                <div className="absolute left-0 top-full mt-1 z-20 bg-slate-900 border border-slate-700 rounded-lg p-3 shadow-xl min-w-[180px]">
+                  <p className="text-xs font-semibold text-slate-300 mb-2">Transcript Jobs</p>
+                  {([['pending', transcriptStats.pending], ['processing', transcriptStats.processing], ['done', transcriptStats.done], ['failed', transcriptStats.failed], ['skipped', transcriptStats.skipped]] as [string, number][]).map(([label, count]) => count > 0 && (
+                    <div key={label} className="flex items-center justify-between text-xs text-slate-400 py-0.5">
+                      <span className="capitalize">{label}</span>
+                      <span className="text-slate-200 font-medium">{count}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+          <button
+            onClick={() => setShowStudyMap(v => !v)}
+            className={`flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-medium transition-colors ${
+              showStudyMap
+                ? 'bg-blue-900/60 text-blue-300 border border-blue-700/60'
+                : 'bg-slate-800 text-slate-400 border border-slate-700 hover:text-slate-200'
+            }`}
+          >
+            <MapIcon className="w-3.5 h-3.5" />
+            Study Map
+          </button>
+        </div>
         <p className="text-sm text-slate-400 mt-1">
           Ingest URLs, text, or PDFs — Mimir embeds them and auto-links them to matching quest nodes.
         </p>
@@ -928,8 +1207,26 @@ export default function ResourcesPage() {
           )}
         </div>
 
+      {/* Study Map panel */}
+      {showStudyMap && (
+        <StudyMapPanel
+          studyMap={studyMap}
+          loading={studyMapLoading}
+          frontier={studyMapFrontier}
+          onFrontierChange={v => setStudyMapFrontier(v)}
+          treeFilter={studyMapTreeFilter}
+          onTreeFilterChange={ids => setStudyMapTreeFilter(ids)}
+          expandedNodes={studyMapExpandedNodes}
+          onToggleNodes={id => setStudyMapExpandedNodes(prev => {
+            const next = new Set(prev);
+            next.has(id) ? next.delete(id) : next.add(id);
+            return next;
+          })}
+        />
+      )}
+
       {/* Resource list */}
-      {loading ? (
+      {!showStudyMap && (loading ? (
         <p className="text-sm text-slate-500">Loading…</p>
       ) : resources.length === 0 ? (
         <p className="text-sm text-slate-500">
@@ -1399,7 +1696,7 @@ export default function ResourcesPage() {
             )}
           </div>
         </>
-      )}
+      ))}
 
       {/* Playlist modal */}
       {playlistData && (
