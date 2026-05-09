@@ -1,5 +1,5 @@
 // src/pages/SkillsPage.tsx
-// Universal Skill Tree — cosmic organic tree, branches spread like a real tree spanning the universe.
+// Universal Skill Graph — depth-stratified grid: foundations at bottom, advanced skills at top.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
@@ -7,11 +7,11 @@ import { listen } from '@tauri-apps/api/event';
 import {
   RefreshCw, Loader2, AlertTriangle, Sparkles, FileText, TreePine,
   Briefcase, X, Wand2, GitMerge, Check, Search, Eye, Download, ChevronDown, ChevronRight,
-  PanelLeftClose, PanelLeftOpen, RotateCcw, TrendingUp, Zap,
+  PanelLeftClose, PanelLeftOpen, RotateCcw, TrendingUp, Zap, Route, BookOpen, ExternalLink,
+  Maximize2,
 } from 'lucide-react';
-import type { UniversalSkill, SkillGap, SkillDependency, SkillAlias, SkillGraphSnapshot, GrowthTarget, PathNode, PrereqPath } from '../types';
+import type { UniversalSkill, SkillGap, SkillDependency, SkillAlias, SkillGraphSnapshot, GrowthTarget, PathNode, PrereqPath, LearningStep, LearningPath } from '../types';
 import { validateOrLog, SkillSchema } from '../lib/validators';
-import { log } from '../lib/logger';
 import { z } from 'zod';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -36,15 +36,17 @@ const LEVEL_LABELS = ['', 'Aware', 'Familiar', 'Proficient', 'Advanced', 'Expert
 const NODE_R = [0, 6, 8, 10, 12, 14];
 const GAP_COLOR = '#f59e0b';
 const GAP_NODE_R = 4;
-
-// Radii for skill placement tiers along each bough
-const SKILL_RADII = [160, 240, 320];
-// Branch widths
-const W_TRUNK = 8;
-const W_BOUGH = 4;
-const W_TWIG  = 1.5;
+const MAX_DEPTH = 6;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
+
+interface SuggestedMerge {
+  canonicalId: string;
+  canonicalName: string;
+  aliasIds: string[];
+  aliasNames: string[];
+  reason: string;
+}
 
 interface SkillPlacement {
   skill: UniversalSkill | null;
@@ -53,20 +55,8 @@ interface SkillPlacement {
   y: number;
   color: string;
   domainIndex: number;
-  /** outward angle from center — used for hit-test and label positioning */
+  /** prerequisite depth (0 = foundation) */
   outAngle: number;
-}
-
-interface Branch {
-  x1: number; y1: number;
-  x2: number; y2: number;
-  cpx: number; cpy: number;
-  w1: number; w2: number;
-  color: string;
-  /** 0=trunk/root, 1=bough, 2=twig, 3=decorative */
-  depth: number;
-  /** which domain this branch belongs to (-1 = trunk/root) */
-  domainIndex: number;
 }
 
 interface DomainLabel {
@@ -76,10 +66,21 @@ interface DomainLabel {
   y: number;
 }
 
+interface Lane {
+  domainName: string;
+  domainIndex: number;
+  color: string;
+  left: number;
+  right: number;
+  headerY: number;
+}
+
 interface LayoutResult {
   placements: SkillPlacement[];
-  branches: Branch[];
   domainLabels: DomainLabel[];
+  lanes: Lane[];
+  bandHeight: number;
+  maxDepth: number;
 }
 
 // ─── Seeded pseudo-random ─────────────────────────────────────────────────────
@@ -94,186 +95,191 @@ function seededRand(seed: number): () => number {
 
 // ─── Layout ───────────────────────────────────────────────────────────────────
 
-function layoutSkillTree(
+function layoutSkillGraph(
   skills: UniversalSkill[],
   gaps: SkillGap[],
   showGaps: boolean,
+  deps: SkillDependency[],
   w: number,
   h: number,
 ): LayoutResult {
-  const branches: Branch[] = [];
   const placements: SkillPlacement[] = [];
-  const domainLabels: DomainLabel[] = [];
+  const domainLabels: DomainLabel[] = []; // always empty — lane headers replace these
+  const lanes: Lane[] = [];
 
-  const sc = Math.min(w, h) / 900;
-  const cx = w * 0.50;
-  const cy = h * 0.55;
+  if (skills.length === 0) return { placements, domainLabels, lanes, bandHeight: 80, maxDepth: 0 };
 
-  // ── Group skills by domain ───────────────────────────────────────────────
-  const domainMap = new Map<string, UniversalSkill[]>();
-  for (const s of skills) {
-    const d = s.domain || 'General';
-    if (!domainMap.has(d)) domainMap.set(d, []);
-    domainMap.get(d)!.push(s);
-  }
-  const domainNames = [...domainMap.keys()];
-  const domainCount = domainNames.length || 1;
-
-  log('[SkillsPage] domain groups:', domainNames.map(d => `${d}(${domainMap.get(d)!.length})`).join(', '));
-
-  // ── Trunk ────────────────────────────────────────────────────────────────
-  const trunkLen = 80 * sc;
-  const trunkOrigin = { x: cx, y: cy };         // where boughs split from
-  const trunkTip    = { x: cx, y: cy - trunkLen };
-
-  branches.push({
-    x1: cx, y1: cy,
-    x2: trunkTip.x, y2: trunkTip.y,
-    cpx: cx, cpy: cy - trunkLen * 0.5,
-    w1: W_TRUNK * sc, w2: (W_TRUNK * 0.6) * sc,
-    color: '#4a2e14', depth: 0, domainIndex: -1,
-  });
-
-  // ── Atmospheric roots ────────────────────────────────────────────────────
   const rand = seededRand(42);
-  for (let r = 0; r < 5; r++) {
-    const rootAng = (Math.PI / 6) + (r / 4) * (Math.PI * 2 / 3) - Math.PI / 3 + Math.PI / 2;
-    const rootLen = (35 + r * 10) * sc;
-    branches.push({
-      x1: cx, y1: cy,
-      x2: cx + rootLen * Math.cos(rootAng),
-      y2: cy + rootLen * Math.sin(rootAng),
-      cpx: cx + rootLen * 0.5 * Math.cos(rootAng + 0.3),
-      cpy: cy + rootLen * 0.5 * Math.sin(rootAng + 0.3),
-      w1: 6 * sc, w2: 0.8 * sc,
-      color: '#2e1c0c', depth: 0, domainIndex: -1,
-    });
+
+  // ── Step 1: BFS depth per skill ───────────────────────────────────────────
+  const prereqEdges = deps.filter(d => d.relationship === 'prerequisite' || d.relationship === 'part_of');
+  const prereqCount = new Map<string, number>();
+  const successors  = new Map<string, string[]>();
+  for (const s of skills) { prereqCount.set(s.id, 0); successors.set(s.id, []); }
+  for (const e of prereqEdges) {
+    if (!prereqCount.has(e.sourceSkillId) || !prereqCount.has(e.targetSkillId)) continue;
+    prereqCount.set(e.targetSkillId, (prereqCount.get(e.targetSkillId) ?? 0) + 1);
+    successors.get(e.sourceSkillId)!.push(e.targetSkillId);
   }
 
-  // ── Compute proportional angle allocation ────────────────────────────────
-  // Domains with more skills get a larger slice of the arc.
-  const totalSkills = Math.max(1, skills.length);
-  const arcSpanDeg  = Math.min(300, 50 + domainCount * 35); // total spread
-  const arcStartDeg = -90 - arcSpanDeg / 2;                 // top-centred
-  const minGapDeg   = 20;                                    // minimum between boughs
+  const depth = new Map<string, number>();
+  const queue: string[] = [];
+  for (const s of skills) {
+    if ((prereqCount.get(s.id) ?? 0) === 0) {
+      depth.set(s.id, 0);
+      queue.push(s.id);
+    }
+  }
+  let qi = 0;
+  while (qi < queue.length) {
+    const id = queue[qi++];
+    const d = depth.get(id) ?? 0;
+    for (const nextId of (successors.get(id) ?? [])) {
+      const existing = depth.get(nextId) ?? -1;
+      if (d + 1 > existing) {
+        depth.set(nextId, d + 1);
+        queue.push(nextId);
+      }
+    }
+  }
+  for (const s of skills) { if (!depth.has(s.id)) depth.set(s.id, 0); }
 
-  // Raw weight per domain
-  const rawWeights = domainNames.map(d => Math.max(1, domainMap.get(d)!.length / totalSkills));
-  const weightSum  = rawWeights.reduce((a, b) => a + b, 0);
-  // Normalised fractions → convert to degrees, respecting minGap
-  const allocDeg = rawWeights.map(w => (w / weightSum) * arcSpanDeg);
-  // Running cumulative mid-angle for each domain
-  const midAngles: number[] = [];
-  let cursor = arcStartDeg;
-  for (let i = 0; i < domainCount; i++) {
-    midAngles.push(cursor + allocDeg[i] / 2);
-    cursor += Math.max(allocDeg[i], minGapDeg);
+  const maxDepth = Math.min(MAX_DEPTH, Math.max(...[...depth.values()]));
+
+  // ── Step 2: Group by domain ───────────────────────────────────────────────
+  const domainNames = [...new Set(skills.map(s => s.domain || 'General'))];
+  const domainIndexMap = new Map(domainNames.map((d, i) => [d, i]));
+  const totalSkills = skills.length;
+
+  // ── Step 3: Lane allocation (proportional width) ──────────────────────────
+  const padLR = 40;
+  const usableW = w - 2 * padLR;
+  const padTop = 60, padBottom = 60;
+  const usableH = h - padTop - padBottom;
+  const bandHeight = Math.max(80, usableH / (maxDepth + 1));
+
+  function depthToY(d: number): number {
+    return h - padBottom - d * bandHeight;
   }
 
-  // ── Per-domain boughs + skill placement ─────────────────────────────────
-  domainNames.forEach((domainName, dIdx) => {
-    const domainSkills = domainMap.get(domainName)!;
-    const color = DOMAIN_COLORS[dIdx % DOMAIN_COLORS.length];
-    const spineAngle = (midAngles[dIdx] * Math.PI) / 180;
+  // Count skills per domain for proportional widths
+  const domainSkillCount = new Map<number, number>();
+  for (const s of skills) {
+    const di = domainIndexMap.get(s.domain || 'General') ?? 0;
+    domainSkillCount.set(di, (domainSkillCount.get(di) ?? 0) + 1);
+  }
 
-    // Bough: from trunk tip outward
-    // Length is generous — label goes at the tip, not midpoint
-    const boughLen = 130 * sc;
-    const boughTip = {
-      x: trunkTip.x + boughLen * Math.cos(spineAngle),
-      y: trunkTip.y + boughLen * Math.sin(spineAngle),
-    };
-    // S-curve control point: alternating bias gives organic spread
-    const cpBias   = (dIdx % 2 === 0 ? -1 : 1) * 0.20;
-    const perpAng  = spineAngle + Math.PI / 2;
-    const boughCpx = (trunkTip.x + boughTip.x) / 2 + cpBias * boughLen * Math.cos(perpAng);
-    const boughCpy = (trunkTip.y + boughTip.y) / 2 + cpBias * boughLen * Math.sin(perpAng);
-
-    branches.push({
-      x1: trunkTip.x, y1: trunkTip.y,
-      x2: boughTip.x, y2: boughTip.y,
-      cpx: boughCpx, cpy: boughCpy,
-      w1: W_BOUGH * sc, w2: (W_BOUGH * 0.4) * sc,
-      color, depth: 1, domainIndex: dIdx,
-    });
-
-    // Domain label at bough tip
-    domainLabels.push({ name: domainName, color, x: boughTip.x, y: boughTip.y });
-
-    // ── Skills — distribute across radii ──────────────────────────────────
-    const sorted = [...domainSkills].sort((a, b) => a.level - b.level);
-    const skillCount = sorted.length;
-    if (skillCount === 0) return;
-
-    // Fan half-angle: ±15° max (tight so neighbours don't collide)
-    const halfFanDeg = Math.min(15, 4 + skillCount * 1.5);
-
-    // Evenly distribute across three radii tiers
-    const tierSize = Math.ceil(skillCount / SKILL_RADII.length);
-
-    sorted.forEach((skill, sIdx) => {
-      const tier = Math.min(Math.floor(sIdx / tierSize), SKILL_RADII.length - 1);
-      const posInTier = sIdx - tier * tierSize;
-      const tierCount = Math.min(tierSize, skillCount - tier * tierSize);
-
-      const fanFrac = tierCount <= 1 ? 0.5 : posInTier / (tierCount - 1);
-      const fanOffDeg = (fanFrac - 0.5) * 2 * halfFanDeg + (rand() - 0.5) * 3;
-      const twigAngle = spineAngle + (fanOffDeg * Math.PI / 180);
-
-      const r = SKILL_RADII[tier] * sc;
-      const leafPos = {
-        x: trunkOrigin.x + r * Math.cos(twigAngle),
-        y: trunkOrigin.y + r * Math.sin(twigAngle),
-      };
-
-      // Twig anchor: interpolate along bough toward bough tip
-      const twigT = 0.3 + tier * 0.25;
-      const twigAnchorX = trunkTip.x + (boughTip.x - trunkTip.x) * twigT;
-      const twigAnchorY = trunkTip.y + (boughTip.y - trunkTip.y) * twigT;
-
-      // Twig control: slight outward curve
-      const twigCpx = (twigAnchorX + leafPos.x) / 2 + (rand() - 0.5) * 14 * sc * Math.cos(perpAng);
-      const twigCpy = (twigAnchorY + leafPos.y) / 2 + (rand() - 0.5) * 14 * sc * Math.sin(perpAng);
-
-      branches.push({
-        x1: twigAnchorX, y1: twigAnchorY,
-        x2: leafPos.x, y2: leafPos.y,
-        cpx: twigCpx, cpy: twigCpy,
-        w1: W_TWIG * sc, w2: 0.6 * sc,
-        color, depth: 2, domainIndex: dIdx,
-      });
-
-      placements.push({
-        skill,
-        gap: null,
-        x: leafPos.x,
-        y: leafPos.y,
-        color,
-        domainIndex: dIdx,
-        outAngle: Math.atan2(leafPos.y - cy, leafPos.x - cx),
-      });
-    });
+  // Compute raw widths and normalize if needed
+  const rawWidths = domainNames.map((_, di) => {
+    const count = domainSkillCount.get(di) ?? 0;
+    return Math.max(80, (count / Math.max(totalSkills, 1)) * usableW);
   });
+  const rawTotal = rawWidths.reduce((a, b) => a + b, 0);
+  const scale = rawTotal > usableW ? usableW / rawTotal : 1;
+  const laneWidths = rawWidths.map(rw => rw * scale);
 
-  // ── Gap ring (optional, no connector lines, static) ──────────────────────
+  // Build lane structs (headerY computed after placements)
+  let laneX = padLR;
+  for (let di = 0; di < domainNames.length; di++) {
+    const lw = laneWidths[di];
+    lanes.push({
+      domainName: domainNames[di],
+      domainIndex: di,
+      color: DOMAIN_COLORS[di % DOMAIN_COLORS.length],
+      left: laneX,
+      right: laneX + lw,
+      headerY: padTop - 10, // default; will be updated below
+    });
+    laneX += lw;
+  }
+
+  // ── Step 4: Group skills by (domainIdx, depth) cell ──────────────────────
+  type Cell = { skills: UniversalSkill[] };
+  const grid = new Map<string, Cell>();
+  const cellKey = (di: number, d: number) => `${di}:${d}`;
+
+  for (const s of skills) {
+    const di = domainIndexMap.get(s.domain || 'General') ?? 0;
+    const d  = Math.min(depth.get(s.id) ?? 0, MAX_DEPTH);
+    const key = cellKey(di, d);
+    if (!grid.has(key)) grid.set(key, { skills: [] });
+    grid.get(key)!.skills.push(s);
+  }
+
+  // ── Step 5: Place nodes in cells ─────────────────────────────────────────
+  for (const [key, cell] of grid.entries()) {
+    const [diStr, dStr] = key.split(':');
+    const di    = parseInt(diStr);
+    const d     = parseInt(dStr);
+    const lane  = lanes[di];
+    const count = cell.skills.length;
+    const color = DOMAIN_COLORS[di % DOMAIN_COLORS.length];
+    const laneW = lane.right - lane.left;
+
+    cell.skills.forEach((skill, i) => {
+      const frac = count <= 1 ? 0.5 : i / (count - 1);
+      const innerW = laneW * 0.80;
+      const innerLeft = lane.left + laneW * 0.10;
+      const baseX = innerLeft + frac * innerW;
+      const baseY = depthToY(d);
+      const x = baseX + (rand() - 0.5) * 24;
+      const y = baseY + (rand() - 0.5) * bandHeight * 0.35;
+      placements.push({
+        skill, gap: null, x, y,
+        color, domainIndex: di,
+        outAngle: d,
+      });
+    });
+  }
+
+  // ── Step 6: Repulsion within each cell (3 iterations) ────────────────────
+  for (const [key, cell] of grid.entries()) {
+    const cellPlacements = cell.skills.map(s => placements.find(p => p.skill?.id === s.id)!).filter(Boolean);
+    for (let iter = 0; iter < 3; iter++) {
+      for (let a = 0; a < cellPlacements.length; a++) {
+        for (let b = a + 1; b < cellPlacements.length; b++) {
+          const pa = cellPlacements[a], pb = cellPlacements[b];
+          const dx = pb.x - pa.x, dy = pb.y - pa.y;
+          const dist = Math.sqrt(dx * dx + dy * dy) || 0.001;
+          if (dist < 28) {
+            const push = (28 - dist) / 2;
+            const nx = dx / dist, ny = dy / dist;
+            pa.x -= nx * push; pa.y -= ny * push;
+            pb.x += nx * push; pb.y += ny * push;
+          }
+        }
+      }
+    }
+    void key; // suppress unused warning
+  }
+
+  // ── Step 7: Gap nodes ─────────────────────────────────────────────────────
   if (showGaps && gaps.length > 0) {
     const existingNames = new Set(skills.map(s => s.name.toLowerCase()));
-    const visibleGaps = gaps.filter(g => !(existingNames.has(g.skillName.toLowerCase()) && g.currentLevel > 0));
-    const gapR = 380 * sc;
-    visibleGaps.forEach((gap, i) => {
-      const angle = ((i / visibleGaps.length) * 360 - 90) * Math.PI / 180;
-      placements.push({
-        skill: null, gap,
-        x: cx + gapR * Math.cos(angle),
-        y: cy + gapR * Math.sin(angle),
-        color: GAP_COLOR,
-        domainIndex: -1,
-        outAngle: angle,
+    const visibleGaps = gaps.filter(g => !existingNames.has(g.skillName.toLowerCase()));
+    if (visibleGaps.length > 0) {
+      const gapY = depthToY(0);
+      const gapBandW = usableW / Math.max(1, visibleGaps.length);
+      visibleGaps.forEach((gap, i) => {
+        const x = padLR + (i + 0.5) * gapBandW + (rand() - 0.5) * 18;
+        placements.push({
+          skill: null, gap, x, y: gapY + (rand() - 0.5) * 20,
+          color: GAP_COLOR, domainIndex: -1, outAngle: 0,
+        });
       });
-    });
+    }
   }
 
-  return { placements, branches, domainLabels };
+  // ── Step 8: Compute lane headerY from topmost node in each lane ───────────
+  for (let di = 0; di < lanes.length; di++) {
+    const laneNodes = placements.filter(p => p.domainIndex === di);
+    if (laneNodes.length > 0) {
+      const minY = Math.min(...laneNodes.map(p => p.y));
+      lanes[di].headerY = Math.max(padTop - 10, minY - 24);
+    }
+  }
+
+  return { placements, domainLabels, lanes, bandHeight, maxDepth };
 }
 
 // ─── Canvas helpers ───────────────────────────────────────────────────────────
@@ -285,81 +291,6 @@ function hexToRgb(hex: string) {
     g: parseInt(hex.slice(3, 5), 16),
     b: parseInt(hex.slice(5, 7), 16),
   };
-}
-
-// Quadratic-bezier tapered branch
-function taperedBezierBranch(
-  ctx: CanvasRenderingContext2D,
-  x1: number, y1: number,
-  cpx: number, cpy: number,
-  x2: number, y2: number,
-  w1: number, w2: number,
-) {
-  if (w1 < 0.15 && w2 < 0.15) return;
-  const dxS = cpx - x1, dyS = cpy - y1;
-  const lenS = Math.hypot(dxS, dyS) || 1;
-  const nxS = -dyS / lenS, nyS = dxS / lenS;
-  const dxE = x2 - cpx, dyE = y2 - cpy;
-  const lenE = Math.hypot(dxE, dyE) || 1;
-  const nxE = -dyE / lenE, nyE = dxE / lenE;
-  const hw1 = w1 / 2, hw2 = w2 / 2, hwM = (hw1 + hw2) / 2;
-
-  ctx.beginPath();
-  ctx.moveTo(x1 + hw1 * nxS, y1 + hw1 * nyS);
-  ctx.quadraticCurveTo(cpx + hwM * nxS, cpy + hwM * nyS, x2 + hw2 * nxE, y2 + hw2 * nyE);
-  ctx.lineTo(x2 - hw2 * nxE, y2 - hw2 * nyE);
-  ctx.quadraticCurveTo(cpx - hwM * nxS, cpy - hwM * nyS, x1 - hw1 * nxS, y1 - hw1 * nyS);
-  ctx.closePath();
-}
-
-function drawBranches(
-  ctx: CanvasRenderingContext2D,
-  branches: Branch[],
-  selectedDomainIndex: number | null,
-  growFrac: number,          // 0→1 animation progress
-) {
-  const sorted = [...branches].sort((a, b) => a.depth - b.depth);
-  sorted.forEach(b => {
-    // Selection dimming: dim branches not on selected domain
-    let domainAlpha = 1;
-    if (selectedDomainIndex !== null && b.domainIndex !== -1 && b.domainIndex !== selectedDomainIndex) {
-      domainAlpha = 0.10;
-    }
-
-    // Branch-growth animation: interpolate endpoint toward x1/y1
-    let x2 = b.x2, y2 = b.y2, cpx = b.cpx, cpy = b.cpy;
-    if (growFrac < 1) {
-      const t = growFrac;
-      x2   = b.x1 + (b.x2  - b.x1)  * t;
-      y2   = b.y1 + (b.y2  - b.y1)  * t;
-      cpx  = b.x1 + (b.cpx - b.x1)  * t;
-      cpy  = b.y1 + (b.cpy - b.y1)  * t;
-    }
-
-    taperedBezierBranch(ctx, b.x1, b.y1, cpx, cpy, x2, y2, b.w1, b.w2);
-
-    const c = hexToRgb(b.color);
-    const grad = ctx.createLinearGradient(b.x1, b.y1, x2, y2);
-    ctx.globalAlpha = domainAlpha;
-    if (b.depth === 0) {
-      grad.addColorStop(0, '#5a3620');
-      grad.addColorStop(0.5, '#3d2410');
-      grad.addColorStop(1, '#1e0f05');
-    } else if (b.depth === 1) {
-      grad.addColorStop(0, `rgba(${c.r},${c.g},${c.b},0.70)`);
-      grad.addColorStop(0.6, `rgba(${c.r},${c.g},${c.b},0.38)`);
-      grad.addColorStop(1, `rgba(${c.r},${c.g},${c.b},0.18)`);
-    } else if (b.depth === 2) {
-      grad.addColorStop(0, `rgba(${c.r},${c.g},${c.b},0.45)`);
-      grad.addColorStop(1, `rgba(${c.r},${c.g},${c.b},0.10)`);
-    } else {
-      grad.addColorStop(0, `rgba(${c.r},${c.g},${c.b},0.18)`);
-      grad.addColorStop(1, `rgba(${c.r},${c.g},${c.b},0.03)`);
-    }
-    ctx.fillStyle = grad;
-    ctx.fill();
-    ctx.globalAlpha = 1;
-  });
 }
 
 // Seeded starfield (stable, only rebuilt when dimensions change)
@@ -422,43 +353,162 @@ function drawBackground(ctx: CanvasRenderingContext2D, w: number, h: number, ani
   });
 }
 
-function drawCenterNode(ctx: CanvasRenderingContext2D, cx: number, cy: number, animTime: number, sc: number) {
-  const pulse = 0.5 + 0.5 * Math.sin(animTime * 1.1);
-  const outerR = (22 + pulse * 4) * sc;
 
-  const halo = ctx.createRadialGradient(cx, cy, 0, cx, cy, outerR * 2.4);
-  halo.addColorStop(0, `rgba(16,185,129,${(0.12 + pulse * 0.06).toFixed(3)})`);
-  halo.addColorStop(0.5, 'rgba(16,185,129,0.025)');
-  halo.addColorStop(1, 'rgba(0,0,0,0)');
+// ─── Lane / depth draw helpers ────────────────────────────────────────────────
+
+function drawLaneSeparators(ctx: CanvasRenderingContext2D, lanes: Lane[], canvasH: number) {
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+  ctx.lineWidth = 1;
+  // Draw vertical lines at each lane boundary (between lanes)
+  for (let i = 1; i < lanes.length; i++) {
+    const x = lanes[i].left;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, canvasH);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawDepthGuides(
+  ctx: CanvasRenderingContext2D,
+  maxDepth: number,
+  bandHeight: number,
+  padBottom: number,
+  _w: number,
+  h: number,
+) {
+  if (maxDepth < 2) return;
+  const depthToY = (d: number) => h - padBottom - d * bandHeight;
+
+  ctx.save();
+  ctx.font = '400 9px DM Sans, system-ui';
+  ctx.fillStyle = 'rgba(255,255,255,0.18)';
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'left';
+
+  const labels: { d: number; label: string }[] = [
+    { d: 0,                         label: 'Foundations' },
+    { d: Math.ceil(maxDepth / 2),   label: 'Intermediate' },
+    { d: maxDepth,                  label: 'Advanced' },
+  ];
+
+  for (const { d, label } of labels) {
+    ctx.fillText(label, 8, depthToY(d));
+  }
+  ctx.restore();
+}
+
+function drawLaneHeaders(ctx: CanvasRenderingContext2D, lanes: Lane[], growFrac: number) {
+  if (growFrac <= 0.5) return;
+  const alpha = Math.min(1, (growFrac - 0.5) / 0.4);
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = '600 11px DM Sans, system-ui';
+
+  for (const lane of lanes) {
+    const laneW = lane.right - lane.left;
+    const cx = lane.left + laneW / 2;
+    const c = hexToRgb(lane.color);
+    ctx.fillStyle = `rgba(${c.r},${c.g},${c.b},${(0.65 * alpha).toFixed(3)})`;
+    ctx.fillText(lane.domainName, cx, lane.headerY);
+  }
+  ctx.restore();
+}
+
+function drawLegend(ctx: CanvasRenderingContext2D, _w: number, h: number) {
+  const legendW = 190, legendH = 90;
+  const lx = 16, ly = h - 16 - legendH;
+
+  // Background
+  ctx.save();
+  ctx.fillStyle = 'rgba(4,8,20,0.72)';
+  ctx.strokeStyle = 'rgba(255,255,255,0.07)';
+  ctx.lineWidth = 1;
   ctx.beginPath();
-  ctx.arc(cx, cy, outerR * 2.4, 0, Math.PI * 2);
-  ctx.fillStyle = halo;
+  ctx.roundRect(lx, ly, legendW, legendH, 8);
   ctx.fill();
-
-  ctx.beginPath();
-  ctx.arc(cx, cy, outerR, 0, Math.PI * 2);
-  ctx.strokeStyle = `rgba(16,185,129,${(0.25 + pulse * 0.18).toFixed(3)})`;
-  ctx.lineWidth = 1.4 * sc;
   ctx.stroke();
 
-  const rootGlow = ctx.createRadialGradient(cx, cy, 0, cx, cy, 32 * sc);
-  rootGlow.addColorStop(0, 'rgba(90,54,32,0.50)');
-  rootGlow.addColorStop(0.5, 'rgba(60,36,20,0.20)');
-  rootGlow.addColorStop(1, 'rgba(0,0,0,0)');
-  ctx.beginPath();
-  ctx.arc(cx, cy, 32 * sc, 0, Math.PI * 2);
-  ctx.fillStyle = rootGlow;
-  ctx.fill();
+  ctx.font = '400 9px DM Sans, system-ui';
+  ctx.textBaseline = 'middle';
 
-  const core = ctx.createRadialGradient(cx, cy - sc, 0, cx, cy, 6.5 * sc);
-  core.addColorStop(0, '#e0fff6');
-  core.addColorStop(0.35, '#10b981');
-  core.addColorStop(0.75, '#064e3b');
-  core.addColorStop(1, '#021a12');
+  // Row 1: Level label + circles
+  ctx.fillStyle = '#64748b';
+  ctx.textAlign = 'left';
+  ctx.fillText('Level', lx + 8, ly + 14);
+
+  for (let i = 0; i < 5; i++) {
+    const cx = lx + 38 + i * 20;
+    const cy = ly + 14;
+    const r = NODE_R[i + 1];
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fillStyle = '#94a3b8';
+    ctx.fill();
+    ctx.font = '400 8px DM Sans, system-ui';
+    ctx.fillStyle = '#64748b';
+    ctx.textAlign = 'center';
+    ctx.fillText(`L${i + 1}`, cx, cy + r + 6);
+    ctx.font = '400 9px DM Sans, system-ui';
+  }
+
+  // Row 2: seed / target
+  ctx.textAlign = 'left';
+  let rx = lx + 8;
+  const row2y = ly + 44;
+
+  // seed circle
   ctx.beginPath();
-  ctx.arc(cx, cy, 6.5 * sc, 0, Math.PI * 2);
-  ctx.fillStyle = core;
+  ctx.arc(rx + 5, row2y, 5, 0, Math.PI * 2);
+  ctx.fillStyle = '#f59e0b';
   ctx.fill();
+  ctx.fillStyle = '#64748b';
+  ctx.fillText(' seed', rx + 5 + 5, row2y);
+
+  rx += 5 + 5 + ctx.measureText(' seed').width + 12;
+
+  // target circle
+  ctx.beginPath();
+  ctx.arc(rx + 5, row2y, 5, 0, Math.PI * 2);
+  ctx.fillStyle = '#34d399';
+  ctx.fill();
+  ctx.fillStyle = '#64748b';
+  ctx.fillText(' target', rx + 5 + 5, row2y);
+
+  // Row 3: prereq line / related line
+  const row3y = ly + 68;
+  rx = lx + 8;
+
+  // prereq — solid indigo line
+  ctx.beginPath();
+  ctx.moveTo(rx, row3y);
+  ctx.lineTo(rx + 24, row3y);
+  ctx.strokeStyle = '#818cf8';
+  ctx.lineWidth = 1.2;
+  ctx.setLineDash([]);
+  ctx.stroke();
+  ctx.fillStyle = '#64748b';
+  ctx.textAlign = 'left';
+  ctx.fillText(' prereq', rx + 24, row3y);
+
+  rx += 24 + ctx.measureText(' prereq').width + 12;
+
+  // related — dashed gray line
+  ctx.beginPath();
+  ctx.moveTo(rx, row3y);
+  ctx.lineTo(rx + 24, row3y);
+  ctx.strokeStyle = '#64748b';
+  ctx.lineWidth = 1.2;
+  ctx.setLineDash([3, 5]);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = '#64748b';
+  ctx.fillText(' related', rx + 24, row3y);
+
+  ctx.restore();
 }
 
 // ─── Skill Node Drawing ───────────────────────────────────────────────────────
@@ -676,73 +726,50 @@ function drawHoverLabel(
   ctx.textAlign = 'left';
 }
 
-function drawDomainLabels(
-  ctx: CanvasRenderingContext2D,
-  labels: DomainLabel[],
-  selectedDomainIndex: number | null,
-  _placements: SkillPlacement[],
-  _centerX: number,
-  growFrac: number,
-) {
-  if (growFrac < 0.6) return;
-  const alpha = Math.min(1, (growFrac - 0.6) / 0.3);
 
-  labels.forEach((lbl, dIdx) => {
-    const c = hexToRgb(lbl.color);
-    const dimmed = selectedDomainIndex !== null && selectedDomainIndex !== dIdx;
-    const a = (dimmed ? 0.20 : 0.75) * alpha;
-
-    ctx.font = '700 13px "DM Sans", system-ui, sans-serif';
-    ctx.letterSpacing = '0.06em';
-    const tw = ctx.measureText(lbl.name).width;
-
-    // Pill
-    ctx.fillStyle = `rgba(${c.r},${c.g},${c.b},${(a * 0.15).toFixed(3)})`;
-    ctx.globalAlpha = 1;
-    ctx.beginPath();
-    ctx.roundRect(lbl.x - tw / 2 - 7, lbl.y - 10, tw + 14, 18, 5);
-    ctx.fill();
-
-    ctx.fillStyle = `rgba(${c.r},${c.g},${c.b},${a.toFixed(3)})`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(lbl.name, lbl.x, lbl.y);
-    ctx.textAlign = 'left';
-    ctx.letterSpacing = '0';
-  });
-}
-
-// Draw dep edges for selected skill only
+// Draw dep edges for selected or hovered skill — all relationship types styled distinctly
 function drawDepEdges(
   ctx: CanvasRenderingContext2D,
   placements: SkillPlacement[],
   selectedId: string | null,
+  hoveredId: string | null,
   deps: SkillDependency[],
 ) {
-  if (!selectedId) return;
+  const focusId = selectedId ?? hoveredId;
+  if (!focusId) return;
   const bySkillId = new Map(placements.filter(p => p.skill).map(p => [p.skill!.id, p]));
-  const selPlacement = bySkillId.get(selectedId);
-  if (!selPlacement) return;
+  const focusPlacement = bySkillId.get(focusId);
+  if (!focusPlacement) return;
 
-  const relevant = deps.filter(
-    d => d.sourceSkillId === selectedId || d.targetSkillId === selectedId,
-  );
+  const relevant = deps.filter(d => d.sourceSkillId === focusId || d.targetSkillId === focusId);
 
   relevant.forEach(d => {
-    const otherId = d.sourceSkillId === selectedId ? d.targetSkillId : d.sourceSkillId;
-    const other   = bySkillId.get(otherId);
+    const otherId = d.sourceSkillId === focusId ? d.targetSkillId : d.sourceSkillId;
+    const other = bySkillId.get(otherId);
     if (!other) return;
 
-    const isPrereq  = d.targetSkillId === selectedId;
-    const edgeColor = isPrereq ? '#818cf8' : '#34d399';
-    const cx        = hexToRgb(edgeColor);
+    const rel = d.relationship;
+    let color: string;
+    let opacity: number;
+    let lineWidth: number;
+    let dashed = false;
 
+    if (rel === 'prerequisite' || rel === 'part_of') {
+      color = '#818cf8'; opacity = 0.55; lineWidth = 1.4;
+    } else if (rel === 'specialization') {
+      color = '#14b8a6'; opacity = 0.40; lineWidth = 1.2;
+    } else {
+      // related, co_occurs, or anything else
+      color = '#64748b'; opacity = 0.30; lineWidth = 0.8; dashed = true;
+    }
+
+    const c = hexToRgb(color);
     ctx.beginPath();
-    ctx.moveTo(selPlacement.x, selPlacement.y);
+    ctx.moveTo(focusPlacement.x, focusPlacement.y);
     ctx.lineTo(other.x, other.y);
-    ctx.strokeStyle = `rgba(${cx.r},${cx.g},${cx.b},0.55)`;
-    ctx.lineWidth = 1.2;
-    ctx.setLineDash([4, 4]);
+    ctx.strokeStyle = `rgba(${c.r},${c.g},${c.b},${opacity})`;
+    ctx.lineWidth = lineWidth;
+    if (dashed) ctx.setLineDash([3, 5]);
     ctx.stroke();
     ctx.setLineDash([]);
   });
@@ -930,6 +957,62 @@ function SkillPanel({
   );
 }
 
+// ─── Auto-Merge Preview Modal ─────────────────────────────────────────────────
+
+function AutoMergeModal({ suggestions, onClose, onConfirm, merging }: {
+  suggestions: SuggestedMerge[];
+  onClose: () => void;
+  onConfirm: () => void;
+  merging: boolean;
+}) {
+  return (
+    <div style={{ position: 'fixed', inset: 0, zIndex: 100, background: 'rgba(0,0,0,0.80)', display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={onClose}>
+      <div style={{ width: 520, maxHeight: '78vh', background: 'rgba(4,8,20,0.96)', border: '1px solid #1e293b', borderRadius: 16, display: 'flex', flexDirection: 'column', overflow: 'hidden', backdropFilter: 'blur(16px)' }} onClick={e => e.stopPropagation()}>
+        <div style={{ padding: '14px 18px', borderBottom: '1px solid rgba(255,255,255,0.06)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <GitMerge size={15} style={{ color: '#10b981' }} />
+            <span style={{ fontWeight: 600, fontSize: 13, color: '#f1f5f9' }}>Auto-merge duplicates</span>
+            <span style={{ fontSize: 11, color: '#475569', marginLeft: 4 }}>{suggestions.length} suggestion{suggestions.length !== 1 ? 's' : ''}</span>
+          </div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: '#475569', cursor: 'pointer' }}><X size={14} /></button>
+        </div>
+
+        {suggestions.length === 0 ? (
+          <div style={{ padding: '32px 18px', textAlign: 'center', color: '#475569', fontSize: 13 }}>
+            No duplicate skills detected.
+          </div>
+        ) : (
+          <div style={{ flex: 1, overflowY: 'auto', padding: '8px 18px' }}>
+            {suggestions.map((s, i) => (
+              <div key={i} style={{ padding: '7px 0', borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+                <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, fontSize: 12 }}>
+                  <span style={{ color: '#34d399', fontWeight: 500 }}>{s.canonicalName}</span>
+                  <span style={{ color: '#334155' }}>←</span>
+                  <span style={{ color: '#94a3b8' }}>{s.aliasNames.join(', ')}</span>
+                </div>
+                <div style={{ fontSize: 10, color: '#475569', marginTop: 2 }}>{s.reason}</div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div style={{ padding: '10px 18px', borderTop: '1px solid rgba(255,255,255,0.06)', display: 'flex', gap: 8 }}>
+          <button onClick={onClose} style={{ flex: 1, padding: '6px 10px', borderRadius: 6, background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)', color: '#64748b', cursor: 'pointer', fontSize: 11 }}>
+            Cancel
+          </button>
+          <button
+            disabled={merging || suggestions.length === 0}
+            onClick={onConfirm}
+            style={{ flex: 2, padding: '6px 10px', borderRadius: 6, background: merging || suggestions.length === 0 ? 'rgba(16,185,129,0.06)' : 'rgba(16,185,129,0.18)', border: '1px solid rgba(16,185,129,0.25)', color: merging || suggestions.length === 0 ? '#334155' : '#34d399', cursor: merging || suggestions.length === 0 ? 'default' : 'pointer', fontSize: 11, fontWeight: 500, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 5 }}
+          >
+            {merging ? <><Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} />Merging…</> : <><GitMerge size={12} />Merge {suggestions.length} group{suggestions.length !== 1 ? 's' : ''}</>}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Merge Modal ──────────────────────────────────────────────────────────────
 
 function MergeModal({ skills, onClose, onMerged }: { skills: UniversalSkill[]; onClose: () => void; onMerged: () => void }) {
@@ -1102,6 +1185,221 @@ function GrowthPlanPanel({
   );
 }
 
+// ─── Learning Path Panel ──────────────────────────────────────────────────────
+
+const SEASONS = ['Fall 2024', 'Winter 2025', 'Spring 2025', 'Summer 2025', 'Fall 2025', 'Winter 2026', 'Spring 2026', 'Summer 2026'];
+
+function LearningStepRow({ step, onSelectSkill }: { step: LearningStep; onSelectSkill?: (name: string) => void }) {
+  const [expanded, setExpanded] = useState(false);
+  const topJobs = step.jobsNeedingThis.slice(0, 3);
+  const extraJobs = step.jobsNeedingThis.length - topJobs.length;
+
+  const stateColor = step.skillState === 'seed' ? '#f59e0b'
+    : step.skillState === 'gap' ? '#ef4444'
+    : '#64748b';
+
+  return (
+    <div style={{
+      marginBottom: 8,
+      borderRadius: 8,
+      background: 'rgba(255,255,255,0.025)',
+      border: '1px solid rgba(255,255,255,0.06)',
+      overflow: 'hidden',
+    }}>
+      {/* Header row */}
+      <div
+        style={{ padding: '8px 10px', cursor: 'pointer', display: 'flex', alignItems: 'flex-start', gap: 8 }}
+        onClick={() => setExpanded(e => !e)}
+      >
+        {/* Step number */}
+        <div style={{
+          width: 22, height: 22, borderRadius: '50%', flexShrink: 0,
+          background: 'rgba(99,102,241,0.15)', border: '1px solid rgba(99,102,241,0.25)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          fontSize: 9, fontWeight: 700, color: '#818cf8',
+        }}>
+          {step.step}
+        </div>
+
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
+            <span
+              style={{ fontSize: 12, fontWeight: 600, color: '#f1f5f9', cursor: onSelectSkill ? 'pointer' : 'default' }}
+              onClick={e => { if (onSelectSkill) { e.stopPropagation(); onSelectSkill(step.skillName); } }}
+            >
+              {step.skillName}
+            </span>
+            <span style={{
+              fontSize: 8, padding: '1px 4px', borderRadius: 3,
+              background: step.skillState === 'gap' ? 'rgba(239,68,68,0.12)' : 'rgba(255,255,255,0.05)',
+              color: stateColor, border: `1px solid ${stateColor}33`,
+            }}>
+              {step.skillState}
+            </span>
+            {step.hasResources && (
+              <BookOpen size={10} style={{ color: '#34d399', flexShrink: 0 }} />
+            )}
+          </div>
+
+          {/* Job badges */}
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3, marginBottom: 4 }}>
+            {topJobs.map((j, i) => (
+              <span key={i} style={{
+                fontSize: 8, padding: '1px 5px', borderRadius: 3,
+                background: 'rgba(99,102,241,0.08)', color: '#818cf8',
+                border: '1px solid rgba(99,102,241,0.15)',
+                whiteSpace: 'nowrap', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis',
+              }} title={j}>
+                {j}
+              </span>
+            ))}
+            {extraJobs > 0 && (
+              <span style={{ fontSize: 8, color: '#334155' }}>+{extraJobs} more</span>
+            )}
+          </div>
+
+          {/* Prereq path breadcrumb */}
+          {step.prereqPath.length > 0 && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 2, marginBottom: 4 }}>
+              {step.prereqPath.map((node, i) => (
+                <PathNodeChip key={node.skillId || i} node={node} isLast={i === step.prereqPath.length - 1} onSelect={onSelectSkill} />
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Resource indicator */}
+        <div style={{
+          width: 6, height: 6, borderRadius: '50%', flexShrink: 0, marginTop: 4,
+          background: step.hasResources ? '#34d399' : '#1e3a2a',
+          border: `1px solid ${step.hasResources ? '#34d399' : '#1e293b'}`,
+        }} title={step.hasResources ? 'Resources available' : 'No resources yet'} />
+      </div>
+
+      {/* Expanded rationale */}
+      {expanded && (
+        <div style={{ padding: '0 10px 8px 40px' }}>
+          <div style={{ fontSize: 9, color: '#475569', lineHeight: 1.5 }}>{step.rationale}</div>
+          <a
+            href={`/?prefill=${encodeURIComponent(step.skillName)}`}
+            onClick={e => e.stopPropagation()}
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 4, marginTop: 6,
+              fontSize: 9, padding: '2px 7px', borderRadius: 4,
+              background: 'rgba(16,185,129,0.12)', color: '#34d399',
+              border: '1px solid rgba(16,185,129,0.2)', textDecoration: 'none',
+            }}
+          >
+            <ExternalLink size={9} />Generate tree
+          </a>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LearningPathPanel({
+  learningPath, loading, onClose, onSelectSkill, season, onSeasonChange,
+}: {
+  learningPath: LearningPath | null;
+  loading: boolean;
+  onClose: () => void;
+  onSelectSkill?: (name: string) => void;
+  season: string | null;
+  onSeasonChange: (s: string | null) => void;
+}) {
+  return (
+    <div
+      style={{
+        position: 'absolute', top: 16, left: 16, zIndex: 50,
+        width: 340, maxHeight: 'calc(100% - 32px)',
+        background: 'rgba(4,8,20,0.94)',
+        backdropFilter: 'blur(16px)',
+        border: '1px solid rgba(99,102,241,0.2)',
+        borderRadius: 16,
+        overflow: 'hidden',
+        display: 'flex', flexDirection: 'column',
+        boxShadow: '0 12px 48px rgba(0,0,0,0.85)',
+      }}
+      onClick={e => e.stopPropagation()}
+    >
+      {/* Header */}
+      <div style={{ padding: '14px 16px 10px', borderBottom: '1px solid rgba(255,255,255,0.05)', flexShrink: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+            <Route size={13} style={{ color: '#818cf8' }} />
+            <span style={{ fontSize: 13, fontWeight: 600, color: '#e0e7ff' }}>Learning Path</span>
+          </div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: '#475569', cursor: 'pointer', padding: 2 }}>
+            <X size={14} />
+          </button>
+        </div>
+
+        {/* Season filter */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ fontSize: 9, color: '#475569', flexShrink: 0 }}>Season:</span>
+          <select
+            value={season ?? ''}
+            onChange={e => onSeasonChange(e.target.value || null)}
+            style={{
+              flex: 1, fontSize: 10, background: 'rgba(255,255,255,0.05)',
+              border: '1px solid rgba(255,255,255,0.08)', borderRadius: 5,
+              color: '#94a3b8', padding: '2px 6px', outline: 'none',
+            }}
+          >
+            <option value="">All time</option>
+            {SEASONS.map(s => <option key={s} value={s}>{s}</option>)}
+          </select>
+        </div>
+
+        {/* Summary stats */}
+        {learningPath && !loading && (
+          <div style={{ display: 'flex', gap: 10, marginTop: 8 }}>
+            <div style={{ fontSize: 9, color: '#475569' }}>
+              <span style={{ color: '#818cf8', fontWeight: 600 }}>{learningPath.steps.length}</span> skills to learn
+            </div>
+            <div style={{ fontSize: 9, color: '#475569' }}>
+              <span style={{ color: '#f59e0b', fontWeight: 600 }}>{learningPath.targetJobsCount}</span> jobs targeted
+            </div>
+            <div style={{ fontSize: 9, color: '#475569' }}>
+              <span style={{ color: '#34d399', fontWeight: 600 }}>{learningPath.seededSkillsCount}</span> already seeded
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Body */}
+      <div style={{ flex: 1, overflowY: 'auto', padding: '10px 12px' }}>
+        {loading && (
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '24px 0', gap: 8, color: '#475569', fontSize: 12 }}>
+            <Loader2 size={14} style={{ animation: 'spin 1s linear infinite' }} />Computing…
+          </div>
+        )}
+
+        {!loading && (!learningPath || learningPath.steps.length === 0) && (
+          <div style={{ fontSize: 11, color: '#475569', textAlign: 'center', padding: '20px 8px', lineHeight: 1.7 }}>
+            No learning path yet.<br />
+            <span style={{ fontSize: 10, color: '#334155' }}>
+              Add job applications and run Sync Skills to generate your path.
+            </span>
+          </div>
+        )}
+
+        {!loading && learningPath && learningPath.steps.length > 0 && (
+          <>
+            <div style={{ fontSize: 9, color: '#334155', marginBottom: 8, fontStyle: 'italic' }}>
+              Prerequisites always appear before dependents · sorted by job demand weight
+            </div>
+            {learningPath.steps.map(step => (
+              <LearningStepRow key={step.step} step={step} onSelectSkill={onSelectSkill} />
+            ))}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function PathNodeChip({ node, isLast, onSelect }: { node: PathNode; isLast: boolean; onSelect?: (name: string) => void }) {
   const nodeColor = node.state === 'seed' ? '#f59e0b' : isLast ? '#34d399' : '#64748b';
   return (
@@ -1202,10 +1500,19 @@ export default function SkillsPage() {
   const [showGrowthPlan, setShowGrowthPlan] = useState(false);
   const [growthLoading, setGrowthLoading] = useState(false);
   const [expandingGraph, setExpandingGraph] = useState(false);
+  const [showLearningPath, setShowLearningPath] = useState(false);
+  const [learningPath, setLearningPath] = useState<LearningPath | null>(null);
+  const [learningPathLoading, setLearningPathLoading] = useState(false);
+  const [learningPathSeason, setLearningPathSeason] = useState<string | null>(null);
   const [inferring, setInferring] = useState(false);
   const [classifying, setClassifying] = useState(false);
   const [resetting, setResetting]     = useState(false);
   const [classifyToast, setClassifyToast] = useState<string | null>(null);
+  const [backfilling, setBackfilling] = useState(false);
+  const [backfillToast, setBackfillToast] = useState<string | null>(null);
+  const [syncingJobs, setSyncingJobs] = useState(false);
+  const [autoMergeSuggestions, setAutoMergeSuggestions] = useState<SuggestedMerge[] | null>(null);
+  const [autoMerging, setAutoMerging] = useState(false);
   const [showGaps, setShowGaps]       = useState(false);   // default hidden
   const [showReviewOnly, setShowReviewOnly] = useState(false);
   const [showMerge, setShowMerge]     = useState(false);
@@ -1221,6 +1528,12 @@ export default function SkillsPage() {
   const growFracRef   = useRef(0);
   const GROW_DURATION = 600; // ms
 
+  // Double-click zoom animation
+  const animStartRef   = useRef<number | null>(null);
+  const animFromRef    = useRef({ x: 0, y: 0, scale: 1 });
+  const animToRef      = useRef({ x: 0, y: 0, scale: 1 });
+  const animatingRef   = useRef(false);
+
   const transform    = useRef({ x: 0, y: 0, scale: 1 });
   const isDragging   = useRef(false);
   const lastMouse    = useRef({ x: 0, y: 0 });
@@ -1228,9 +1541,9 @@ export default function SkillsPage() {
   const [renderTick, setRenderTick] = useState(0);
   const triggerRender = useCallback(() => setRenderTick(t => t + 1), []);
 
-  const { placements, branches, domainLabels } = useMemo(
-    () => layoutSkillTree(skills, gaps, showGaps, size.w, size.h),
-    [skills, gaps, showGaps, size.w, size.h],
+  const { placements, lanes, bandHeight, maxDepth } = useMemo(
+    () => layoutSkillGraph(skills, gaps, showGaps, deps, size.w, size.h),
+    [skills, gaps, showGaps, deps, size.w, size.h],
   );
 
   // Reset grow animation whenever layout changes
@@ -1263,16 +1576,6 @@ export default function SkillsPage() {
     const gapName = selectedId.startsWith('gap-') ? selectedId.slice(4) : null;
     return gapName ? gaps.find(g => g.skillName === gapName) ?? null : null;
   }, [selectedId, gaps]);
-
-  // Which domain is selected (for dimming everything else)
-  const selectedDomainIndex = useMemo(() => {
-    if (!selectedId) return null;
-    const p = placements.find(p =>
-      (p.skill && p.skill.id === selectedId) ||
-      (p.gap   && 'gap-' + p.gap.skillName === selectedId),
-    );
-    return p ? p.domainIndex : null;
-  }, [selectedId, placements]);
 
   const filteredDomainGroups = useMemo(() => {
     let base = showReviewOnly ? skills.filter(s => s.reviewNeeded) : skills;
@@ -1344,9 +1647,6 @@ export default function SkillsPage() {
 
     const now      = performance.now();
     const animTime = now / 1000;
-    const sc       = Math.min(size.w, size.h) / 900;
-    const cx       = size.w * 0.50;
-    const cy       = size.h * 0.55;
 
     // Advance grow animation
     if (placements.length > 0) {
@@ -1363,11 +1663,23 @@ export default function SkillsPage() {
     ctx.translate(t.x, t.y);
     ctx.scale(t.scale, t.scale);
 
-    drawBranches(ctx, branches, selectedDomainIndex, growFrac);
-    drawCenterNode(ctx, cx, cy, animTime, sc);
+    // Compute which skill IDs are "neighbors" of selected/hovered (for dimming)
+    const focusId = selectedId ?? hoveredId;
+    const neighborIds = new Set<string>();
+    if (focusId) {
+      neighborIds.add(focusId);
+      for (const d of deps) {
+        if (d.sourceSkillId === focusId) neighborIds.add(d.targetSkillId);
+        if (d.targetSkillId === focusId) neighborIds.add(d.sourceSkillId);
+      }
+    }
 
-    // Dep edges behind nodes
-    drawDepEdges(ctx, placements, selectedId, deps);
+    // Lane separators and depth guides (world-space)
+    drawLaneSeparators(ctx, lanes, size.h);
+    drawDepthGuides(ctx, maxDepth, bandHeight, 60, size.w, size.h);
+
+    // Dep edges behind nodes (visible only for selected or hovered skill)
+    drawDepEdges(ctx, placements, selectedId, hoveredId, deps);
 
     // Draw nodes
     const hoveredPlacement = hoveredId ? placements.find(p =>
@@ -1379,56 +1691,95 @@ export default function SkillsPage() {
       const pid        = p.skill ? p.skill.id : 'gap-' + (p.gap?.skillName ?? '');
       const isSelected = pid === selectedId;
       const isHovered  = pid === hoveredId;
-      const domAlpha   = selectedDomainIndex !== null && p.domainIndex !== selectedDomainIndex ? 0.10 : 1;
+
+      let nodeAlpha = 1.0;
+      if (focusId) {
+        if (pid === focusId) nodeAlpha = 1.0;
+        else if (p.skill && neighborIds.has(p.skill.id)) nodeAlpha = 0.90;
+        else nodeAlpha = 0.25;
+      }
 
       if (p.skill) {
         const isSeed   = seedIds.has(p.skill.id);
         const isTarget = targetIds.has(p.skill.id);
-        drawSkillNode(ctx, p.x, p.y, p.color, p.skill.level, isHovered, isSelected, animTime, domAlpha, growFrac, isSeed, isTarget);
+        drawSkillNode(ctx, p.x, p.y, p.color, p.skill.level, isHovered, isSelected, animTime, nodeAlpha, growFrac, isSeed, isTarget);
       } else {
-        drawGapNode(ctx, p.x, p.y, animTime, domAlpha);
+        drawGapNode(ctx, p.x, p.y, animTime, nodeAlpha);
       }
     });
 
-    // Domain labels (fade in after grow)
-    if (skills.length > 0) {
-      drawDomainLabels(ctx, domainLabels, selectedDomainIndex, placements, cx, growFrac);
-    }
+    // Zoom-adaptive labels
+    const scale = t.scale;
+    placements.forEach(p => {
+      if (!p.skill) return;
+      const pid = p.skill.id;
+      if (pid === hoveredId) return; // tooltip handles it
 
-    // Hover tooltip (on top of everything)
+      const isFocused   = pid === selectedId;
+      const isNeighbor  = focusId ? neighborIds.has(pid) : false;
+      const level       = p.skill.level;
+      const isSeed      = seedIds.has(pid);
+
+      let showLabel = false;
+      if (isFocused) showLabel = true;
+      else if (isNeighbor) showLabel = true;
+      else if (scale >= 1.5) showLabel = true;
+      else if (scale >= 1.2 && level >= 2) showLabel = true;
+      else if (scale < 1.2 && (isSeed || level >= 3)) showLabel = true;
+
+      if (!showLabel) return;
+
+      let labelAlpha = 1.0;
+      if (focusId && !isFocused && !isNeighbor) labelAlpha = 0.0;
+      if (!focusId && scale < 1.2 && !isSeed && level < 3) labelAlpha = 0.0;
+
+      if (labelAlpha < 0.01) return;
+
+      const label = p.skill.name.length > 20 ? p.skill.name.slice(0, 20) + '…' : p.skill.name;
+      ctx.font = isFocused ? '600 10px "DM Sans", system-ui' : '500 9px "DM Sans", system-ui';
+      const lx = p.x + 10;
+      ctx.globalAlpha = labelAlpha * (isFocused ? 1.0 : focusId ? 0.85 : 0.70);
+      ctx.fillStyle = isFocused ? '#f1f5f9' : '#94a3b8';
+      ctx.textBaseline = 'middle';
+      ctx.textAlign = 'left';
+      ctx.fillText(label, lx, p.y);
+      ctx.globalAlpha = 1;
+    });
+
+    // Lane headers (world-space, above nodes)
+    drawLaneHeaders(ctx, lanes, growFrac);
+
+    // Hover tooltip (on top of everything, inside transform)
     if (hoveredPlacement) {
-      drawHoverLabel(ctx, hoveredPlacement, cx);
-    }
-
-    // Permanent skill labels only when zoomed in past 1.8x
-    if (t.scale > 1.8) {
-      placements.forEach(p => {
-        if (!p.skill) return;
-        const domAlpha = selectedDomainIndex !== null && p.domainIndex !== selectedDomainIndex ? 0.10 : 1;
-        const label = p.skill.name.length > 20 ? p.skill.name.slice(0, 20) + '…' : p.skill.name;
-        const pid = p.skill.id;
-        if (pid === hoveredId) return; // already shown by hover tooltip
-        ctx.font = '500 9px "DM Sans", system-ui, sans-serif';
-        const tw = ctx.measureText(label).width;
-        const lx = p.x > cx ? p.x + 10 : p.x - 10 - tw;
-        ctx.globalAlpha = 0.60 * domAlpha;
-        ctx.fillStyle = '#c8d8e8';
-        ctx.textBaseline = 'middle';
-        ctx.textAlign = 'left';
-        ctx.fillText(label, lx, p.y);
-        ctx.globalAlpha = 1;
-      });
+      drawHoverLabel(ctx, hoveredPlacement, size.w / 2);
     }
 
     ctx.restore();
-  }, [branches, placements, domainLabels, selectedId, selectedDomainIndex, hoveredId,
+
+    // Screen-space legend — OUTSIDE save/restore so transform doesn't affect it
+    drawLegend(ctx, size.w, size.h);
+
+  }, [placements, lanes, bandHeight, maxDepth, selectedId, hoveredId,
       size, renderTick, domainColors, skills, deps, seedIds, targetIds]);
 
   // ── RAF loop ──────────────────────────────────────────────────────────────
   useEffect(() => {
     if (skills.length === 0 && gaps.length === 0) return;
     let rafId: number;
-    const tick = () => { triggerRender(); rafId = requestAnimationFrame(tick); };
+    const tick = () => {
+      if (animatingRef.current) {
+        const now2 = performance.now();
+        if (animStartRef.current === null) animStartRef.current = now2;
+        const t2 = Math.min(1, easeOutCubic((now2 - animStartRef.current) / 350));
+        const from = animFromRef.current, to = animToRef.current;
+        transform.current.x     = from.x + (to.x - from.x) * t2;
+        transform.current.y     = from.y + (to.y - from.y) * t2;
+        transform.current.scale = from.scale + (to.scale - from.scale) * t2;
+        if (t2 >= 1) animatingRef.current = false;
+      }
+      triggerRender();
+      rafId = requestAnimationFrame(tick);
+    };
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
   }, [skills.length, gaps.length, triggerRender]);
@@ -1511,6 +1862,58 @@ export default function SkillsPage() {
 
   function handleMouseUp() { isDragging.current = false; }
 
+  function handleCanvasDblClick(e: React.MouseEvent) {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect  = canvas.getBoundingClientRect();
+    const world = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
+    const p     = findPlacement(world.x, world.y);
+    if (!p) return;
+
+    const focusSkillId = p.skill?.id ?? null;
+    const neighborPlacements: SkillPlacement[] = [p];
+    if (focusSkillId) {
+      for (const d of deps) {
+        if (d.sourceSkillId !== focusSkillId && d.targetSkillId !== focusSkillId) continue;
+        const otherId = d.sourceSkillId === focusSkillId ? d.targetSkillId : d.sourceSkillId;
+        const op = placements.find(pl => pl.skill?.id === otherId);
+        if (op) neighborPlacements.push(op);
+      }
+    }
+
+    const xs = neighborPlacements.map(n => n.x);
+    const ys = neighborPlacements.map(n => n.y);
+    const minX = Math.min(...xs) - 80, maxX = Math.max(...xs) + 80;
+    const minY = Math.min(...ys) - 80, maxY = Math.max(...ys) + 80;
+    const bbW = maxX - minX, bbH = maxY - minY;
+
+    const newScale0 = Math.min(Math.min(size.w / bbW, size.h / bbH) * 0.80, 3.0);
+    const newScale  = Math.max(newScale0, 0.5);
+    const bbCx = (minX + maxX) / 2, bbCy = (minY + maxY) / 2;
+    const newX = size.w / 2 - bbCx * newScale;
+    const newY = size.h / 2 - bbCy * newScale;
+
+    animFromRef.current  = { ...transform.current };
+    animToRef.current    = { x: newX, y: newY, scale: newScale };
+    animStartRef.current = null;
+    animatingRef.current = true;
+  }
+
+  function handleFitAll() {
+    if (placements.length === 0) return;
+    const xs = placements.map(p => p.x), ys = placements.map(p => p.y);
+    const minX = Math.min(...xs) - 40, maxX = Math.max(...xs) + 40;
+    const minY = Math.min(...ys) - 40, maxY = Math.max(...ys) + 40;
+    const bbW = maxX - minX, bbH = maxY - minY;
+    const newScale = Math.min(size.w / bbW, size.h / bbH, 2.0);
+    const bbCx = (minX + maxX) / 2, bbCy = (minY + maxY) / 2;
+    animFromRef.current  = { ...transform.current };
+    animToRef.current    = { x: size.w / 2 - bbCx * newScale, y: size.h / 2 - bbCy * newScale, scale: newScale };
+    animStartRef.current = null;
+    animatingRef.current = true;
+    triggerRender();
+  }
+
   function handleExport() {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -1524,6 +1927,53 @@ export default function SkillsPage() {
     try { await invoke('sync_all_skills'); await loadAll(); }
     catch (e) { console.error('Sync failed:', e); }
     finally { setSyncing(false); }
+  }
+
+  async function handleAutoMergePreview() {
+    try {
+      const suggestions = await invoke<SuggestedMerge[]>('suggest_skill_merges');
+      setAutoMergeSuggestions(suggestions);
+    } catch (e) {
+      console.error('suggest_skill_merges failed:', e);
+    }
+  }
+
+  async function handleAutoMergeConfirm() {
+    setAutoMerging(true);
+    try {
+      const count = await invoke<number>('auto_merge_suggested');
+      setAutoMergeSuggestions(null);
+      // Refresh slugs and reload after merge
+      await invoke('backfill_concept_slugs');
+      await loadAll();
+      setBackfillToast(`Auto-merged ${count} duplicate group${count !== 1 ? 's' : ''}`);
+      setTimeout(() => setBackfillToast(null), 4000);
+    } catch (e) {
+      console.error('auto_merge_suggested failed:', e);
+    } finally {
+      setAutoMerging(false);
+    }
+  }
+
+  async function handleSyncJobs() {
+    setSyncingJobs(true);
+    try { await invoke('sync_skills_from_jobs'); await loadAll(); }
+    catch (e) { console.error('Job skill sync failed:', e); }
+    finally { setSyncingJobs(false); }
+  }
+
+  async function handleBackfillSlugs() {
+    setBackfilling(true);
+    try {
+      const matched = await invoke<number>('backfill_concept_slugs');
+      setBackfillToast(`Concept slugs backfilled — ${matched} skills matched`);
+      setTimeout(() => setBackfillToast(null), 4000);
+      await loadAll();
+    } catch (e) {
+      console.error('Backfill failed:', e);
+    } finally {
+      setBackfilling(false);
+    }
   }
 
   async function handleInferDeps() {
@@ -1578,6 +2028,22 @@ export default function SkillsPage() {
     finally { setGrowthLoading(false); }
   }
 
+  async function handleOpenLearningPath(season: string | null = learningPathSeason) {
+    setShowLearningPath(true);
+    setShowGrowthPlan(false);
+    setLearningPathLoading(true);
+    try {
+      const path = await invoke<LearningPath>('compute_learning_path', { season });
+      setLearningPath(path);
+    } catch (e) { console.error('compute_learning_path failed:', e); }
+    finally { setLearningPathLoading(false); }
+  }
+
+  async function handleLearningPathSeasonChange(season: string | null) {
+    setLearningPathSeason(season);
+    handleOpenLearningPath(season);
+  }
+
   async function handleExpandSkillGraph() {
     setExpandingGraph(true);
     try {
@@ -1617,6 +2083,12 @@ export default function SkillsPage() {
               <button onClick={handleSync} disabled={syncing} className="p-1.5 text-emerald-700 hover:text-emerald-400 disabled:opacity-30 transition-colors" title="Sync All Skills">
                 {syncing ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
               </button>
+              <button onClick={handleSyncJobs} disabled={syncingJobs} className="p-1.5 text-amber-800 hover:text-amber-500 disabled:opacity-30 transition-colors" title="Sync Job Skills">
+                {syncingJobs ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+              </button>
+              <button onClick={handleBackfillSlugs} disabled={backfilling} className="p-1.5 text-emerald-900 hover:text-emerald-600 disabled:opacity-30 transition-colors" title="Backfill Concept Slugs">
+                {backfilling ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+              </button>
               <button onClick={handleExport} disabled={skills.length === 0} className="p-1.5 text-slate-700 hover:text-slate-400 disabled:opacity-30 transition-colors" title="Export as PNG">
                 <Download className="w-4 h-4" />
               </button>
@@ -1648,12 +2120,39 @@ export default function SkillsPage() {
               </button>
 
               <button
-                onClick={handleOpenGrowthPlan}
-                className="w-full mt-1.5 py-1.5 text-xs rounded-lg transition-colors flex items-center justify-center gap-2"
-                style={{ background: 'rgba(245,158,11,0.12)', color: '#f59e0b', border: '1px solid rgba(245,158,11,0.25)' }}
+                onClick={handleSyncJobs}
+                disabled={syncingJobs}
+                className="w-full py-2 text-xs font-medium rounded-lg transition-colors flex items-center justify-center gap-2 mt-1.5"
+                style={{ background: syncingJobs ? 'rgba(255,255,255,0.04)' : 'rgba(245,158,11,0.12)', color: syncingJobs ? '#334155' : '#fbbf24', border: '1px solid rgba(245,158,11,0.2)' }}
               >
-                <TrendingUp className="w-3 h-3" />Growth Plan
+                {syncingJobs ? <><Loader2 className="w-3 h-3 animate-spin" />Syncing…</> : <>Sync Job Skills</>}
               </button>
+
+              <button
+                onClick={handleBackfillSlugs}
+                disabled={backfilling}
+                className="w-full py-2 text-xs font-medium rounded-lg transition-colors flex items-center justify-center gap-2 mt-1.5"
+                style={{ background: backfilling ? 'rgba(255,255,255,0.04)' : 'rgba(16,185,129,0.08)', color: backfilling ? '#334155' : '#6ee7b7', border: '1px solid rgba(16,185,129,0.15)' }}
+              >
+                {backfilling ? <><Loader2 className="w-3 h-3 animate-spin" />Backfilling…</> : <>Backfill Concept Slugs</>}
+              </button>
+
+              <div className="flex gap-1.5 mt-1.5">
+                <button
+                  onClick={handleOpenGrowthPlan}
+                  className="flex-1 py-1.5 text-xs rounded-lg transition-colors flex items-center justify-center gap-2"
+                  style={{ background: 'rgba(245,158,11,0.12)', color: '#f59e0b', border: '1px solid rgba(245,158,11,0.25)' }}
+                >
+                  <TrendingUp className="w-3 h-3" />Growth Plan
+                </button>
+                <button
+                  onClick={() => handleOpenLearningPath(learningPathSeason)}
+                  className="flex-1 py-1.5 text-xs rounded-lg transition-colors flex items-center justify-center gap-2"
+                  style={{ background: 'rgba(99,102,241,0.12)', color: '#818cf8', border: '1px solid rgba(99,102,241,0.25)' }}
+                >
+                  <Route className="w-3 h-3" />Learning Path
+                </button>
+              </div>
 
               {skills.length >= 2 && (
                 <button
@@ -1673,6 +2172,16 @@ export default function SkillsPage() {
                   style={{ background: 'rgba(255,255,255,0.03)', color: '#475569', border: '1px solid rgba(255,255,255,0.05)' }}
                 >
                   <GitMerge className="w-3 h-3" />Merge Skills
+                </button>
+              )}
+
+              {skills.length >= 2 && (
+                <button
+                  onClick={handleAutoMergePreview}
+                  className="w-full mt-1.5 py-1.5 text-xs rounded-lg transition-colors flex items-center justify-center gap-2"
+                  style={{ background: 'rgba(16,185,129,0.06)', color: '#6ee7b7', border: '1px solid rgba(16,185,129,0.12)' }}
+                >
+                  <GitMerge className="w-3 h-3" />Auto-merge duplicates
                 </button>
               )}
 
@@ -1880,6 +2389,17 @@ export default function SkillsPage() {
             {classifyToast}
           </div>
         )}
+        {backfillToast && (
+          <div style={{
+            position: 'absolute', top: 16, left: '50%', transform: 'translateX(-50%)',
+            background: 'rgba(15,15,25,0.92)', border: '1px solid rgba(16,185,129,0.35)',
+            borderRadius: 8, padding: '8px 16px', fontSize: 12, color: '#6ee7b7',
+            zIndex: 50, backdropFilter: 'blur(6px)', whiteSpace: 'nowrap',
+            boxShadow: '0 4px 24px rgba(0,0,0,0.5)',
+          }}>
+            {backfillToast}
+          </div>
+        )}
         <canvas
           ref={canvasRef}
           style={{
@@ -1892,28 +2412,26 @@ export default function SkillsPage() {
           onMouseMove={handleMouseMove}
           onMouseUp={handleMouseUp}
           onClick={handleCanvasClick}
+          onDoubleClick={handleCanvasDblClick}
           onMouseLeave={() => { isDragging.current = false; dragMoved.current = false; setHoveredId(null); }}
         />
 
-        {/* 'YOU' label */}
+        {/* Fit-all button */}
         {skills.length > 0 && (
-          <div
+          <button
+            onClick={handleFitAll}
+            title="Fit all skills"
             style={{
-              position: 'absolute',
-              left: `${size.w * 0.50 + transform.current.x}px`,
-              top: `${size.h * 0.55 + transform.current.y - 28 * (Math.min(size.w, size.h) / 900) * transform.current.scale}px`,
-              transform: 'translateX(-50%)',
-              fontSize: 8,
-              fontWeight: 700,
-              color: '#34d399',
-              letterSpacing: '0.18em',
-              textTransform: 'uppercase',
-              pointerEvents: 'none',
-              opacity: Math.min(1, transform.current.scale * 1.4),
+              position: 'absolute', bottom: 24, right: 16, zIndex: 10,
+              width: 32, height: 32, borderRadius: '50%',
+              background: 'rgba(255,255,255,0.06)',
+              border: '1px solid rgba(255,255,255,0.10)',
+              color: '#475569', cursor: 'pointer',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
             }}
           >
-            you
-          </div>
+            <Maximize2 size={14} />
+          </button>
         )}
 
         {/* Empty state */}
@@ -1954,10 +2472,33 @@ export default function SkillsPage() {
             }}
           />
         )}
+
+        {/* Learning Path panel */}
+        {showLearningPath && (
+          <LearningPathPanel
+            learningPath={learningPath}
+            loading={learningPathLoading}
+            onClose={() => setShowLearningPath(false)}
+            season={learningPathSeason}
+            onSeasonChange={handleLearningPathSeasonChange}
+            onSelectSkill={name => {
+              const skill = skills.find(s => s.name.toLowerCase() === name.toLowerCase());
+              if (skill) setSelectedId(skill.id);
+            }}
+          />
+        )}
       </div>
 
       {showMerge && (
         <MergeModal skills={skills} onClose={() => setShowMerge(false)} onMerged={loadAll} />
+      )}
+      {autoMergeSuggestions !== null && (
+        <AutoMergeModal
+          suggestions={autoMergeSuggestions}
+          onClose={() => setAutoMergeSuggestions(null)}
+          onConfirm={handleAutoMergeConfirm}
+          merging={autoMerging}
+        />
       )}
     </div>
   );
