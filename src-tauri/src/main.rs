@@ -137,6 +137,7 @@ fn main() {
             job_commands::get_skill_demand,
             job_commands::mark_followed_up,
             job_commands::reextract_all_skills,
+            job_commands::save_tailored_projects,
             idea_commands::create_idea,
             idea_commands::get_ideas,
             idea_commands::update_idea,

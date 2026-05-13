@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { X, ExternalLink } from 'lucide-react';
 
 interface TailoredProject {
@@ -33,6 +34,8 @@ export function TailoredProjectsPanel({
   onClose,
 }: TailoredProjectsPanelProps) {
   const [copyNotification, setCopyNotification] = useState(false);
+  const [saveNotification, setSaveNotification] = useState(false);
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     if (!copyNotification) return;
@@ -43,6 +46,16 @@ export function TailoredProjectsPanel({
 
     return () => clearTimeout(timeoutId);
   }, [copyNotification]);
+
+  useEffect(() => {
+    if (!saveNotification) return;
+
+    const timeoutId = setTimeout(() => {
+      setSaveNotification(false);
+    }, 2000);
+
+    return () => clearTimeout(timeoutId);
+  }, [saveNotification]);
 
   async function handleCopyToClipboard() {
     const text = tailoredData.topProjects
@@ -59,6 +72,21 @@ export function TailoredProjectsPanel({
 
   function handleOpenResume() {
     window.location.href = '/resume';
+  }
+
+  async function handleSave() {
+    setSaving(true);
+    try {
+      await invoke('save_tailored_projects', {
+        jobId: job.id,
+        tailoredProjectsJson: JSON.stringify(tailoredData),
+      });
+      setSaveNotification(true);
+    } catch (error) {
+      console.error('Failed to save tailored projects:', error);
+    } finally {
+      setSaving(false);
+    }
   }
 
   return (
@@ -167,6 +195,16 @@ export function TailoredProjectsPanel({
         {copyNotification && (
           <p className="text-xs text-emerald-400 mb-2">Copied to clipboard!</p>
         )}
+        {saveNotification && (
+          <p className="text-xs text-emerald-400 mb-2">Saved to job!</p>
+        )}
+        <button
+          onClick={handleSave}
+          disabled={saving}
+          className="w-full bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-lg py-2 text-xs font-medium transition-colors"
+        >
+          {saving ? 'Saving...' : 'Save to job'}
+        </button>
         <button
           onClick={handleCopyToClipboard}
           className="w-full bg-blue-600 hover:bg-blue-500 text-white rounded-lg py-2 text-xs font-medium transition-colors"

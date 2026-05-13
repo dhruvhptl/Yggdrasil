@@ -551,3 +551,22 @@ pub async fn reextract_all_skills(
     println!("🏷️  Reextract all: {} processed, {} failed", processed, failed);
     Ok(ReextractResult { processed, failed, errors })
 }
+
+#[tauri::command]
+pub async fn save_tailored_projects(
+    job_id: String,
+    tailored_projects_json: String,
+    database: State<'_, Database>,
+) -> Result<(), String> {
+    sqlx::query(
+        "UPDATE job_applications SET tailored_projects = $2 WHERE id = $1"
+    )
+    .bind(&job_id)
+    .bind(&tailored_projects_json)
+    .execute(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+}
