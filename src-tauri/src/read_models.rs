@@ -1931,15 +1931,22 @@ pub async fn get_skill_graph_snapshot(
 pub struct StudyMapNode {
     pub node_id: String,
     pub title: String,
-    pub matched_section_title: Option<String>,
-    pub matched_page_start: Option<i32>,
-    pub matched_page_end: Option<i32>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StudyMapSection {
+    pub section_title: String,
+    pub page_start: Option<i32>,
+    pub page_end: Option<i32>,
+    pub node_count: i64,
+    pub nodes: Vec<StudyMapNode>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StudyMapTreeBreakdown {
-    pub tree_id: String,
+    pub project_id: String,
     pub project_name: String,
     pub node_count: i64,
 }
@@ -1955,7 +1962,7 @@ pub struct StudyMapEntry {
     pub avg_relevance: f64,
     pub relevance_tier: String,
     pub tree_breakdown: Vec<StudyMapTreeBreakdown>,
-    pub supported_nodes: Vec<StudyMapNode>,
+    pub sections: Vec<StudyMapSection>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1964,24 +1971,59 @@ pub struct ResourceStudyMap {
     pub entries: Vec<StudyMapEntry>,
     pub total_resources_with_links: i64,
     pub total_unlocked_nodes: i64,
+    pub total_frontier_nodes: i64,
 }
 
 #[tauri::command]
 pub async fn get_resource_study_map(
-    tree_ids: Option<Vec<String>>,
+    project_ids: Option<Vec<String>>,
     include_frontier: Option<bool>,
     database: State<'_, Database>,
 ) -> Result<ResourceStudyMap, String> {
     let pool = &database.pool;
     let include_frontier = include_frontier.unwrap_or(false);
 
-    // Count total unlocked leaf nodes
+    // Count total unlocked leaf nodes: leaves whose parent branch is unlocked
     let total_unlocked: i64 = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM tree_nodes WHERE type = 'leaf' AND is_locked = false"
+        "SELECT COUNT(*)
+         FROM tree_nodes leaf
+         JOIN tree_nodes branch ON branch.id = leaf.parent_id
+         WHERE leaf.type = 'leaf'
+           AND branch.type = 'branch'
+           AND branch.is_locked = false"
     )
     .fetch_one(pool)
     .await
     .unwrap_or(0);
+
+    // Count frontier leaf nodes: leaves whose parent branch is locked but is the next-to-unlock
+    // (the immediately preceding sibling branch under the same trunk has progress = 100).
+    // Leaves themselves are never locked — only their parent branch node is.
+    let frontier_count: i64 = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)
+         FROM tree_nodes leaf
+         JOIN tree_nodes branch ON branch.id = leaf.parent_id
+         WHERE leaf.type = 'leaf'
+           AND branch.type = 'branch'
+           AND branch.is_locked = true
+           AND EXISTS (
+               SELECT 1 FROM tree_nodes prev_branch
+               WHERE prev_branch.parent_id = branch.parent_id
+                 AND prev_branch.type = 'branch'
+                 AND prev_branch.order_index = (
+                     SELECT MAX(order_index) FROM tree_nodes
+                     WHERE parent_id = branch.parent_id
+                       AND type = 'branch'
+                       AND order_index < branch.order_index
+                 )
+                 AND prev_branch.progress = 100
+           )"
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+
+    println!("[study_map] include_frontier={}, unlocked_nodes={}, frontier_nodes={}", include_frontier, total_unlocked, frontier_count);
 
     // Count distinct resources that have at least one node link
     let total_resources_with_links: i64 = sqlx::query_scalar::<_, i64>(
@@ -1991,7 +2033,71 @@ pub async fn get_resource_study_map(
     .await
     .unwrap_or(0);
 
-    let filter_trees = tree_ids.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
+    let filter_projects = project_ids.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
+
+    // eligible_nodes CTE: unlocked leaves UNION frontier leaves (when $1=true).
+    // Leaves are never locked — only their parent branch is. Frontier = leaves whose parent
+    // branch is locked but the immediately-preceding sibling branch under the same trunk
+    // has progress=100 (meaning that skill was just completed and this one is next).
+    // The frontier UNION branch is gated on $1::bool = true so it produces zero rows when false.
+    const ELIGIBLE_CTE_NO_PROJECT_FILTER: &str = "
+        WITH eligible AS (
+            SELECT leaf.id
+            FROM tree_nodes leaf
+            JOIN tree_nodes branch ON branch.id = leaf.parent_id
+            WHERE leaf.type = 'leaf' AND branch.type = 'branch' AND branch.is_locked = false
+            UNION
+            SELECT leaf.id
+            FROM tree_nodes leaf
+            JOIN tree_nodes branch ON branch.id = leaf.parent_id
+            WHERE leaf.type = 'leaf'
+              AND branch.type = 'branch'
+              AND branch.is_locked = true
+              AND $1 = true
+              AND EXISTS (
+                  SELECT 1 FROM tree_nodes prev_branch
+                  WHERE prev_branch.parent_id = branch.parent_id
+                    AND prev_branch.type = 'branch'
+                    AND prev_branch.order_index = (
+                        SELECT MAX(order_index) FROM tree_nodes
+                        WHERE parent_id = branch.parent_id
+                          AND type = 'branch'
+                          AND order_index < branch.order_index
+                    )
+                    AND prev_branch.progress = 100
+              )
+        )";
+    const ELIGIBLE_CTE_WITH_PROJECT_FILTER: &str = "
+        WITH eligible AS (
+            SELECT leaf.id
+            FROM tree_nodes leaf
+            JOIN tree_nodes branch ON branch.id = leaf.parent_id
+            JOIN trees t ON t.id = leaf.tree_id
+            WHERE leaf.type = 'leaf' AND branch.type = 'branch' AND branch.is_locked = false
+              AND t.project_id = ANY($2)
+            UNION
+            SELECT leaf.id
+            FROM tree_nodes leaf
+            JOIN tree_nodes branch ON branch.id = leaf.parent_id
+            JOIN trees t ON t.id = leaf.tree_id
+            WHERE leaf.type = 'leaf'
+              AND branch.type = 'branch'
+              AND branch.is_locked = true
+              AND $1 = true
+              AND t.project_id = ANY($2)
+              AND EXISTS (
+                  SELECT 1 FROM tree_nodes prev_branch
+                  WHERE prev_branch.parent_id = branch.parent_id
+                    AND prev_branch.type = 'branch'
+                    AND prev_branch.order_index = (
+                        SELECT MAX(order_index) FROM tree_nodes
+                        WHERE parent_id = branch.parent_id
+                          AND type = 'branch'
+                          AND order_index < branch.order_index
+                    )
+                    AND prev_branch.progress = 100
+              )
+        )";
 
     struct RankedRow {
         resource_id: String,
@@ -1999,31 +2105,26 @@ pub async fn get_resource_study_map(
         avg_relevance: f64,
     }
 
-    let ranked_rows: Vec<RankedRow> = if filter_trees {
-        let ids = tree_ids.as_ref().unwrap();
-        let rows = sqlx::query(
-            "SELECT mnl.resource_id,
+    let ranked_rows: Vec<RankedRow> = if filter_projects {
+        let ids = project_ids.as_ref().unwrap();
+        let sql = format!(
+            "{} SELECT mnl.resource_id,
                     COUNT(DISTINCT mnl.node_id) AS coverage_count,
                     CAST(AVG(mnl.relevance_score) AS FLOAT8) AS avg_relevance
              FROM mimir_node_links mnl
-             JOIN tree_nodes lf ON lf.id = mnl.node_id AND lf.type = 'leaf'
-             LEFT JOIN tree_nodes br ON br.id = lf.parent_id AND br.type = 'branch'
+             JOIN eligible e ON e.id = mnl.node_id
              WHERE mnl.relevance_score < 0.55
-               AND lf.tree_id = ANY($1)
-               AND (
-                   lf.is_locked = false
-                   OR ($2 = true AND br.progress > 0)
-               )
              GROUP BY mnl.resource_id
              ORDER BY coverage_count DESC, avg_relevance ASC
-             LIMIT 20"
-        )
-        .bind(ids)
-        .bind(include_frontier)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
+             LIMIT 20",
+            ELIGIBLE_CTE_WITH_PROJECT_FILTER
+        );
+        let rows = sqlx::query(&sql)
+            .bind(include_frontier)
+            .bind(ids)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
         rows.iter().filter_map(|r| {
             Some(RankedRow {
                 resource_id: r.try_get("resource_id").ok()?,
@@ -2032,27 +2133,23 @@ pub async fn get_resource_study_map(
             })
         }).collect()
     } else {
-        let rows = sqlx::query(
-            "SELECT mnl.resource_id,
+        let sql = format!(
+            "{} SELECT mnl.resource_id,
                     COUNT(DISTINCT mnl.node_id) AS coverage_count,
                     CAST(AVG(mnl.relevance_score) AS FLOAT8) AS avg_relevance
              FROM mimir_node_links mnl
-             JOIN tree_nodes lf ON lf.id = mnl.node_id AND lf.type = 'leaf'
-             LEFT JOIN tree_nodes br ON br.id = lf.parent_id AND br.type = 'branch'
+             JOIN eligible e ON e.id = mnl.node_id
              WHERE mnl.relevance_score < 0.55
-               AND (
-                   lf.is_locked = false
-                   OR ($1 = true AND br.progress > 0)
-               )
              GROUP BY mnl.resource_id
              ORDER BY coverage_count DESC, avg_relevance ASC
-             LIMIT 20"
-        )
-        .bind(include_frontier)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
+             LIMIT 20",
+            ELIGIBLE_CTE_NO_PROJECT_FILTER
+        );
+        let rows = sqlx::query(&sql)
+            .bind(include_frontier)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
         rows.iter().filter_map(|r| {
             Some(RankedRow {
                 resource_id: r.try_get("resource_id").ok()?,
@@ -2067,6 +2164,7 @@ pub async fn get_resource_study_map(
             entries: vec![],
             total_resources_with_links,
             total_unlocked_nodes: total_unlocked,
+            total_frontier_nodes: frontier_count,
         });
     }
 
@@ -2092,58 +2190,100 @@ pub async fn get_resource_study_map(
         resource_meta.insert(id, (title, rtype, url));
     }
 
-    // Fetch supported nodes
-    let node_rows = if filter_trees {
-        let ids = tree_ids.as_ref().unwrap();
-        sqlx::query(
-            "SELECT mnl.resource_id, mnl.node_id, tn.title,
+    // Fetch supported nodes — reuse eligible CTE so frontier nodes appear when flag is on
+    let node_rows = if filter_projects {
+        let ids = project_ids.as_ref().unwrap();
+        let sql = format!(
+            "{} SELECT mnl.resource_id, mnl.node_id, tn.title,
                     mnl.matched_section_title, mnl.matched_page_start, mnl.matched_page_end
              FROM mimir_node_links mnl
+             JOIN eligible e ON e.id = mnl.node_id
              JOIN tree_nodes tn ON tn.id = mnl.node_id
-             WHERE mnl.resource_id = ANY($1)
-               AND tn.tree_id = ANY($2)
-               AND mnl.relevance_score < 0.55"
-        )
-        .bind(&top_resource_ids)
-        .bind(ids)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| e.to_string())?
+             WHERE mnl.resource_id = ANY($3)
+               AND mnl.relevance_score < 0.55",
+            ELIGIBLE_CTE_WITH_PROJECT_FILTER
+        );
+        sqlx::query(&sql)
+            .bind(include_frontier)
+            .bind(ids)
+            .bind(&top_resource_ids)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?
     } else {
-        sqlx::query(
-            "SELECT mnl.resource_id, mnl.node_id, tn.title,
+        let sql = format!(
+            "{} SELECT mnl.resource_id, mnl.node_id, tn.title,
                     mnl.matched_section_title, mnl.matched_page_start, mnl.matched_page_end
              FROM mimir_node_links mnl
+             JOIN eligible e ON e.id = mnl.node_id
              JOIN tree_nodes tn ON tn.id = mnl.node_id
-             WHERE mnl.resource_id = ANY($1)
-               AND mnl.relevance_score < 0.55"
-        )
-        .bind(&top_resource_ids)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| e.to_string())?
+             WHERE mnl.resource_id = ANY($2)
+               AND mnl.relevance_score < 0.55",
+            ELIGIBLE_CTE_NO_PROJECT_FILTER
+        );
+        sqlx::query(&sql)
+            .bind(include_frontier)
+            .bind(&top_resource_ids)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?
     };
 
-    let mut nodes_by_resource: std::collections::HashMap<String, Vec<StudyMapNode>> = std::collections::HashMap::new();
+    // Group raw node rows by (resource_id, section_key) for section assembly
+    struct RawNode {
+        node_id: String,
+        title: String,
+        section_title: Option<String>,
+        page_start: Option<i32>,
+        page_end: Option<i32>,
+    }
+    // resource_id → list of raw nodes
+    let mut raw_nodes_by_resource: std::collections::HashMap<String, Vec<RawNode>> = std::collections::HashMap::new();
     for r in &node_rows {
         let resource_id: String = r.try_get("resource_id").unwrap_or_default();
-        let node_id: String = r.try_get("node_id").unwrap_or_default();
-        let title: String = r.try_get("title").unwrap_or_default();
-        let matched_section_title: Option<String> = r.try_get("matched_section_title").unwrap_or(None);
-        let matched_page_start: Option<i32> = r.try_get("matched_page_start").unwrap_or(None);
-        let matched_page_end: Option<i32> = r.try_get("matched_page_end").unwrap_or(None);
-        nodes_by_resource.entry(resource_id).or_default().push(StudyMapNode {
-            node_id,
-            title,
-            matched_section_title,
-            matched_page_start,
-            matched_page_end,
+        raw_nodes_by_resource.entry(resource_id).or_default().push(RawNode {
+            node_id: r.try_get("node_id").unwrap_or_default(),
+            title: r.try_get("title").unwrap_or_default(),
+            section_title: r.try_get("matched_section_title").unwrap_or(None),
+            page_start: r.try_get("matched_page_start").unwrap_or(None),
+            page_end: r.try_get("matched_page_end").unwrap_or(None),
         });
     }
 
-    // Fetch tree breakdown
+    // Build sections_by_resource: group nodes by section_title, sort by page_start
+    let mut sections_by_resource: std::collections::HashMap<String, Vec<StudyMapSection>> = std::collections::HashMap::new();
+    for (resource_id, raw_nodes) in raw_nodes_by_resource {
+        // section_key → (page_start, page_end, nodes)
+        let mut section_map: std::collections::HashMap<String, (Option<i32>, Option<i32>, Vec<StudyMapNode>)> = std::collections::HashMap::new();
+        for n in raw_nodes {
+            let key = n.section_title.clone().unwrap_or_else(|| "Other".to_string());
+            let entry = section_map.entry(key).or_insert((n.page_start, n.page_end, vec![]));
+            // track min page_start and max page_end across nodes in the section
+            if let Some(ps) = n.page_start {
+                entry.0 = Some(entry.0.map_or(ps, |existing| existing.min(ps)));
+            }
+            if let Some(pe) = n.page_end {
+                entry.1 = Some(entry.1.map_or(pe, |existing| existing.max(pe)));
+            }
+            entry.2.push(StudyMapNode { node_id: n.node_id, title: n.title });
+        }
+        let mut sections: Vec<StudyMapSection> = section_map.into_iter().map(|(title, (page_start, page_end, nodes))| {
+            let node_count = nodes.len() as i64;
+            StudyMapSection { section_title: title, page_start, page_end, node_count, nodes }
+        }).collect();
+        // Sort: sections with page_start first (ascending), then "Other" (None) at end
+        sections.sort_by(|a, b| match (a.page_start, b.page_start) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.section_title.cmp(&b.section_title),
+        });
+        sections_by_resource.insert(resource_id, sections);
+    }
+
+    // Fetch project breakdown — group by project (not tree) so multiple tree versions don't produce duplicate pills
     let breakdown_rows = sqlx::query(
-        "SELECT mnl.resource_id, tn.tree_id, p.name AS project_name,
+        "SELECT mnl.resource_id, p.id AS project_id, p.name AS project_name,
                 COUNT(DISTINCT mnl.node_id) AS node_count
          FROM mimir_node_links mnl
          JOIN tree_nodes tn ON tn.id = mnl.node_id
@@ -2151,7 +2291,7 @@ pub async fn get_resource_study_map(
          JOIN projects p ON p.id = t.project_id
          WHERE mnl.resource_id = ANY($1)
            AND mnl.relevance_score < 0.55
-         GROUP BY mnl.resource_id, tn.tree_id, p.name"
+         GROUP BY mnl.resource_id, p.id, p.name"
     )
     .bind(&top_resource_ids)
     .fetch_all(pool)
@@ -2161,11 +2301,11 @@ pub async fn get_resource_study_map(
     let mut breakdown_by_resource: std::collections::HashMap<String, Vec<StudyMapTreeBreakdown>> = std::collections::HashMap::new();
     for r in &breakdown_rows {
         let resource_id: String = r.try_get("resource_id").unwrap_or_default();
-        let tree_id: String = r.try_get("tree_id").unwrap_or_default();
+        let project_id: String = r.try_get("project_id").unwrap_or_default();
         let project_name: String = r.try_get("project_name").unwrap_or_default();
         let node_count: i64 = r.try_get("node_count").unwrap_or(0);
         breakdown_by_resource.entry(resource_id).or_default().push(StudyMapTreeBreakdown {
-            tree_id,
+            project_id,
             project_name,
             node_count,
         });
@@ -2190,7 +2330,7 @@ pub async fn get_resource_study_map(
             avg_relevance: rr.avg_relevance,
             relevance_tier,
             tree_breakdown: breakdown_by_resource.remove(&rr.resource_id).unwrap_or_default(),
-            supported_nodes: nodes_by_resource.remove(&rr.resource_id).unwrap_or_default(),
+            sections: sections_by_resource.remove(&rr.resource_id).unwrap_or_default(),
         })
     }).collect();
 
@@ -2198,5 +2338,161 @@ pub async fn get_resource_study_map(
         entries,
         total_resources_with_links,
         total_unlocked_nodes: total_unlocked,
+        total_frontier_nodes: frontier_count,
+    })
+}
+
+// ─── TailoredProjects ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TailoredProject {
+    pub project_name: String,
+    pub project_description: Option<String>,
+    pub yggdrasil_project_id: Option<String>,
+    pub matched_skills: Vec<String>,
+    pub missing_required_skills: Vec<String>,
+    pub match_score: f32,
+    pub talking_points: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TailoredProjects {
+    pub job_id: String,
+    pub company: String,
+    pub position: String,
+    pub required_skills_count: i32,
+    pub top_projects: Vec<TailoredProject>,
+}
+
+#[tauri::command]
+pub async fn get_tailored_projects(
+    job_id: String,
+    database: State<'_, Database>,
+) -> Result<TailoredProjects, String> {
+    use serde_json::Value;
+
+    // Load job metadata
+    let job_row = sqlx::query(
+        "SELECT company, position FROM job_applications WHERE id = $1"
+    )
+    .bind(&job_id)
+    .fetch_optional(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (company, position) = match job_row {
+        None => return Err(format!("Job {} not found", job_id)),
+        Some(r) => (
+            r.try_get::<String, _>("company").map_err(|e| e.to_string())?,
+            r.try_get::<String, _>("position").map_err(|e| e.to_string())?,
+        ),
+    };
+
+    // Load required skills for this job
+    let skills_rows = sqlx::query(
+        "SELECT skill_name FROM job_skills WHERE job_id = $1 AND is_required = true"
+    )
+    .bind(&job_id)
+    .fetch_all(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let required_skills: Vec<String> = skills_rows
+        .iter()
+        .map(|r| {
+            r.try_get::<String, _>("skill_name")
+                .map(|s| s.to_lowercase())
+                .map_err(|e| e.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let required_skills_count = required_skills.len() as i32;
+
+    // Load resume profile (most recent)
+    let resume_row = sqlx::query("SELECT parsed FROM resume_profile ORDER BY created_at DESC LIMIT 1")
+        .fetch_optional(&database.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let resume_projects: Vec<(String, Option<String>, Vec<String>, Option<String>)> = match resume_row {
+        None => vec![],
+        Some(r) => {
+            let parsed: Value = r.try_get("parsed").map_err(|e| e.to_string())?;
+            let empty_array: Vec<Value> = vec![];
+            let projects = parsed.get("projects").and_then(|p| p.as_array()).unwrap_or(&empty_array);
+            projects
+                .iter()
+                .filter_map(|p| {
+                    let name = p.get("name")?.as_str()?.to_string();
+                    let desc = p.get("description").and_then(|d| d.as_str()).map(String::from);
+                    let empty_tech: Vec<Value> = vec![];
+                    let tech_array = p
+                        .get("techStack")
+                        .or_else(|| p.get("tech_stack"))
+                        .and_then(|ts| ts.as_array())
+                        .unwrap_or(&empty_tech);
+                    let tech_stack: Vec<String> = tech_array
+                        .iter()
+                        .filter_map(|t| t.as_str().map(|s| s.to_lowercase()))
+                        .collect();
+                    let linked_id = p.get("linkedProjectId")
+                        .or_else(|| p.get("linked_project_id"))
+                        .and_then(|id| id.as_str())
+                        .map(String::from);
+                    Some((name, desc, tech_stack, linked_id))
+                })
+                .collect()
+        }
+    };
+
+    // Match projects to job skills
+    let mut tailored: Vec<TailoredProject> = resume_projects
+        .iter()
+        .map(|(name, desc, tech_stack, linked_id)| {
+            let tech_lower: Vec<String> = tech_stack.iter().map(|s| s.to_lowercase()).collect();
+            let matched_skills: Vec<String> = required_skills
+                .iter()
+                .filter(|rs| tech_lower.contains(rs))
+                .cloned()
+                .collect();
+            let missing_required_skills: Vec<String> = required_skills
+                .iter()
+                .filter(|rs| !tech_lower.contains(rs))
+                .cloned()
+                .collect();
+            let match_score = if required_skills.is_empty() {
+                0.0
+            } else {
+                matched_skills.len() as f32 / required_skills.len() as f32
+            };
+            let talking_points: Vec<String> = matched_skills
+                .iter()
+                .map(|s| format!("Demonstrates {} through {}", s, name))
+                .collect();
+
+            TailoredProject {
+                project_name: name.clone(),
+                project_description: desc.clone(),
+                yggdrasil_project_id: linked_id.clone(),
+                matched_skills,
+                missing_required_skills,
+                match_score,
+                talking_points,
+            }
+        })
+        .collect();
+
+    // Sort by match_score DESC, take top 3
+    tailored.sort_by(|a, b| b.match_score.partial_cmp(&a.match_score).unwrap_or(std::cmp::Ordering::Equal));
+    tailored.truncate(3);
+
+    Ok(TailoredProjects {
+        job_id,
+        company,
+        position,
+        required_skills_count,
+        top_projects: tailored,
     })
 }
