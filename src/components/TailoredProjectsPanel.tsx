@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { X, ExternalLink } from 'lucide-react';
 
 interface TailoredProject {
@@ -34,13 +34,27 @@ export function TailoredProjectsPanel({
 }: TailoredProjectsPanelProps) {
   const [copyNotification, setCopyNotification] = useState(false);
 
-  function handleCopyToClipboard() {
+  useEffect(() => {
+    if (!copyNotification) return;
+
+    const timeoutId = setTimeout(() => {
+      setCopyNotification(false);
+    }, 2000);
+
+    return () => clearTimeout(timeoutId);
+  }, [copyNotification]);
+
+  async function handleCopyToClipboard() {
     const text = tailoredData.topProjects
       .map((p) => `• ${p.projectName}: ${p.projectDescription || 'N/A'} (${p.matchedSkills.join(', ')}); ${p.talkingPoints.join('; ')}`)
       .join('\n');
-    navigator.clipboard.writeText(text);
-    setCopyNotification(true);
-    setTimeout(() => setCopyNotification(false), 2000);
+
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopyNotification(true);
+    } catch (error) {
+      console.error('Failed to copy to clipboard:', error);
+    }
   }
 
   function handleOpenResume() {
@@ -108,8 +122,8 @@ export function TailoredProjectsPanel({
                   <div className="mb-2">
                     <p className="text-xs text-slate-400 mb-1">Matched skills</p>
                     <div className="flex flex-wrap gap-1">
-                      {project.matchedSkills.map((skill, i) => (
-                        <span key={i} className="bg-emerald-900 text-emerald-100 text-xs px-2 py-0.5 rounded-full">
+                      {project.matchedSkills.map((skill) => (
+                        <span key={`matched-skill-${idx}-${skill}`} className="bg-emerald-900 text-emerald-100 text-xs px-2 py-0.5 rounded-full">
                           {skill}
                         </span>
                       ))}
@@ -122,8 +136,8 @@ export function TailoredProjectsPanel({
                   <div className="mb-2">
                     <p className="text-xs text-slate-400 mb-1">Missing skills</p>
                     <div className="flex flex-wrap gap-1">
-                      {project.missingRequiredSkills.map((skill, i) => (
-                        <span key={i} className="bg-amber-900 text-amber-100 text-xs px-2 py-0.5 rounded-full">
+                      {project.missingRequiredSkills.map((skill) => (
+                        <span key={`missing-skill-${idx}-${skill}`} className="bg-amber-900 text-amber-100 text-xs px-2 py-0.5 rounded-full">
                           {skill}
                         </span>
                       ))}
@@ -136,8 +150,8 @@ export function TailoredProjectsPanel({
                   <div>
                     <p className="text-xs text-slate-400 mb-1">Talking points</p>
                     <ul className="text-xs text-slate-300 space-y-0.5 pl-4 list-disc">
-                      {project.talkingPoints.map((point, i) => (
-                        <li key={i}>{point}</li>
+                      {project.talkingPoints.map((point) => (
+                        <li key={`point-${idx}-${point}`}>{point}</li>
                       ))}
                     </ul>
                   </div>
