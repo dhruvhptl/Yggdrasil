@@ -3,7 +3,9 @@
 // Replaces several round-trip fetches the frontend used to do separately.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sqlx::Row;
+use std::collections::HashSet;
 use tauri::State;
 
 use crate::database::Database;
@@ -2371,7 +2373,6 @@ pub async fn get_tailored_projects(
     job_id: String,
     database: State<'_, Database>,
 ) -> Result<TailoredProjects, String> {
-    use serde_json::Value;
 
     // Load job metadata
     let job_row = sqlx::query(
@@ -2451,15 +2452,16 @@ pub async fn get_tailored_projects(
     let mut tailored: Vec<TailoredProject> = resume_projects
         .iter()
         .map(|(name, desc, tech_stack, linked_id)| {
-            let tech_lower: Vec<String> = tech_stack.iter().map(|s| s.to_lowercase()).collect();
+            // Convert to HashSet for O(1) lookups (tech_stack is already lowercased)
+            let tech_set: HashSet<&str> = tech_stack.iter().map(|s| s.as_str()).collect();
             let matched_skills: Vec<String> = required_skills
                 .iter()
-                .filter(|rs| tech_lower.contains(rs))
+                .filter(|rs| tech_set.contains(rs.as_str()))
                 .cloned()
                 .collect();
             let missing_required_skills: Vec<String> = required_skills
                 .iter()
-                .filter(|rs| !tech_lower.contains(rs))
+                .filter(|rs| !tech_set.contains(rs.as_str()))
                 .cloned()
                 .collect();
             let match_score = if required_skills.is_empty() {
