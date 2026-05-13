@@ -5,8 +5,27 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { DragDropContext, Droppable, Draggable, DropResult } from '@hello-pangea/dnd';
 import { ExternalLink, Plus, X, RefreshCw, ChevronDown, Calendar, Trash2 } from 'lucide-react';
+import { TailoredProjectsPanel } from '../components/TailoredProjectsPanel';
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
+
+interface TailoredProject {
+  projectName: string;
+  projectDescription?: string;
+  yggdrasilProjectId?: string;
+  matchedSkills: string[];
+  missingRequiredSkills: string[];
+  matchScore: number;
+  talkingPoints: string[];
+}
+
+interface TailoredProjects {
+  jobId: string;
+  company: string;
+  position: string;
+  requiredSkillsCount: number;
+  topProjects: TailoredProject[];
+}
 
 interface JobApplication {
   id: string;
@@ -239,7 +258,15 @@ function AddJobForm({ season, onCreated, onClose }: AddJobFormProps) {
 
 // ─── JobCard ──────────────────────────────────────────────────────────────────
 
-function JobCard({ job, onClick }: { job: JobApplication; onClick: () => void }) {
+function JobCard({
+  job,
+  onClick,
+  onTailorClick,
+}: {
+  job: JobApplication;
+  onClick: () => void;
+  onTailorClick?: () => void;
+}) {
   const badge = followUpBadge(job);
   const overall = computeOverall(job.ratingLocation, job.ratingAlignment, job.ratingSalary, job.ratingRole);
   const rating = overall ?? 0;
@@ -268,6 +295,17 @@ function JobCard({ job, onClick }: { job: JobApplication; onClick: () => void })
           </span>
         )}
       </div>
+      {onTailorClick && (
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onTailorClick();
+          }}
+          className="mt-2 w-full bg-slate-700 hover:bg-slate-600 text-white rounded text-xs py-1 transition-colors"
+        >
+          Tailor Resume
+        </button>
+      )}
     </div>
   );
 }
@@ -607,9 +645,10 @@ interface BoardViewProps {
   season: string;
   onJobClick: (job: JobApplication) => void;
   onJobsChange: (jobs: JobApplication[]) => void;
+  onTailorClick?: (job: JobApplication) => void;
 }
 
-function BoardView({ jobs, season, onJobClick, onJobsChange }: BoardViewProps) {
+function BoardView({ jobs, season, onJobClick, onJobsChange, onTailorClick }: BoardViewProps) {
   const [showAddForm, setShowAddForm] = useState(false);
 
   function handleDragEnd(result: DropResult) {
@@ -689,7 +728,11 @@ function BoardView({ jobs, season, onJobClick, onJobsChange }: BoardViewProps) {
                                   opacity: dragSnapshot.isDragging ? 0.85 : 1,
                                 }}
                               >
-                                <JobCard job={job} onClick={() => onJobClick(job)} />
+                                <JobCard
+                                  job={job}
+                                  onClick={() => onJobClick(job)}
+                                  onTailorClick={onTailorClick ? () => onTailorClick(job) : undefined}
+                                />
                               </div>
                             )}
                           </Draggable>
@@ -1021,6 +1064,10 @@ export default function JobsPage() {
   const [selectedJobSkills, setSelectedJobSkills] = useState<JobSkill[]>([]);
   const [loading, setLoading] = useState(true);
   const [showSeasonMenu, setShowSeasonMenu] = useState(false);
+  const [tailorPanelOpen, setTailorPanelOpen] = useState(false);
+  const [tailorJob, setTailorJob] = useState<JobApplication | null>(null);
+  const [tailoredProjects, setTailoredProjects] = useState<TailoredProjects | null>(null);
+  const [tailorLoading, setTailorLoading] = useState(false);
 
   const loadAll = useCallback(async () => {
     setLoading(true);
@@ -1090,6 +1137,22 @@ export default function JobsPage() {
       .catch(console.error);
   }
 
+  async function handleTailorClick(job: JobApplication) {
+    setTailorJob(job);
+    setTailorLoading(true);
+    try {
+      const data = await invoke<TailoredProjects>('get_tailored_projects', {
+        jobId: job.id,
+      });
+      setTailoredProjects(data);
+      setTailorPanelOpen(true);
+    } catch (err) {
+      console.error('get_tailored_projects failed:', err);
+    } finally {
+      setTailorLoading(false);
+    }
+  }
+
   const tabs: Array<{ id: View; label: string }> = [
     { id: 'board', label: 'Board' },
     { id: 'analytics', label: 'Analytics' },
@@ -1157,6 +1220,7 @@ export default function JobsPage() {
               season={selectedSeason}
               onJobClick={(job) => setSelectedJob(job)}
               onJobsChange={setJobs}
+              onTailorClick={handleTailorClick}
             />
           )}
           {view === 'analytics' && (
@@ -1186,6 +1250,16 @@ export default function JobsPage() {
           onUpdate={handleJobUpdate}
           onSkillsRefresh={setSelectedJobSkills}
           onDelete={handleJobDelete}
+        />
+      )}
+
+      {/* Tailored Projects Panel */}
+      {tailorPanelOpen && tailorJob && tailoredProjects && (
+        <TailoredProjectsPanel
+          job={{ id: tailorJob.id, company: tailorJob.company, position: tailorJob.position }}
+          tailoredData={tailoredProjects}
+          loading={tailorLoading}
+          onClose={() => setTailorPanelOpen(false)}
         />
       )}
     </div>
