@@ -569,4 +569,3 @@ pub async fn save_tailored_projects(
 
     Ok(())
 }
-}
