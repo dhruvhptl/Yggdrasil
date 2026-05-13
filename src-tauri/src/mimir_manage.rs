@@ -3,7 +3,7 @@
 
 use serde_json::json;
 use sqlx::Row;
-use tauri::State;
+use tauri::{Emitter, State};
 use crate::constants::SCRAPER_URL;
 use crate::database::Database;
 use crate::mimir::{
@@ -17,6 +17,7 @@ pub async fn get_mimir_resources(
     let rows = sqlx::query(
         "SELECT mr.id, mr.title, mr.url, mr.type, mr.status, mr.user_notes, \
                 mr.created_at::text, mr.parent_id, mr.tags, mr.is_completed, \
+                mr.transcript_source, \
                 COALESCE(nc.node_count, 0)::int AS node_count \
          FROM mimir_resources mr \
          LEFT JOIN ( \
@@ -48,6 +49,7 @@ pub async fn get_mimir_resources(
             matched_section_title: None,
             matched_page_start: None,
             matched_page_end: None,
+            transcript_source: row.try_get("transcript_source").ok().flatten(),
         });
     }
 
@@ -62,6 +64,7 @@ pub async fn get_node_resources(
     let rows = sqlx::query(
         "SELECT mr.id, mr.title, mr.url, mr.type, mr.status, mr.user_notes, \
                 mr.created_at::text, mr.parent_id, mr.tags, mr.is_completed, \
+                mr.transcript_source, \
                 mnl.relevance_score, mnl.matched_section_title, \
                 mnl.matched_page_start, mnl.matched_page_end \
          FROM mimir_resources mr \
@@ -92,6 +95,7 @@ pub async fn get_node_resources(
             matched_section_title: row.try_get("matched_section_title").ok().flatten(),
             matched_page_start: row.try_get("matched_page_start").ok().flatten(),
             matched_page_end: row.try_get("matched_page_end").ok().flatten(),
+            transcript_source: row.try_get("transcript_source").ok().flatten(),
         });
     }
 
@@ -323,6 +327,223 @@ pub async fn fetch_playlist(url: String, client: tauri::State<'_, reqwest::Clien
         eprintln!("[fetch_playlist] decode error: {e}\nraw body: {raw}");
         format!("Failed to parse playlist response: {e}")
     })
+}
+
+// ─── Reading progress ─────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn mark_section_read(
+    resource_id: String,
+    section_title: String,
+    page_start: Option<i32>,
+    page_end: Option<i32>,
+    app: tauri::AppHandle,
+    database: State<'_, Database>,
+) -> Result<(), String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO resource_reading_progress (id, resource_id, section_title, page_start, page_end) \
+         VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT (resource_id, section_title) DO UPDATE SET completed_at = NOW()"
+    )
+    .bind(&id)
+    .bind(&resource_id)
+    .bind(&section_title)
+    .bind(page_start)
+    .bind(page_end)
+    .execute(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Find nodes linked to this section of this resource
+    let linked = sqlx::query(
+        "SELECT mnl.node_id, tn.tree_id, tn.progress \
+         FROM mimir_node_links mnl \
+         JOIN tree_nodes tn ON tn.id = mnl.node_id \
+         WHERE mnl.resource_id = $1 AND mnl.matched_section_title = $2"
+    )
+    .bind(&resource_id)
+    .bind(&section_title)
+    .fetch_all(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut affected_trees: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for row in &linked {
+        let node_id: String = row.try_get("node_id").map_err(|e| e.to_string())?;
+        let tree_id: String = row.try_get("tree_id").map_err(|e| e.to_string())?;
+        let current_progress: Option<i32> = row.try_get("progress").map_err(|e| e.to_string())?;
+
+        let new_progress = if current_progress.unwrap_or(0) == 0 {
+            // Node untouched — jump straight to 33 (one step)
+            33
+        } else {
+            // Bump by 33, cap at 100
+            (current_progress.unwrap_or(0) + 33).min(100)
+        };
+
+        sqlx::query("UPDATE tree_nodes SET progress = $1 WHERE id = $2")
+            .bind(new_progress)
+            .bind(&node_id)
+            .execute(&database.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        affected_trees.insert(tree_id.clone());
+
+        let _ = app.emit("ygg-checkpoint-completed", serde_json::json!({
+            "nodeId": node_id,
+            "treeId": tree_id,
+        }));
+    }
+
+    for tree_id in &affected_trees {
+        if let Err(e) = crate::orchestrator::recalculate_tree_progress_inner(&database.pool, tree_id).await {
+            println!("⚠️  [reading] recalculate_tree_progress failed for {}: {}", tree_id, e);
+        }
+        if let Err(e) = crate::orchestrator::recalculate_unlocks_inner(&database.pool, tree_id).await {
+            println!("⚠️  [reading] recalculate_unlocks failed for {}: {}", tree_id, e);
+        }
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn mark_sections_read_up_to(
+    resource_id: String,
+    section_title: String,
+    page_start: Option<i32>,
+    app: tauri::AppHandle,
+    database: State<'_, Database>,
+) -> Result<usize, String> {
+    // Collect all distinct sections at or before the given page_start.
+    // If page_start is None, only mark the exact section.
+    let sections: Vec<(String, Option<i32>, Option<i32>)> = if let Some(ps) = page_start {
+        let rows = sqlx::query(
+            "SELECT DISTINCT mc.section_title, \
+                    MIN(mc.page_start) AS pg_start, MAX(mc.page_end) AS pg_end \
+             FROM mimir_chunks mc \
+             WHERE mc.resource_id = $1 \
+               AND mc.section_title IS NOT NULL \
+               AND mc.page_start <= $2 \
+             GROUP BY mc.section_title"
+        )
+        .bind(&resource_id)
+        .bind(ps)
+        .fetch_all(&database.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        rows.iter().map(|r| {
+            let st: String = r.try_get("section_title").unwrap_or_default();
+            let pg_s: Option<i32> = r.try_get("pg_start").ok().flatten();
+            let pg_e: Option<i32> = r.try_get("pg_end").ok().flatten();
+            (st, pg_s, pg_e)
+        }).collect()
+    } else {
+        // No page info — just mark the named section
+        vec![(section_title.clone(), None, None)]
+    };
+
+    let count = sections.len();
+    for (st, pg_s, pg_e) in sections {
+        mark_section_read_inner(&resource_id, &st, pg_s, pg_e, &app, &database).await?;
+    }
+
+    Ok(count)
+}
+
+async fn mark_section_read_inner(
+    resource_id: &str,
+    section_title: &str,
+    page_start: Option<i32>,
+    page_end: Option<i32>,
+    app: &tauri::AppHandle,
+    database: &Database,
+) -> Result<(), String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO resource_reading_progress (id, resource_id, section_title, page_start, page_end) \
+         VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT (resource_id, section_title) DO UPDATE SET completed_at = NOW()"
+    )
+    .bind(&id)
+    .bind(resource_id)
+    .bind(section_title)
+    .bind(page_start)
+    .bind(page_end)
+    .execute(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let linked = sqlx::query(
+        "SELECT mnl.node_id, tn.tree_id, tn.progress \
+         FROM mimir_node_links mnl \
+         JOIN tree_nodes tn ON tn.id = mnl.node_id \
+         WHERE mnl.resource_id = $1 AND mnl.matched_section_title = $2"
+    )
+    .bind(resource_id)
+    .bind(section_title)
+    .fetch_all(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut affected_trees: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for row in &linked {
+        let node_id: String = row.try_get("node_id").map_err(|e| e.to_string())?;
+        let tree_id: String = row.try_get("tree_id").map_err(|e| e.to_string())?;
+        let current_progress: Option<i32> = row.try_get("progress").map_err(|e| e.to_string())?;
+
+        let new_progress = if current_progress.unwrap_or(0) == 0 {
+            33
+        } else {
+            (current_progress.unwrap_or(0) + 33).min(100)
+        };
+
+        sqlx::query("UPDATE tree_nodes SET progress = $1 WHERE id = $2")
+            .bind(new_progress)
+            .bind(&node_id)
+            .execute(&database.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        affected_trees.insert(tree_id.clone());
+
+        let _ = app.emit("ygg-checkpoint-completed", serde_json::json!({
+            "nodeId": node_id,
+            "treeId": tree_id,
+        }));
+    }
+
+    for tree_id in &affected_trees {
+        if let Err(e) = crate::orchestrator::recalculate_tree_progress_inner(&database.pool, tree_id).await {
+            println!("⚠️  [reading] recalculate_tree_progress failed for {}: {}", tree_id, e);
+        }
+        if let Err(e) = crate::orchestrator::recalculate_unlocks_inner(&database.pool, tree_id).await {
+            println!("⚠️  [reading] recalculate_unlocks failed for {}: {}", tree_id, e);
+        }
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_reading_progress(
+    resource_id: String,
+    database: State<'_, Database>,
+) -> Result<Vec<String>, String> {
+    let rows = sqlx::query(
+        "SELECT section_title FROM resource_reading_progress WHERE resource_id = $1 ORDER BY completed_at"
+    )
+    .bind(&resource_id)
+    .fetch_all(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(rows.iter().map(|r| r.try_get::<String, _>("section_title").unwrap_or_default()).collect())
 }
 
 #[tauri::command]

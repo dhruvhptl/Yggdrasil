@@ -18,6 +18,7 @@ import uvicorn
 from youtube_transcript_api import YouTubeTranscriptApi
 from googleapiclient.discovery import build as googleapi_build
 import fitz  # pymupdf
+import httpx
 
 app = FastAPI()
 
@@ -51,6 +52,8 @@ class FetchResponse(BaseModel):
     char_count: int
     page_type: str = "article"
     external_links: list[ExternalLink] = []
+    transcript_source: str | None = None  # 'youtube_transcript_api' | 'youtubetranscript_dev' | 'metadata_only'
+    transcript_mode: str | None = None    # 'captions' | 'asr' | 'none'
 
 
 class DiscoverRequest(BaseModel):
@@ -465,7 +468,13 @@ def _format_transcript(segments) -> str:
 
 
 def _fetch_youtube_transcript(video_id: str, url: str) -> FetchResponse:
-    """Fetch transcript + oEmbed metadata for a YouTube video. Runs in a thread."""
+    """Fetch transcript + oEmbed metadata for a YouTube video. Runs in a thread.
+
+    Fallback chain:
+      Step 1 — youtube-transcript-api (manual captions → any language)
+      Step 2 — youtubetranscript.dev REST API
+      Step 3 — metadata only (title + description)
+    """
     # Fetch title / channel via oEmbed
     title = f"YouTube: {video_id}"
     author = ""
@@ -479,15 +488,30 @@ def _fetch_youtube_transcript(video_id: str, url: str) -> FetchResponse:
     except Exception:
         pass
 
+    header = f"# {title}"
+    if author:
+        header += f"\nChannel: {author}"
+    header += "\n\n"
+
+    # ── Step 1: youtube-transcript-api ──────────────────────────────────────
     segments = None
 
-    # Attempt 1: English transcript (class-method API — works on v0.x and v1.x)
+    # 1a: manual captions in English
     try:
-        segments = list(YouTubeTranscriptApi.get_transcript(video_id, languages=["en", "en-US", "en-GB"]))
+        segments = list(YouTubeTranscriptApi.get_transcript(video_id))
+        print(f"[scraper] YouTube Step 1a (manual default) succeeded for {video_id}")
     except Exception:
         pass
 
-    # Attempt 2: any available language (instance API)
+    # 1b: explicit English variants
+    if segments is None:
+        try:
+            segments = list(YouTubeTranscriptApi.get_transcript(video_id, languages=["en", "en-US", "en-GB"]))
+            print(f"[scraper] YouTube Step 1b (en variants) succeeded for {video_id}")
+        except Exception:
+            pass
+
+    # 1c: any available language via instance API
     if segments is None:
         try:
             ytt_api = YouTubeTranscriptApi()
@@ -496,25 +520,64 @@ def _fetch_youtube_transcript(video_id: str, url: str) -> FetchResponse:
                 try:
                     fetched = t.fetch()
                     segments = list(fetched)
+                    print(f"[scraper] YouTube Step 1c (any language) succeeded for {video_id}")
                     break
                 except Exception:
                     continue
         except Exception:
             pass
 
-    header = f"# {title}"
-    if author:
-        header += f"\nChannel: {author}"
-    header += "\n\n"
-
-    if segments:
+    if segments is not None:
         full_text = header + _format_transcript(segments)
-        print(f"[scraper] Fetching {url} with YouTubeTranscript")
-        return FetchResponse(text=full_text, fetcher_used="YouTubeTranscript", char_count=len(full_text))
-    else:
-        full_text = "[No transcript available — metadata only]\n" + header
-        print(f"[scraper] Fetching {url} with YouTubeTranscript (metadata only)")
-        return FetchResponse(text=full_text, fetcher_used="YouTubeTranscript", char_count=len(full_text))
+        print(f"[scraper] Fetching {url} with YouTubeTranscript (youtube_transcript_api)")
+        return FetchResponse(
+            text=full_text,
+            fetcher_used="YouTubeTranscript",
+            char_count=len(full_text),
+            transcript_source="youtube_transcript_api",
+            transcript_mode="captions",
+        )
+
+    # ── Step 2: youtubetranscript.dev REST API ───────────────────────────────
+    try:
+        dev_resp = httpx.get(
+            f"https://api.youtubetranscript.dev/?videoID={video_id}",
+            timeout=10,
+            headers={"User-Agent": "Yggdrasil/1.0"},
+        )
+        if dev_resp.status_code == 200:
+            dev_data = dev_resp.json()
+            # Response shape: {"transcript": [{"text": "...", "start": ..., "dur": ...}], ...}
+            # or {"captions": [...]} depending on API version — try both keys
+            raw_segments = dev_data.get("transcript") or dev_data.get("captions") or []
+            if raw_segments:
+                transcript_text = _format_transcript(raw_segments)
+                if transcript_text.strip():
+                    # Detect ASR: API may include an "asr" boolean flag or "kind" field
+                    is_asr = bool(dev_data.get("asr")) or dev_data.get("kind") == "asr"
+                    mode = "asr" if is_asr else "captions"
+                    full_text = header + transcript_text
+                    print(f"[scraper] YouTube Step 2 (youtubetranscript.dev, mode={mode}) succeeded for {video_id}")
+                    return FetchResponse(
+                        text=full_text,
+                        fetcher_used="YouTubeTranscriptDev",
+                        char_count=len(full_text),
+                        transcript_source="youtubetranscript_dev",
+                        transcript_mode=mode,
+                    )
+    except Exception as e:
+        print(f"[scraper] YouTube Step 2 (youtubetranscript.dev) failed for {video_id}: {e}")
+
+    # ── Step 3: metadata only ────────────────────────────────────────────────
+    full_text = "[METADATA ONLY - no transcript available]\n" + header
+    print(f"[scraper] YouTube Step 3 (metadata only) for {url}")
+    return FetchResponse(
+        text=full_text,
+        fetcher_used="YouTubeTranscript",
+        char_count=len(full_text),
+        transcript_source="metadata_only",
+        transcript_mode="none",
+    )
 
 
 def _fetch_playlist_sync(playlist_id: str) -> PlaylistResponse:
@@ -592,6 +655,9 @@ async def fetch_url(request: FetchRequest):
         if video_id:
             resp = await asyncio.to_thread(_fetch_youtube_transcript, video_id, url)
             resp.page_type = "youtube_video"
+            resp_dict = resp.model_dump()
+            print(f"[scraper/youtube] response keys: {list(resp_dict.keys())}")
+            print(f"[scraper/youtube] transcript_source={resp_dict.get('transcript_source')!r} transcript_mode={resp_dict.get('transcript_mode')!r} char_count={resp_dict.get('char_count')}")
             return resp
 
     # Tier 1: Fast async HTTP with browser TLS fingerprinting (no semaphore — no browser)

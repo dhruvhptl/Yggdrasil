@@ -1106,6 +1106,18 @@ function NodePanel({ node, skillLocked, onSave, onClose, onAddChild, onDelete, o
     } catch { /* silently ignore */ }
   }
 
+  async function handleMarkSectionRead(r: MimirResource) {
+    if (!r.matchedSectionTitle) return;
+    try {
+      await invoke('mark_section_read', {
+        resourceId: r.id,
+        sectionTitle: r.matchedSectionTitle,
+        pageStart: r.matchedPageStart ?? null,
+        pageEnd: r.matchedPageEnd ?? null,
+      });
+    } catch { /* silently ignore */ }
+  }
+
   function handleSave() {
     onSave({ title, description, resources: resources.length > 0 ? resources : null });
   }
@@ -1510,6 +1522,25 @@ function NodePanel({ node, skillLocked, onSave, onClose, onAddChild, onDelete, o
                       </div>
                     )}
                   </button>
+
+                  {/* Mark section read button — PDF only, when section is known */}
+                  {hasSection && (
+                    <button
+                      onClick={() => handleMarkSectionRead(r)}
+                      title={`Mark "${r.matchedSectionTitle}" as read`}
+                      style={{
+                        flexShrink: 0, width: 20, height: 20,
+                        borderRadius: 4, border: '1px solid #1e3a2f',
+                        background: 'rgba(5,150,105,0.08)',
+                        color: '#059669',
+                        cursor: 'pointer', fontSize: 9, lineHeight: 1,
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        marginTop: 2,
+                      }}
+                    >
+                      ✓
+                    </button>
+                  )}
 
                   {/* Completion toggle */}
                   <button

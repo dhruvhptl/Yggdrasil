@@ -333,13 +333,18 @@ export interface TranscriptJobStats {
 export interface StudyMapNode {
   nodeId: string;
   title: string;
-  matchedSectionTitle: string | null;
-  matchedPageStart: number | null;
-  matchedPageEnd: number | null;
+}
+
+export interface StudyMapSection {
+  sectionTitle: string;
+  pageStart: number | null;
+  pageEnd: number | null;
+  nodeCount: number;
+  nodes: StudyMapNode[];
 }
 
 export interface StudyMapTreeBreakdown {
-  treeId: string;
+  projectId: string;
   projectName: string;
   nodeCount: number;
 }
@@ -353,11 +358,12 @@ export interface StudyMapEntry {
   avgRelevance: number;
   relevanceTier: 'green' | 'amber' | 'grey';
   treeBreakdown: StudyMapTreeBreakdown[];
-  supportedNodes: StudyMapNode[];
+  sections: StudyMapSection[];
 }
 
 export interface ResourceStudyMap {
   entries: StudyMapEntry[];
   totalResourcesWithLinks: number;
   totalUnlockedNodes: number;
+  totalFrontierNodes: number;
 }

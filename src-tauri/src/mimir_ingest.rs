@@ -291,10 +291,17 @@ pub async fn store_sections_and_embeddings(
 // ─── URL fetching ───────────────────────────────────────────────────────────
 
 #[derive(Debug)]
-struct FetchResult {
-    text: String,
-    page_type: String,
-    external_links: Vec<ScrapedExternalLink>,
+pub struct FetchResult {
+    pub text: String,
+    pub page_type: String,
+    pub external_links: Vec<ScrapedExternalLink>,
+    pub transcript_source: Option<String>,
+    pub transcript_mode: Option<String>,
+}
+
+/// Public re-export of fetch_url_content for use by the orchestrator's FetchTranscript job.
+pub async fn fetch_url_content_pub(client: &reqwest::Client, url: &str, force_dynamic: bool) -> Result<FetchResult, String> {
+    fetch_url_content(client, url, force_dynamic).await
 }
 
 /// Fetch URL via Python scraper (port 3002), fall back to reqwest + scraper crate.
@@ -323,14 +330,28 @@ async fn fetch_url_content(client: &reqwest::Client, url: &str, force_dynamic: b
                         .collect()
                 })
                 .unwrap_or_default();
+            let transcript_source = data["transcript_source"].as_str().map(|s| s.to_string());
+            let transcript_mode = data["transcript_mode"].as_str().map(|s| s.to_string());
+
+            if page_type == "youtube_video" {
+                println!(
+                    "[ingest/debug] raw scraper keys: {:?}",
+                    data.as_object().map(|m| m.keys().collect::<Vec<_>>())
+                );
+                println!(
+                    "[ingest/debug] transcript_source={:?} transcript_mode={:?}",
+                    transcript_source, transcript_mode
+                );
+            }
 
             println!(
-                "[scraper] {} → {} chars, type={}",
+                "[scraper] {} → {} chars, type={}{}",
                 data["fetcher_used"].as_str().unwrap_or("unknown"),
                 text.len(),
-                page_type
+                page_type,
+                transcript_source.as_deref().map(|s| format!(", transcript={}", s)).unwrap_or_default(),
             );
-            return Ok(FetchResult { text, page_type, external_links });
+            return Ok(FetchResult { text, page_type, external_links, transcript_source, transcript_mode });
         }
         Ok(resp) => {
             let err: serde_json::Value = resp.json().await.unwrap_or_default();
@@ -368,6 +389,8 @@ async fn fetch_url_content(client: &reqwest::Client, url: &str, force_dynamic: b
         text,
         page_type: "article".to_string(),
         external_links: vec![],
+        transcript_source: None,
+        transcript_mode: None,
     })
 }
 
@@ -468,18 +491,108 @@ pub async fn ingest_mimir_url(
     queue: tauri::State<'_, crate::orchestrator::JobQueue>,
 ) -> Result<IngestResult, String> {
     // Duplicate check by URL
-    let dup = sqlx::query("SELECT id, title FROM mimir_resources WHERE url = $1")
+    let dup = sqlx::query("SELECT id, title, transcript_source FROM mimir_resources WHERE url = $1 LIMIT 1")
         .bind(&url)
         .fetch_optional(&database.pool)
         .await
         .map_err(|e| e.to_string())?;
 
+    let is_youtube = url.contains("youtube.com") || url.contains("youtu.be");
+
     if let Some(row) = dup {
+        let existing_id: String = row.try_get("id").unwrap_or_default();
         let existing_title: String = row.try_get("title").unwrap_or_default();
+        let transcript_source: Option<String> = row.try_get("transcript_source").unwrap_or(None);
+
+        if is_youtube {
+            // Good transcript already exists — leave it alone.
+            let has_real_transcript = matches!(
+                transcript_source.as_deref(),
+                Some("youtube_transcript_api") | Some("youtubetranscript_dev")
+            );
+            if has_real_transcript {
+                return Err(format!("DUPLICATE:{}", existing_title));
+            }
+
+            // Metadata-only or no transcript yet — requeue for backfill without touching the resource.
+            let job_id = uuid::Uuid::new_v4().to_string();
+            let _ = sqlx::query(
+                "INSERT INTO transcript_jobs (id, resource_id, status) \
+                 VALUES ($1, $2, 'pending') ON CONFLICT DO NOTHING"
+            )
+            .bind(&job_id)
+            .bind(&existing_id)
+            .execute(&database.pool)
+            .await;
+
+            let _ = queue.send(crate::orchestrator::OrchestratorJob::FetchTranscript {
+                resource_id: existing_id.clone(),
+            }).await;
+
+            println!("📋 [ingest] YouTube duplicate — transcript requeued for {}", existing_id);
+            return Err(format!("DUPLICATE:{}", existing_title));
+        }
+
         return Err(format!("DUPLICATE:{}", existing_title));
     }
 
     println!("📥 Ingesting URL: {}", url);
+
+    if is_youtube {
+        // YouTube: store resource immediately with pending transcript job,
+        // fetch transcript asynchronously to avoid blocking the UI.
+        let page_title = match title.as_ref().filter(|t| !t.trim().is_empty()) {
+            Some(t) => t.trim().to_string(),
+            None => fetch_page_title(&*client, &url).await,
+        };
+
+        println!("  [youtube] title: \"{}\" — deferring transcript fetch", page_title);
+
+        let resource_id = uuid::Uuid::new_v4().to_string();
+
+        // Insert resource with transcript_mode='none'; transcript_source stays NULL until fetched.
+        sqlx::query(
+            "INSERT INTO mimir_resources (id, title, url, type, status, transcript_mode) \
+             VALUES ($1, $2, $3, $4, $5, $6)"
+        )
+        .bind(&resource_id)
+        .bind(&page_title)
+        .bind(&url)
+        .bind("webpage")
+        .bind("read")
+        .bind("none")
+        .execute(&database.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        // Enqueue transcript job
+        let job_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO transcript_jobs (id, resource_id, status) VALUES ($1, $2, 'pending')"
+        )
+        .bind(&job_id)
+        .bind(&resource_id)
+        .execute(&database.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        println!("📋 [ingest] transcript job {} queued for resource {}", job_id, resource_id);
+
+        // Enqueue the transcript fetch so it runs right away in the background
+        let _ = queue.send(crate::orchestrator::OrchestratorJob::FetchTranscript {
+            resource_id: resource_id.clone(),
+        }).await;
+
+        // Emit immediately — resource is usable even without transcript
+        let _ = app.emit("ygg-resource-ingested", serde_json::json!({ "resourceId": resource_id }));
+
+        return Ok(IngestResult {
+            id: resource_id,
+            title: page_title,
+            page_type: "youtube_video".to_string(),
+            external_links: vec![],
+        });
+    }
 
     let fetch_result = fetch_url_content(&*client, &url, force_dynamic.unwrap_or(false)).await?;
 
@@ -753,7 +866,7 @@ pub async fn extract_pdf_text(
 pub(crate) async fn rescrape_one(pool: &sqlx::PgPool, client: &reqwest::Client, resource_id: &str) -> RescrapeResult {
     // Load resource
     let resource_row = match sqlx::query(
-        "SELECT id, title, url, type FROM mimir_resources WHERE id = $1"
+        "SELECT id, title, url, type, transcript_source FROM mimir_resources WHERE id = $1"
     )
     .bind(resource_id)
     .fetch_optional(pool)
@@ -773,6 +886,7 @@ pub(crate) async fn rescrape_one(pool: &sqlx::PgPool, client: &reqwest::Client, 
     let res_type: String = resource_row.try_get("type").unwrap_or_default();
     let res_url: Option<String> = resource_row.try_get("url").ok();
     let res_title: String = resource_row.try_get("title").unwrap_or_default();
+    let transcript_source: Option<String> = resource_row.try_get("transcript_source").ok().flatten();
 
     if res_type != "webpage" {
         return RescrapeResult {
@@ -789,12 +903,34 @@ pub(crate) async fn rescrape_one(pool: &sqlx::PgPool, client: &reqwest::Client, 
         },
     };
 
-    // Skip YouTube videos — transcript was fetched at ingest time, not re-scrape-able
-    if url.contains("youtube.com/watch") || url.contains("youtu.be/") {
-        println!("⏭️  Skipping YouTube video: {}", res_title);
+    // YouTube: don't re-scrape inline. If we already have a real transcript, leave it alone.
+    // If transcript is still metadata_only (or null pending), enqueue a fresh FetchTranscript job.
+    let is_youtube = url.contains("youtube.com") || url.contains("youtu.be");
+    if is_youtube {
+        let already_fetched = transcript_source.as_deref()
+            .map(|s| s == "youtube_transcript_api" || s == "youtubetranscript_dev")
+            .unwrap_or(false);
+        if already_fetched {
+            return RescrapeResult {
+                success: true, changed: false,
+                old_chunks: 0, new_chunks: 0,
+                message: "YouTube resource already has transcript — skipping re-scrape".to_string(),
+            };
+        }
+        // metadata_only or null: enqueue a new job
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let _ = sqlx::query(
+            "INSERT INTO transcript_jobs (id, resource_id, status) VALUES ($1, $2, 'pending') \
+             ON CONFLICT DO NOTHING"
+        )
+        .bind(&job_id)
+        .bind(resource_id)
+        .execute(pool)
+        .await;
+        println!("[rescrape_one] YouTube transcript job queued for {}", resource_id);
         return RescrapeResult {
             success: true, changed: false, old_chunks: 0, new_chunks: 0,
-            message: "Skipped: YouTube video".to_string(),
+            message: "YouTube transcript fetch enqueued".to_string(),
         };
     }
 
@@ -816,13 +952,14 @@ pub(crate) async fn rescrape_one(pool: &sqlx::PgPool, client: &reqwest::Client, 
     let old_chunks: i64 = chunk_row.try_get("count").unwrap_or(0);
 
     // Fetch new content — don't delete before success
-    let new_text = match fetch_url_content(client, &url, false).await {
-        Ok(r) => r.text,
+    let fetch_result = match fetch_url_content(client, &url, false).await {
+        Ok(r) => r,
         Err(e) => return RescrapeResult {
             success: false, changed: false, old_chunks: old_chunks as i32, new_chunks: 0,
             message: format!("Fetch failed: {}", e),
         },
     };
+    let new_text = fetch_result.text.clone();
 
     if new_text.len() < 50 {
         return RescrapeResult {
@@ -877,10 +1014,25 @@ pub(crate) async fn rescrape_one(pool: &sqlx::PgPool, client: &reqwest::Client, 
         };
     }
 
-    let _ = sqlx::query("UPDATE mimir_resources SET updated_at = NOW() WHERE id = $1")
+    if fetch_result.transcript_source.is_some() {
+        let transcript_chars = fetch_result.text.len() as i32;
+        let _ = sqlx::query(
+            "UPDATE mimir_resources \
+             SET updated_at = NOW(), transcript_source = $1, transcript_mode = $2, transcript_chars = $3 \
+             WHERE id = $4"
+        )
+        .bind(&fetch_result.transcript_source)
+        .bind(&fetch_result.transcript_mode)
+        .bind(transcript_chars)
         .bind(resource_id)
         .execute(pool)
         .await;
+    } else {
+        let _ = sqlx::query("UPDATE mimir_resources SET updated_at = NOW() WHERE id = $1")
+            .bind(resource_id)
+            .execute(pool)
+            .await;
+    }
 
     println!("✅ Rescraped \"{}\": {} → {} chunks", res_title, old_chunks, new_chunks);
     RescrapeResult {

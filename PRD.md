@@ -1,6 +1,6 @@
 # Yggdrasil — Product Requirements Document
 **Version:** 2.6  
-**Updated:** April 2026
+**Updated:** May 2026
 
 ---
 
@@ -72,6 +72,7 @@ Yggdrasil puts it all in one place.
 | Mimir Library — Rescrape All | ✅ Done | Bulk rescrape with real-time progress events; YouTube videos excluded |
 | Mimir Library — Re-embed PDFs | ✅ Done | Re-embeds from sections_json or raw_text without re-uploading |
 | Mimir Library — Resource gap finder | ✅ Done | Surfaces resources most relevant to unmastered checkpoints (agentic suggestions) |
+| Mimir Library — Study Map | ✅ Done | Ranks resources by checkpoint coverage; groups matched checkpoints by section for reading-order guidance; frontier toggle; per-project filter |
 | Mimir Chat — Hybrid RAG | ✅ Done | RRF over pgvector cosine + Postgres FTS; Groq LLaMA 3.3-70b synthesis, section+page citations |
 | Mimir Chat — Reranking | ✅ Done | llama-3.1-8b-instant reranker, top-3 selection |
 | Mimir Chat — Session memory | ✅ Done | Persisted per (tree_id, node_id); last 10 messages injected into context |
@@ -102,6 +103,7 @@ Yggdrasil puts it all in one place.
 | God module splits | ✅ Done | brain.rs → llm_client + github + prompt_builders + tree_persistence; mimir.rs → mimir_ingest + mimir_retrieval + mimir_tags + mimir_manage |
 | Universal Skill Tree — Canvas V2 | ✅ Done | Canvas-rendered radial tree with domain classification, replacing D3 force galaxy |
 | Universal Skills — Domain-agnostic schema | ✅ Done | skill_domains table seeded; kind widened to 6 values; review_needed + status columns; skill_evidence first-class rows |
+| Universal Skills — Provenance columns | ✅ Done | origin + state columns live (migration 037); origin ∈ (resume|ontology|job_gap|resource|tree_quest|work); state ∈ (seed|adjacent); backfilled from evidence JSONB |
 | Universal Skills — Canonicalization | ✅ Done | skill_aliases table + merge UI; alias lookups case-insensitive |
 | Jobs Page | ✅ Done | Kanban + skill gap detection |
 | Resume Page | ✅ Done | Auto-parse, skill extraction |
@@ -229,13 +231,19 @@ A checkpoint represents a specific concept you need to genuinely understand. You
 
 A checkpoint is complete when you've satisfied the mastery criteria — a combination of working through the resources, completing the exercises, and your own judgment that you genuinely get it. You mark it done manually; there's no automatic completion.
 
-### Tree structure (unchanged)
+### Tree structure
 
 ```
-Trunk (project)
-  └── Branch (phase/domain)
-        └── Leaf (concept checkpoint)
+Trunk (phase)
+  └── Branch (skill — can be locked)
+        └── Leaf (concept checkpoint — never locked directly)
 ```
+
+- **Trunk** = a learning phase (e.g. "Foundations", "Core Algorithms"). Never locked.
+- **Branch** = a skill within that phase. The first skill per phase starts unlocked; subsequent skills start `is_locked=true`. A branch unlocks the moment its predecessor branch reaches 100% progress.
+- **Leaf** = a concept checkpoint. Leaves are always accessible when their parent branch is unlocked — `is_locked` is only ever set on branches. Progress on branches and trunks is the rolling average of their children, cascaded upward on every checkpoint completion.
+
+**Frontier:** A locked branch whose immediately-preceding sibling just reached 100% is the "frontier" — the next skill to unlock. In practice, the unlock cascade fires eagerly on checkpoint completion, so frontier windows collapse immediately and `frontier_count` is typically 0 at any given steady state.
 
 Checkpoints have no difficulty rating or estimated time. They're concepts — some take an afternoon, some take a week. You'll know when you're there.
 
@@ -255,21 +263,38 @@ Job descriptions feed in from the opposite direction as directional signal: requ
 
 ### Node States
 
-| State | Meaning | Primary Source |
-|---|---|---|
-| `seed` | Claimed on resume — baseline, not verified mastery | resume_profile parsed JSON |
-| `adjacent` | Ontology neighbor of a seed — probably relevant, not yet confirmed | skill_dependencies inference |
-| `gap` | Required by target JD(s) but absent or low-level in your graph | job_skills demand analysis |
-| `growth_target` | User-designated or planner-recommended next node to climb | user action / gap planner |
+| State | Meaning | Primary Source | Status |
+|---|---|---|---|
+| `seed` | Claimed on resume — baseline, not verified mastery | resume_profile parsed JSON | ✅ Live (migration 037) |
+| `adjacent` | Default for all other skills — ontology neighbor, co-op extract, tree quest | skill_dependencies / tree gen / work | ✅ Live (migration 037) |
+| `gap` | Required by target JD(s) but absent or low-level in your graph | job_skills demand analysis | Planned |
+| `growth_target` | User-designated or planner-recommended next node to climb | user action / gap planner | Planned |
+| `mastered` | Checkpoint completed at level ≥ 4 | tree quest completion | Planned |
 
 ### Edge Semantics
+
+`skill_dependencies.relationship` values:
 
 | Edge type | Direction | Meaning |
 |---|---|---|
 | `prerequisite` | A → B | Must understand A before B makes sense |
-| `unlocks` | A → B | Mastering A opens B as a reasonable next step |
+| `part_of` | A → B | A is a sub-concept of B |
+| `specialization` | A → B | A is a specific instance of B |
 | `related` | A ↔ B | Conceptually adjacent, no strict ordering |
-| `evidence` | Resource/Quest → Skill | This resource/quest provides evidence for the skill |
+| `co_occurs` | A ↔ B | Frequently appear together in practice |
+
+### Skill Origin Values
+
+`universal_skills.origin` tracks how a skill entered the graph:
+
+| Origin | Meaning |
+|---|---|
+| `resume` | Extracted from uploaded resume |
+| `tree_quest` | Created when climbing a project tree |
+| `work` | Extracted from co-op work resources |
+| `resource` | Inferred from a Mimir resource |
+| `ontology` | Inferred via skill dependency inference |
+| `job_gap` | Required by a job description |
 
 ### Build Roadmap
 

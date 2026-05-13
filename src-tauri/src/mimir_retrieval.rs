@@ -109,6 +109,11 @@ fn rrf_merge(
 
 // ─── Match node to resources ────────────────────────────────────────────────
 
+/// Cosine-distance cutoff for node↔resource chunk matching.
+/// Academic/technical resources often score in the 0.57–0.65 range, so 0.65 is
+/// the minimum threshold that recovers them while still keeping obvious noise out.
+const NODE_MATCH_THRESHOLD: f64 = 0.65;
+
 pub async fn match_node_impl(
     pool: &sqlx::PgPool,
     client: &reqwest::Client,
@@ -127,8 +132,8 @@ pub async fn match_node_impl(
     };
 
     let title: String = node_row.try_get("title").unwrap_or_default();
-    let description: Option<String> = node_row.try_get("description").ok();
-    let search_text = match description.filter(|d| !d.is_empty()) {
+    let description: Option<String> = node_row.try_get("description").ok().filter(|d: &String| !d.is_empty());
+    let search_text = match description.as_deref() {
         Some(desc) => format!("{}: {}", title, desc),
         None => title.clone(),
     };
@@ -147,7 +152,7 @@ pub async fn match_node_impl(
     let embedding = get_embedding(client, &search_text).await?;
     let vec_str = vector_str(&embedding);
 
-    // Vector search — per-resource best chunk (lowest cosine distance), threshold 0.55
+    // Vector search — per-resource best chunk (lowest cosine distance)
     let vec_rows = sqlx::query(
         "SELECT DISTINCT ON (mc.resource_id) \
                 mc.resource_id, mc.id AS chunk_id, mc.content, \
@@ -155,10 +160,11 @@ pub async fn match_node_impl(
                 (me.embedding <=> $1::vector) AS distance \
          FROM mimir_embeddings me \
          JOIN mimir_chunks mc ON mc.id = me.chunk_id \
-         WHERE (me.embedding <=> $1::vector) < 0.55 \
+         WHERE (me.embedding <=> $1::vector) < $2 \
          ORDER BY mc.resource_id, distance ASC"
     )
     .bind(&vec_str)
+    .bind(NODE_MATCH_THRESHOLD)
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
@@ -233,7 +239,7 @@ pub async fn match_node_impl(
         if !content_to_chunk.contains_key(&content) {
             let rid: String = r.try_get("resource_id").unwrap_or_default();
             let cid: String = r.try_get("chunk_id").unwrap_or_default();
-            content_to_chunk.insert(content, (rid, cid, 0.55)); // treat lexical-only as boundary distance
+            content_to_chunk.insert(content, (rid, cid, NODE_MATCH_THRESHOLD)); // treat lexical-only as boundary distance
         }
     }
 
@@ -292,6 +298,14 @@ pub async fn match_node_impl(
     }
 
     if matches.is_empty() {
+        println!(
+            "⚠️  [match_node] zero matches for '{}' (node_id={}, has_description={}, vec_candidates={}, lex_candidates={})",
+            title,
+            node_id,
+            description.is_some(),
+            vec_rows.len(),
+            lex_rows.len(),
+        );
         return Ok(vec![]);
     }
 
@@ -299,7 +313,7 @@ pub async fn match_node_impl(
     let resource_ids: Vec<String> = matches.iter().map(|m| m.resource_id.clone()).collect();
     let rows = sqlx::query(
         "SELECT mr.id, mr.title, mr.url, mr.type, mr.status, mr.created_at::text, \
-                mr.tags, mr.is_completed, \
+                mr.tags, mr.is_completed, mr.transcript_source, \
                 mnl.relevance_score, mnl.matched_section_title, mnl.matched_page_start, mnl.matched_page_end \
          FROM mimir_resources mr \
          JOIN mimir_node_links mnl ON mnl.resource_id = mr.id AND mnl.node_id = $2 \
@@ -330,6 +344,7 @@ pub async fn match_node_impl(
             matched_section_title: row.try_get("matched_section_title").ok().flatten(),
             matched_page_start: row.try_get("matched_page_start").ok().flatten(),
             matched_page_end: row.try_get("matched_page_end").ok().flatten(),
+            transcript_source: row.try_get("transcript_source").ok().flatten(),
         })
         .collect();
 
@@ -475,7 +490,7 @@ pub async fn mimir_chat(
         let graph_result: Result<(), String> = async {
             // Find the universal_skill matched to this node via concept_slug
             let skill_row = sqlx::query(
-                "SELECT us.id, us.name \
+                "SELECT us.id, us.name, us.concept_slug \
                  FROM universal_skills us \
                  JOIN tree_nodes tn ON tn.concept_slug = us.concept_slug \
                  WHERE tn.id = $1 AND us.concept_slug IS NOT NULL \
@@ -487,11 +502,19 @@ pub async fn mimir_chat(
             .map_err(|e| e.to_string())?;
 
             let (skill_id, _skill_name) = match skill_row {
-                Some(r) => (
-                    r.try_get::<String, _>("id").map_err(|e| e.to_string())?,
-                    r.try_get::<String, _>("name").map_err(|e| e.to_string())?,
-                ),
-                None => return Ok(()), // no skill matched to this node
+                Some(ref r) => {
+                    let id = r.try_get::<String, _>("id").map_err(|e| e.to_string())?;
+                    let name = r.try_get::<String, _>("name").map_err(|e| e.to_string())?;
+                    let slug = r.try_get::<String, _>("concept_slug").unwrap_or_default();
+                    println!("[graphrag] node={} concept_slug={} skill_match=found (skill={})",
+                        node_title.as_deref().unwrap_or(nid), slug, name);
+                    (id, name)
+                },
+                None => {
+                    println!("[graphrag] node={} concept_slug=none skill_match=not found",
+                        node_title.as_deref().unwrap_or(nid));
+                    return Ok(()); // no skill matched to this node
+                },
             };
 
             // Walk skill_dependencies backward (depth 1) to find prerequisites
@@ -507,6 +530,13 @@ pub async fn mimir_chat(
             .fetch_all(&database.pool)
             .await
             .map_err(|e| e.to_string())?;
+
+            let prereq_names: Vec<String> = prereq_rows.iter()
+                .filter_map(|r| r.try_get::<String, _>("name").ok())
+                .collect();
+            println!("[graphrag] prereq skills found: {} — {}",
+                prereq_names.len(),
+                if prereq_names.is_empty() { "none".to_string() } else { prereq_names.join(", ") });
 
             if prereq_rows.is_empty() {
                 return Ok(());
@@ -536,6 +566,13 @@ pub async fn mimir_chat(
 
                 if let Some(row) = chunk_row {
                     let content: String = row.try_get("content").unwrap_or_default();
+
+                    // Skip if this chunk content already appears in context_blocks (dedup against pre-matched)
+                    let fingerprint: String = content.chars().take(60).collect();
+                    if context_blocks.contains(fingerprint.as_str()) {
+                        continue;
+                    }
+
                     let section_title: Option<String> = row.try_get("section_title").ok().flatten();
                     let page_start: Option<i32> = row.try_get("page_start").ok().flatten();
                     let page_end: Option<i32> = row.try_get("page_end").ok().flatten();
@@ -574,9 +611,7 @@ pub async fn mimir_chat(
                 }
             }
 
-            if graph_chunks_used > 0 {
-                println!("  ↳ injected {} prerequisite graph chunks", graph_chunks_used);
-            }
+            println!("[graphrag] graph_chunks_used={}", graph_chunks_used);
             Ok(())
         }.await;
 

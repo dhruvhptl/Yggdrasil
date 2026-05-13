@@ -48,6 +48,8 @@ pub struct MimirResource {
     pub matched_page_start: Option<i32>,
     #[serde(default)]
     pub matched_page_end: Option<i32>,
+    #[serde(default)]
+    pub transcript_source: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

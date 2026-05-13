@@ -9,6 +9,7 @@
 // (rematch, reembed, autotag, rescrape, infer-deps) off the UI thread.
 // Jobs are processed one at a time; the worker never crashes on error.
 
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use sqlx::Row;
 use tauri::{AppHandle, Emitter};
@@ -22,6 +23,7 @@ pub(crate) enum OrchestratorJob {
     InferSkillDeps,
     AutoTagResources { resource_ids: Vec<String> },
     MatchResourceToNodes { resource_id: String },
+    FetchTranscript { resource_id: String },
 }
 
 // ─── JobQueue (managed Tauri state) ──────────────────────────────────────────
@@ -45,6 +47,37 @@ impl JobQueue {
 pub fn start_worker(pool: PgPool, app: AppHandle, client: reqwest::Client) -> JobQueue {
     let (tx, mut rx) = mpsc::channel::<OrchestratorJob>(64);
 
+    // Periodic poller: every 5 minutes, pick up to 3 pending/failed transcript jobs
+    // whose next_retry_at is in the past (or null) and enqueue them as FetchTranscript jobs.
+    {
+        let pool2 = pool.clone();
+        let tx2 = tx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+            interval.tick().await; // skip immediate first tick
+            loop {
+                interval.tick().await;
+                let rows = sqlx::query(
+                    "SELECT resource_id FROM transcript_jobs \
+                     WHERE status IN ('pending', 'failed') \
+                       AND (next_retry_at IS NULL OR next_retry_at <= NOW()) \
+                       AND attempts < 5 \
+                     ORDER BY created_at ASC \
+                     LIMIT 3"
+                )
+                .fetch_all(&pool2)
+                .await
+                .unwrap_or_default();
+
+                for row in rows {
+                    let resource_id: String = row.try_get("resource_id").unwrap_or_default();
+                    if resource_id.is_empty() { continue; }
+                    let _ = tx2.send(OrchestratorJob::FetchTranscript { resource_id }).await;
+                }
+            }
+        });
+    }
+
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
             match job {
@@ -65,11 +98,55 @@ pub fn start_worker(pool: PgPool, app: AppHandle, client: reqwest::Client) -> Jo
                     run_match_resource_to_nodes(&pool, &app, &client, &resource_id).await;
                     println!("🔍 [worker/debug] MatchResourceToNodes done resource={}", resource_id);
                 }
+                OrchestratorJob::FetchTranscript { resource_id } => {
+                    run_fetch_transcript(&pool, &app, &client, &resource_id).await;
+                }
             }
         }
     });
 
     JobQueue::new(tx)
+}
+
+// ─── TranscriptJobStats ───────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptJobStats {
+    pub pending: i64,
+    pub processing: i64,
+    pub done: i64,
+    pub failed: i64,
+    pub skipped: i64,
+}
+
+#[tauri::command]
+pub async fn get_transcript_job_status(
+    database: tauri::State<'_, crate::database::Database>,
+) -> Result<TranscriptJobStats, String> {
+    let rows = sqlx::query(
+        "SELECT status, COUNT(*) AS cnt FROM transcript_jobs GROUP BY status"
+    )
+    .fetch_all(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut stats = TranscriptJobStats {
+        pending: 0, processing: 0, done: 0, failed: 0, skipped: 0,
+    };
+    for row in rows {
+        let status: String = row.try_get("status").unwrap_or_default();
+        let cnt: i64 = row.try_get("cnt").unwrap_or(0);
+        match status.as_str() {
+            "pending"    => stats.pending    = cnt,
+            "processing" => stats.processing = cnt,
+            "done"       => stats.done       = cnt,
+            "failed"     => stats.failed     = cnt,
+            "skipped"    => stats.skipped    = cnt,
+            _ => {}
+        }
+    }
+    Ok(stats)
 }
 
 // ─── Tauri commands — manual job dispatch ────────────────────────────────────
@@ -434,7 +511,7 @@ pub async fn on_work_skills_extracted(pool: &PgPool, app: &AppHandle) {
 
 // ─── Private helpers ──────────────────────────────────────────────────────────
 
-async fn recalculate_tree_progress_inner(pool: &PgPool, tree_id: &str) -> Result<(), String> {
+pub(crate) async fn recalculate_tree_progress_inner(pool: &PgPool, tree_id: &str) -> Result<(), String> {
     let rows = sqlx::query(
         "SELECT id, parent_id, progress FROM tree_nodes WHERE tree_id = $1"
     )
@@ -488,7 +565,7 @@ async fn recalculate_tree_progress_inner(pool: &PgPool, tree_id: &str) -> Result
     Ok(())
 }
 
-async fn recalculate_unlocks_inner(pool: &PgPool, tree_id: &str) -> Result<(), String> {
+pub(crate) async fn recalculate_unlocks_inner(pool: &PgPool, tree_id: &str) -> Result<(), String> {
     sqlx::query(
         "UPDATE tree_nodes SET is_locked = false
          WHERE id IN (
@@ -712,6 +789,270 @@ async fn write_mimir_resource_evidence(pool: &PgPool, resource_id: &str) -> usiz
     }
 
     written
+}
+
+// ─── run_fetch_transcript ─────────────────────────────────────────────────────
+
+async fn run_fetch_transcript(pool: &PgPool, app: &AppHandle, client: &reqwest::Client, resource_id: &str) {
+    println!("🎬 [job/transcript] START resource={}", resource_id);
+
+    // Load URL and current transcript_source
+    let meta = match sqlx::query(
+        "SELECT mr.url, mr.transcript_source \
+         FROM mimir_resources mr \
+         WHERE mr.id = $1"
+    )
+    .bind(resource_id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(Some(r)) => r,
+        _ => {
+            println!("⚠️  [job/transcript] resource {} not found", resource_id);
+            return;
+        }
+    };
+
+    let url: Option<String> = meta.try_get("url").ok().flatten();
+    let transcript_source: Option<String> = meta.try_get("transcript_source").ok().flatten();
+
+    // Never downgrade: if we already have a real transcript, mark job skipped and bail.
+    let already_fetched = transcript_source.as_deref()
+        .map(|s| s == "youtube_transcript_api" || s == "youtubetranscript_dev")
+        .unwrap_or(false);
+    if already_fetched {
+        let _ = sqlx::query(
+            "UPDATE transcript_jobs SET status = 'skipped', updated_at = NOW() \
+             WHERE resource_id = $1 AND status NOT IN ('done','skipped')"
+        )
+        .bind(resource_id)
+        .execute(pool)
+        .await;
+        println!("⏭️  [job/transcript] resource {} already has transcript — skipped", resource_id);
+        return;
+    }
+
+    let url = match url.filter(|u| !u.is_empty()) {
+        Some(u) => u,
+        None => {
+            println!("⚠️  [job/transcript] resource {} has no URL", resource_id);
+            return;
+        }
+    };
+
+    // Mark processing and increment attempts
+    let _ = sqlx::query(
+        "UPDATE transcript_jobs \
+         SET status = 'processing', attempts = attempts + 1, updated_at = NOW() \
+         WHERE resource_id = $1 AND status NOT IN ('done','skipped')"
+    )
+    .bind(resource_id)
+    .execute(pool)
+    .await;
+
+    // Read current attempts count for retry logic
+    let attempts: i32 = sqlx::query(
+        "SELECT attempts FROM transcript_jobs WHERE resource_id = $1 ORDER BY created_at DESC LIMIT 1"
+    )
+    .bind(resource_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .and_then(|r| r.try_get("attempts").ok())
+    .unwrap_or(1);
+
+    // Call scraper /fetch
+    let fetch_result = crate::mimir_ingest::fetch_url_content_pub(client, &url, false).await;
+
+    match fetch_result {
+        Ok(result) => {
+            let source = result.transcript_source.as_deref().unwrap_or("unknown");
+            let is_real_transcript = source == "youtube_transcript_api" || source == "youtubetranscript_dev";
+
+            if source == "unknown" {
+                // transcript_source field was absent from the scraper response — likely a stale
+                // scraper process. Retry with backoff; give up permanently at 5 attempts.
+                println!("⚠️  [transcript] transcript_source missing from scraper response for resource {} (attempt {})", resource_id, attempts);
+                if attempts >= 5 {
+                    let _ = sqlx::query(
+                        "UPDATE transcript_jobs \
+                         SET status = 'failed', last_error = 'transcript_source missing after 5 attempts — permanent', \
+                             updated_at = NOW() \
+                         WHERE resource_id = $1"
+                    )
+                    .bind(resource_id)
+                    .execute(pool)
+                    .await;
+                    println!("❌ [transcript] {} giving up after {} attempts (transcript_source always missing)", resource_id, attempts);
+                } else {
+                    let retry_interval = if attempts >= 3 { "1 hour" } else { "15 minutes" };
+                    let _ = sqlx::query(&format!(
+                        "UPDATE transcript_jobs \
+                         SET status = 'failed', last_error = 'transcript_source field missing from scraper response', \
+                             next_retry_at = NOW() + INTERVAL '{}', \
+                             updated_at = NOW() \
+                         WHERE resource_id = $1",
+                        retry_interval
+                    ))
+                    .bind(resource_id)
+                    .execute(pool)
+                    .await;
+                }
+                return;
+            }
+
+            if is_real_transcript {
+                // Delete old chunks/embeddings and store new ones
+                let delete_result = sqlx::query(
+                    "DELETE FROM mimir_embeddings WHERE chunk_id IN \
+                     (SELECT id FROM mimir_chunks WHERE resource_id = $1)"
+                )
+                .bind(resource_id)
+                .execute(pool)
+                .await;
+                if let Err(e) = delete_result {
+                    println!("⚠️  [job/transcript] delete embeddings failed: {}", e);
+                }
+                let _ = sqlx::query("DELETE FROM mimir_chunks WHERE resource_id = $1")
+                    .bind(resource_id)
+                    .execute(pool)
+                    .await;
+
+                let mut tx = match pool.begin().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        println!("⚠️  [job/transcript] begin tx failed: {}", e);
+                        mark_transcript_job_failed(pool, resource_id, &e.to_string(), attempts).await;
+                        return;
+                    }
+                };
+                match crate::mimir_ingest::store_chunks_and_embeddings(&mut tx, client, resource_id, &result.text).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        println!("⚠️  [job/transcript] chunk/embed failed: {}", e);
+                        let _ = tx.rollback().await;
+                        mark_transcript_job_failed(pool, resource_id, &e, attempts).await;
+                        return;
+                    }
+                }
+                if let Err(e) = tx.commit().await {
+                    println!("⚠️  [job/transcript] commit failed: {}", e);
+                    mark_transcript_job_failed(pool, resource_id, &e.to_string(), attempts).await;
+                    return;
+                }
+
+                // Update transcript columns
+                let transcript_chars = result.text.len() as i32;
+                let _ = sqlx::query(
+                    "UPDATE mimir_resources \
+                     SET transcript_source = $1, transcript_mode = $2, transcript_chars = $3 \
+                     WHERE id = $4"
+                )
+                .bind(&result.transcript_source)
+                .bind(&result.transcript_mode)
+                .bind(transcript_chars)
+                .bind(resource_id)
+                .execute(pool)
+                .await;
+
+                // Mark job done
+                let _ = sqlx::query(
+                    "UPDATE transcript_jobs SET status = 'done', updated_at = NOW() \
+                     WHERE resource_id = $1"
+                )
+                .bind(resource_id)
+                .execute(pool)
+                .await;
+
+                println!("✅ [job/transcript] transcript fetched for {} (source={})", resource_id, source);
+
+                // Auto-match now that we have content
+                run_match_resource_to_nodes(pool, app, client, resource_id).await;
+
+                let _ = app.emit("ygg-resource-ingested", serde_json::json!({ "resourceId": resource_id }));
+            } else {
+                // metadata_only result
+                if attempts >= 3 {
+                    // Permanent failure — store metadata_only
+                    let transcript_chars = result.text.len() as i32;
+                    let _ = sqlx::query(
+                        "UPDATE mimir_resources \
+                         SET transcript_source = 'metadata_only', transcript_mode = 'none', \
+                             transcript_chars = $1 \
+                         WHERE id = $2"
+                    )
+                    .bind(transcript_chars)
+                    .bind(resource_id)
+                    .execute(pool)
+                    .await;
+
+                    let _ = sqlx::query(
+                        "UPDATE transcript_jobs \
+                         SET status = 'failed', last_error = 'metadata_only after 3 attempts', \
+                             updated_at = NOW() \
+                         WHERE resource_id = $1"
+                    )
+                    .bind(resource_id)
+                    .execute(pool)
+                    .await;
+
+                    println!("❌ [job/transcript] {} gave metadata_only after {} attempts — marking permanent", resource_id, attempts);
+                } else {
+                    // Retry in 30 minutes
+                    let _ = sqlx::query(
+                        "UPDATE transcript_jobs \
+                         SET status = 'failed', last_error = 'metadata_only', \
+                             next_retry_at = NOW() + INTERVAL '30 minutes', \
+                             updated_at = NOW() \
+                         WHERE resource_id = $1"
+                    )
+                    .bind(resource_id)
+                    .execute(pool)
+                    .await;
+                    println!("🔄 [job/transcript] {} metadata_only (attempt {}), retrying in 30min", resource_id, attempts);
+                }
+            }
+        }
+        Err(e) => {
+            // Check for rate-limit errors
+            let is_rate_limit = e.contains("429") || e.contains("IpBlocked") || e.contains("rate limit");
+            let retry_interval = if is_rate_limit {
+                "2 hours"
+            } else {
+                "15 minutes"
+            };
+            let _ = sqlx::query(&format!(
+                "UPDATE transcript_jobs \
+                 SET status = 'failed', last_error = $1, \
+                     next_retry_at = NOW() + INTERVAL '{}', \
+                     updated_at = NOW() \
+                 WHERE resource_id = $2",
+                retry_interval
+            ))
+            .bind(&e)
+            .bind(resource_id)
+            .execute(pool)
+            .await;
+            println!("⚠️  [job/transcript] fetch failed for {} (attempt {}, retry in {}): {}", resource_id, attempts, retry_interval, e);
+        }
+    }
+}
+
+async fn mark_transcript_job_failed(pool: &PgPool, resource_id: &str, error: &str, attempts: i32) {
+    let retry_interval = if attempts >= 3 { "2 hours" } else { "15 minutes" };
+    let _ = sqlx::query(&format!(
+        "UPDATE transcript_jobs \
+         SET status = 'failed', last_error = $1, \
+             next_retry_at = NOW() + INTERVAL '{}', \
+             updated_at = NOW() \
+         WHERE resource_id = $2",
+        retry_interval
+    ))
+    .bind(error)
+    .bind(resource_id)
+    .execute(pool)
+    .await;
 }
 
 async fn run_match_resource_to_nodes(pool: &PgPool, app: &AppHandle, client: &reqwest::Client, resource_id: &str) {

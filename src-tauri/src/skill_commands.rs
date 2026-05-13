@@ -86,6 +86,16 @@ pub struct SyncResult {
     pub source: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuggestedMerge {
+    pub canonical_id: String,
+    pub canonical_name: String,
+    pub alias_ids: Vec<String>,
+    pub alias_names: Vec<String>,
+    pub reason: String,
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Deterministic normalization: lowercase + trim + suffix stripping + abbrev expansion.
@@ -312,6 +322,63 @@ pub(crate) async fn sync_work_inner(pool: &PgPool) -> Result<SyncResult, String>
     Ok(SyncResult { upserted: count, source: "work".into() })
 }
 
+pub(crate) async fn sync_jobs_inner(pool: &PgPool) -> Result<SyncResult, String> {
+    let rows = sqlx::query(
+        "SELECT js.skill_name,
+                COUNT(DISTINCT js.job_id) AS job_count,
+                AVG(CASE WHEN js.is_required THEN 1.0 ELSE 0.0 END)::float8 AS required_ratio
+         FROM job_skills js
+         GROUP BY js.skill_name"
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut count = 0;
+    for row in &rows {
+        let skill_name: String = row.try_get("skill_name").map_err(|e| e.to_string())?;
+        let job_count: i64 = row.try_get("job_count").map_err(|e| e.to_string())?;
+        let required_ratio: f64 = row.try_get("required_ratio").unwrap_or(0.0);
+
+        let evidence = serde_json::json!({
+            "type": "job_demand",
+            "job_count": job_count,
+            "is_required_ratio": required_ratio
+        });
+
+        // Only insert missing skills; for existing ones preserve state if already seed,
+        // otherwise mark adjacent. Never overwrite evidence from other sources.
+        let id = Uuid::new_v4().to_string();
+        let normalized = normalize_skill_name(skill_name.trim());
+        let canonical = if normalized.is_empty() { skill_name.trim().to_string() } else { normalized };
+        let slug = canonical.to_lowercase().replace(' ', "-");
+        let evidence_arr = serde_json::json!([evidence]);
+
+        let result = sqlx::query(
+            "INSERT INTO universal_skills
+                 (id, name, concept_slug, level, evidence, last_updated, status, review_needed, origin, state)
+             VALUES ($1, $2, $3, 1, $4::jsonb, NOW(), 'unclassified', true, 'job_gap', 'adjacent')
+             ON CONFLICT (LOWER(name)) DO UPDATE SET
+                 evidence = universal_skills.evidence || $4::jsonb,
+                 state = CASE WHEN universal_skills.state = 'seed' THEN 'seed' ELSE 'adjacent' END,
+                 last_updated = NOW()"
+        )
+        .bind(&id)
+        .bind(&canonical)
+        .bind(&slug)
+        .bind(&evidence_arr)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        if result.rows_affected() > 0 {
+            count += 1;
+        }
+    }
+
+    Ok(SyncResult { upserted: count, source: "jobs".into() })
+}
+
 pub(crate) async fn recalculate_levels_inner(pool: &PgPool) -> Result<usize, String> {
     let rows = sqlx::query("SELECT id, evidence FROM universal_skills")
         .fetch_all(pool)
@@ -446,11 +513,28 @@ pub async fn sync_all_skills(
         println!("🌳 Pruned {} stale skills ({} dep rows)", deleted, pruned);
     }
 
+    let r4 = sync_jobs_inner(&database.pool).await?;
+
+    sync_concept_slugs_inner(&database.pool).await?;
     recalculate_levels_inner(&database.pool).await?;
     expand_seed_neighbors(&database.pool).await?;
 
-    println!("🌳 Synced all skills: resume={}, trees={}, work={}", r1.upserted, r2.upserted, r3.upserted);
-    Ok(vec![r1, r2, r3])
+    println!("🌳 Synced all skills: resume={}, trees={}, work={}, jobs={}", r1.upserted, r2.upserted, r3.upserted, r4.upserted);
+    Ok(vec![r1, r2, r3, r4])
+}
+
+#[tauri::command]
+pub async fn sync_skills_from_jobs(
+    database: State<'_, Database>,
+) -> Result<SyncResult, String> {
+    sync_jobs_inner(&database.pool).await
+}
+
+#[tauri::command]
+pub async fn backfill_concept_slugs(
+    database: State<'_, Database>,
+) -> Result<usize, String> {
+    sync_concept_slugs_inner(&database.pool).await
 }
 
 #[tauri::command]
@@ -681,10 +765,82 @@ pub(crate) async fn infer_skill_deps_inner(client: &reqwest::Client, pool: &PgPo
         all_pairs.extend(batch_pairs);
     }
 
-    sqlx::query("DELETE FROM skill_dependencies WHERE relationship = 'prerequisite'")
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    // ── Second pass: related / co_occurs edges ───────────────────────────────
+    let related_system_prompt = "Given a list of technical skills, identify related skills \
+        (conceptually similar or frequently used together). \
+        Return ONLY a JSON array: [{\"from\": \"skill_a\", \"to\": \"skill_b\", \"relationship\": \"related\"}]. \
+        Use exact skill names from the list. Max 40 relationships. Return ONLY the JSON array, no markdown.";
+
+    #[derive(Deserialize)]
+    struct RelatedTriple {
+        from: String,
+        to: String,
+        #[allow(dead_code)]
+        relationship: String,
+    }
+
+    let mut all_related: Vec<RelatedTriple> = Vec::new();
+
+    for (i, batch) in batches.iter().enumerate() {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let user_prompt = format!("Skills: {}", batch.join(", "));
+        let rel_t0 = std::time::Instant::now();
+        let response = client
+            .post(GROQ_API_URL)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "model": "llama-3.3-70b-versatile",
+                "messages": [
+                    { "role": "system", "content": related_system_prompt },
+                    { "role": "user",   "content": user_prompt }
+                ],
+                "temperature": 0.3,
+                "max_tokens": 1200
+            }))
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await;
+
+        match response {
+            Err(e) => {
+                crate::brain::log_prompt_call(
+                    pool.clone(), "skill_related", "llama-3.3-70b-versatile", "skill_related_v1",
+                    rel_t0.elapsed().as_millis() as i64, false, Some(e.to_string()), None,
+                );
+                println!("  ⚠️  Related pass batch {} failed (non-fatal): {}", i, e);
+                continue;
+            }
+            Ok(resp) => {
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                let content = body["choices"][0]["message"]["content"].as_str().unwrap_or("[]");
+                let clean = content.trim()
+                    .trim_start_matches("```json")
+                    .trim_start_matches("```")
+                    .trim_end_matches("```")
+                    .trim();
+                let batch_triples: Vec<RelatedTriple> = serde_json::from_str(clean).unwrap_or_default();
+                crate::brain::log_prompt_call(
+                    pool.clone(), "skill_related", "llama-3.3-70b-versatile", "skill_related_v1",
+                    rel_t0.elapsed().as_millis() as i64, true, None,
+                    Some(serde_json::json!({ "batch": i, "skills": batch.len() })),
+                );
+                println!("  🔗 Related batch {}: {} triples", i + 1, batch_triples.len());
+                all_related.extend(batch_triples);
+            }
+        }
+    }
+
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+
+    // Delete inferred prerequisite and related edges — preserve manually curated ones
+    sqlx::query(
+        "DELETE FROM skill_dependencies WHERE relationship IN ('prerequisite', 'related') AND is_manual = false"
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
 
     let mut count = 0;
     for pair in &all_pairs {
@@ -702,7 +858,7 @@ pub(crate) async fn infer_skill_deps_inner(client: &reqwest::Client, pool: &PgPo
             .bind(&dep_id)
             .bind(from_id)
             .bind(to_id)
-            .execute(pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -712,7 +868,35 @@ pub(crate) async fn infer_skill_deps_inner(client: &reqwest::Client, pool: &PgPo
         }
     }
 
-    println!("🔗 Inferred {} skill dependencies from {} total pairs ({} batches)", count, all_pairs.len(), batches.len());
+    for triple in &all_related {
+        let from_id = lower_to_id.get(&triple.from.to_lowercase());
+        let to_id = lower_to_id.get(&triple.to.to_lowercase());
+
+        if let (Some(from_id), Some(to_id)) = (from_id, to_id) {
+            if from_id == to_id { continue; }
+            let dep_id = Uuid::new_v4().to_string();
+            let result = sqlx::query(
+                "INSERT INTO skill_dependencies (id, source_skill_id, target_skill_id, relationship)
+                 VALUES ($1, $2, $3, 'related')
+                 ON CONFLICT (source_skill_id, target_skill_id) DO NOTHING"
+            )
+            .bind(&dep_id)
+            .bind(from_id)
+            .bind(to_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+
+            if result.rows_affected() > 0 {
+                count += 1;
+            }
+        }
+    }
+
+    tx.commit().await.map_err(|e| e.to_string())?;
+
+    println!("🔗 Inferred {} skill deps ({} prereq pairs, {} related triples, {} batches)",
+        count, all_pairs.len(), all_related.len(), batches.len());
     Ok(count)
 }
 
@@ -742,22 +926,220 @@ pub async fn get_skill_aliases(
     }).collect()
 }
 
+// ─── Deterministic duplicate detection ───────────────────────────────────────
+
+static STRIP_SUFFIXES: &[&str] = &[
+    " skills", " skill", " knowledge", " tools", " tool",
+    " principles", " systems", " system", " concepts", " concept",
+];
+
+fn strip_knowledge_suffix(s: &str) -> &str {
+    let lower = s.to_lowercase();
+    for suffix in STRIP_SUFFIXES {
+        if lower.ends_with(suffix) {
+            return &s[..s.len() - suffix.len()];
+        }
+    }
+    s
+}
+
+fn to_singular(s: &str) -> String {
+    // Only handle the common English plural patterns we care about
+    if s.ends_with("ies") && s.len() > 3 {
+        return format!("{}y", &s[..s.len() - 3]);
+    }
+    if s.ends_with("ses") && s.len() > 3 {
+        return s[..s.len() - 2].to_string();
+    }
+    if s.ends_with('s') && s.len() > 2 && !s.ends_with("ss") {
+        return s[..s.len() - 1].to_string();
+    }
+    s.to_string()
+}
+
 #[tauri::command]
-pub async fn merge_skills(
-    canonical_id: String,
-    alias_ids: Vec<String>,
+pub async fn suggest_skill_merges(
     database: State<'_, Database>,
-) -> Result<(), String> {
-    if alias_ids.is_empty() {
-        return Err("No alias IDs provided".to_string());
+) -> Result<Vec<SuggestedMerge>, String> {
+    suggest_skill_merges_inner(&database.pool).await
+}
+
+pub(crate) async fn suggest_skill_merges_inner(pool: &PgPool) -> Result<Vec<SuggestedMerge>, String> {
+    // Load all skills
+    let rows = sqlx::query(
+        "SELECT us.id, us.name FROM universal_skills us ORDER BY us.name"
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Load alias table: alias text → canonical_skill_id
+    let alias_rows = sqlx::query(
+        "SELECT LOWER(alias) AS alias_lower, canonical_skill_id FROM skill_aliases"
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let alias_map: std::collections::HashMap<String, String> = alias_rows.iter()
+        .filter_map(|r| {
+            let alias: String = r.try_get("alias_lower").ok()?;
+            let cid: String = r.try_get("canonical_skill_id").ok()?;
+            Some((alias, cid))
+        })
+        .collect();
+
+    struct Skill { id: String, name: String }
+    let skills: Vec<Skill> = rows.iter()
+        .filter_map(|r| {
+            let id: String = r.try_get("id").ok()?;
+            let name: String = r.try_get("name").ok()?;
+            Some(Skill { id, name })
+        })
+        .collect();
+
+    // Group candidates by a normalised key — first-match-wins across four rules.
+    // key → (canonical_idx, reason)
+    let mut groups: std::collections::HashMap<String, (usize, String)> = std::collections::HashMap::new();
+    // idx → list of (alias_idx, reason) to merge into canonical
+    let mut merges: std::collections::HashMap<usize, Vec<(usize, String)>> = std::collections::HashMap::new();
+
+    let id_to_idx: std::collections::HashMap<String, usize> = skills.iter()
+        .enumerate()
+        .map(|(i, s)| (s.id.clone(), i))
+        .collect();
+
+    for (i, skill) in skills.iter().enumerate() {
+        let name = &skill.name;
+        let name_lower = name.to_lowercase();
+
+        // Rule 1 — normalized name match
+        let norm = normalize_skill_name(name).to_lowercase();
+        if !norm.is_empty() {
+            if let Some(&(canon_i, ref _r)) = groups.get(&norm) {
+                if canon_i != i {
+                    merges.entry(canon_i).or_default().push((i, "normalized match".to_string()));
+                    continue;
+                }
+            } else {
+                groups.insert(norm.clone(), (i, "normalized match".to_string()));
+            }
+        }
+
+        // Rule 2 — alias collision: this skill's name matches an alias pointing to another skill
+        if let Some(canonical_id) = alias_map.get(&name_lower) {
+            if let Some(&canon_i) = id_to_idx.get(canonical_id) {
+                if canon_i != i {
+                    merges.entry(canon_i).or_default().push((i, "alias collision".to_string()));
+                    continue;
+                }
+            }
+        }
+
+        // Rule 3 — suffix stripping
+        let stripped = strip_knowledge_suffix(name).to_lowercase();
+        if stripped != name_lower && !stripped.is_empty() {
+            if let Some(&(canon_i, ref _r)) = groups.get(&stripped) {
+                if canon_i != i {
+                    // merge the longer (suffix) form into the shorter canonical
+                    merges.entry(canon_i).or_default().push((i, "suffix strip".to_string()));
+                    continue;
+                }
+            } else {
+                // Register stripped key pointing to this skill, but also check if
+                // another skill with the stripped name already exists
+                let mut found_shorter = false;
+                for (j, other) in skills.iter().enumerate() {
+                    if j == i { continue; }
+                    if other.name.to_lowercase() == stripped {
+                        // other is the shorter form → canonical
+                        merges.entry(j).or_default().push((i, "suffix strip".to_string()));
+                        found_shorter = true;
+                        break;
+                    }
+                }
+                if !found_shorter {
+                    groups.entry(stripped).or_insert((i, "suffix strip".to_string()));
+                }
+                continue;
+            }
+        }
+
+        // Rule 4 — plural/singular
+        let singular = to_singular(&name_lower);
+        if singular != name_lower {
+            // Is there already a skill with the singular form?
+            let mut found_singular = false;
+            for (j, other) in skills.iter().enumerate() {
+                if j == i { continue; }
+                if other.name.to_lowercase() == singular {
+                    merges.entry(j).or_default().push((i, "plural/singular".to_string()));
+                    found_singular = true;
+                    break;
+                }
+            }
+            if found_singular { continue; }
+        }
     }
 
-    // Fetch the canonical skill's current evidence
+    // Build result — deduplicate: each alias_idx should appear in at most one merge group
+    let mut used_as_alias: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut suggestions: Vec<SuggestedMerge> = Vec::new();
+
+    for (canon_i, alias_list) in &merges {
+        let canon = &skills[*canon_i];
+        let mut alias_ids: Vec<String> = Vec::new();
+        let mut alias_names: Vec<String> = Vec::new();
+        let mut reason = String::new();
+
+        for (alias_i, alias_reason) in alias_list {
+            if used_as_alias.contains(alias_i) { continue; }
+            if *alias_i == *canon_i { continue; }
+            alias_ids.push(skills[*alias_i].id.clone());
+            alias_names.push(skills[*alias_i].name.clone());
+            if reason.is_empty() { reason = alias_reason.clone(); }
+            used_as_alias.insert(*alias_i);
+        }
+
+        if alias_ids.is_empty() { continue; }
+
+        suggestions.push(SuggestedMerge {
+            canonical_id: canon.id.clone(),
+            canonical_name: canon.name.clone(),
+            alias_ids,
+            alias_names,
+            reason,
+        });
+    }
+
+    suggestions.sort_by(|a, b| a.canonical_name.cmp(&b.canonical_name));
+    println!("🔍 suggest_skill_merges: {} suggestions", suggestions.len());
+    Ok(suggestions)
+}
+
+#[tauri::command]
+pub async fn auto_merge_suggested(
+    database: State<'_, Database>,
+) -> Result<usize, String> {
+    let suggestions = suggest_skill_merges_inner(&database.pool).await?;
+    let count = suggestions.len();
+    for suggestion in suggestions {
+        merge_skills_inner(&suggestion.canonical_id, &suggestion.alias_ids, &database.pool).await?;
+    }
+    println!("✅ Auto-merged {} duplicate skill groups", count);
+    Ok(count)
+}
+
+// ─── Merge implementation (inner, pool-only) ──────────────────────────────────
+
+async fn merge_skills_inner(canonical_id: &str, alias_ids: &[String], pool: &PgPool) -> Result<(), String> {
+    if alias_ids.is_empty() { return Ok(()); }
+
     let canonical_row = sqlx::query(
         "SELECT name, evidence FROM universal_skills WHERE id = $1"
     )
-    .bind(&canonical_id)
-    .fetch_one(&database.pool)
+    .bind(canonical_id)
+    .fetch_one(pool)
     .await
     .map_err(|e| format!("Canonical skill not found: {}", e))?;
 
@@ -769,23 +1151,20 @@ pub async fn merge_skills(
         .cloned()
         .unwrap_or_default();
 
-    for alias_id in &alias_ids {
-        if *alias_id == canonical_id { continue; }
+    for alias_id in alias_ids {
+        if alias_id == canonical_id { continue; }
 
-        // Fetch alias skill data
         let alias_row = sqlx::query(
             "SELECT name, evidence FROM universal_skills WHERE id = $1"
         )
         .bind(alias_id)
-        .fetch_optional(&database.pool)
+        .fetch_optional(pool)
         .await
         .map_err(|e| e.to_string())?;
 
         let Some(alias_row) = alias_row else { continue; };
-
         let alias_name: String = alias_row.try_get("name").map_err(|e| e.to_string())?;
 
-        // Record alias in skill_aliases table
         let alias_entry_id = Uuid::new_v4().to_string();
         sqlx::query(
             "INSERT INTO skill_aliases (id, canonical_skill_id, alias)
@@ -793,13 +1172,12 @@ pub async fn merge_skills(
              ON CONFLICT (alias) DO UPDATE SET canonical_skill_id = EXCLUDED.canonical_skill_id"
         )
         .bind(&alias_entry_id)
-        .bind(&canonical_id)
+        .bind(canonical_id)
         .bind(&alias_name)
-        .execute(&database.pool)
+        .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
 
-        // Merge alias evidence into canonical
         let alias_evidence: Vec<serde_json::Value> = alias_row
             .try_get::<serde_json::Value, _>("evidence")
             .map_err(|e| e.to_string())?
@@ -808,7 +1186,6 @@ pub async fn merge_skills(
             .unwrap_or_default();
         merged_evidence.extend(alias_evidence);
 
-        // Re-point skill_dependencies: source edges
         sqlx::query(
             "UPDATE skill_dependencies SET source_skill_id = $1
              WHERE source_skill_id = $2
@@ -818,13 +1195,12 @@ pub async fn merge_skills(
                    AND target_skill_id = skill_dependencies.target_skill_id
                )"
         )
-        .bind(&canonical_id)
+        .bind(canonical_id)
         .bind(alias_id)
-        .execute(&database.pool)
+        .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
 
-        // Re-point skill_dependencies: target edges
         sqlx::query(
             "UPDATE skill_dependencies SET target_skill_id = $1
              WHERE target_skill_id = $2
@@ -834,38 +1210,46 @@ pub async fn merge_skills(
                    AND source_skill_id = skill_dependencies.source_skill_id
                )"
         )
-        .bind(&canonical_id)
+        .bind(canonical_id)
         .bind(alias_id)
-        .execute(&database.pool)
+        .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
 
-        // Delete alias skill (CASCADE removes stale dependency rows)
         sqlx::query("DELETE FROM universal_skills WHERE id = $1")
             .bind(alias_id)
-            .execute(&database.pool)
+            .execute(pool)
             .await
             .map_err(|e| e.to_string())?;
 
         println!("🔀 Merged '{}' → '{}' (canonical)", alias_name, canonical_name);
     }
 
-    // Write merged evidence back to canonical
     let merged_json = serde_json::Value::Array(merged_evidence);
     sqlx::query(
         "UPDATE universal_skills SET evidence = $1::jsonb, last_updated = NOW() WHERE id = $2"
     )
     .bind(&merged_json)
-    .bind(&canonical_id)
-    .execute(&database.pool)
+    .bind(canonical_id)
+    .execute(pool)
     .await
     .map_err(|e| e.to_string())?;
 
-    // Recalculate level for the canonical skill
-    recalculate_levels_inner(&database.pool).await?;
-
+    recalculate_levels_inner(pool).await?;
     println!("✅ Merge complete: {} aliases into '{}'", alias_ids.len(), canonical_name);
     Ok(())
+}
+
+#[tauri::command]
+pub async fn merge_skills(
+    canonical_id: String,
+    alias_ids: Vec<String>,
+    database: State<'_, Database>,
+) -> Result<(), String> {
+    if alias_ids.is_empty() {
+        return Err("No alias IDs provided".to_string());
+    }
+    merge_skills_inner(&canonical_id, &alias_ids, &database.pool).await
 }
 
 #[tauri::command]
@@ -1144,42 +1528,89 @@ pub async fn expand_skill_graph(
 }
 
 /// Copy concept_slug from tree_nodes onto universal_skills where the skill name
-/// matches the node title (case-insensitive, ILIKE).
+/// matches the node title. Uses two passes:
+///   Pass 1 — normalized name match (normalize_skill_name applied to both sides)
+///   Pass 2 — normalized slug match (skill name slugified vs node concept_slug)
 /// Called from on_tree_generated so newly generated trees immediately enrich
 /// the skill graph with concept identities from the concept graph.
 pub async fn sync_concept_slugs_inner(pool: &PgPool) -> Result<usize, String> {
-    // Find skills that don't yet have a concept_slug but whose name matches
-    // a tree_node that does.
-    let rows = sqlx::query(
-        "SELECT DISTINCT ON (us.id) us.id AS skill_id, tn.concept_slug
-         FROM universal_skills us
-         JOIN tree_nodes tn
-           ON tn.title ILIKE us.name
-          AND tn.concept_slug IS NOT NULL
-         WHERE us.concept_slug IS NULL
-         ORDER BY us.id, tn.concept_slug"
+    // Load all skills without a concept_slug
+    let skill_rows = sqlx::query(
+        "SELECT id, name FROM universal_skills WHERE concept_slug IS NULL"
     )
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
 
-    let mut updated = 0usize;
-    for row in &rows {
-        let skill_id: String = row.try_get("skill_id").map_err(|e| e.to_string())?;
-        let slug: String = row.try_get("concept_slug").map_err(|e| e.to_string())?;
-        sqlx::query(
-            "UPDATE universal_skills SET concept_slug = $1 WHERE id = $2 AND concept_slug IS NULL"
-        )
-        .bind(&slug)
-        .bind(&skill_id)
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-        updated += 1;
+    let total = skill_rows.len();
+
+    // Load all tree nodes that have a concept_slug
+    let node_rows = sqlx::query(
+        "SELECT title, concept_slug FROM tree_nodes WHERE concept_slug IS NOT NULL"
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Build lookup: normalized_title -> concept_slug (first win per normalized form)
+    let mut norm_title_to_slug: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // Also: slug -> concept_slug (pass 2: slugified name match)
+    let mut slug_to_slug: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    for row in &node_rows {
+        let title: String = row.try_get("title").unwrap_or_default();
+        let concept_slug: String = row.try_get("concept_slug").unwrap_or_default();
+        if title.is_empty() || concept_slug.is_empty() { continue; }
+
+        let norm = normalize_skill_name(&title).to_lowercase();
+        norm_title_to_slug.entry(norm).or_insert_with(|| concept_slug.clone());
+
+        // Slugified form of the title for pass 2 comparison
+        let slugified: String = title.to_lowercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '-' })
+            .collect::<String>()
+            .split('-')
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("-");
+        slug_to_slug.entry(slugified).or_insert_with(|| concept_slug.clone());
     }
 
-    if updated > 0 {
-        println!("🔖 sync_concept_slugs_inner: bridged concept_slug to {} skills", updated);
+    let mut updated = 0usize;
+    for row in &skill_rows {
+        let skill_id: String = row.try_get("id").unwrap_or_default();
+        let skill_name: String = row.try_get("name").unwrap_or_default();
+        if skill_id.is_empty() || skill_name.is_empty() { continue; }
+
+        // Pass 1: normalized name match
+        let norm_name = normalize_skill_name(&skill_name).to_lowercase();
+        let matched_slug = norm_title_to_slug.get(&norm_name).cloned().or_else(|| {
+            // Pass 2: slugified skill name vs node concept_slug
+            let slugified_name: String = skill_name.to_lowercase()
+                .chars()
+                .map(|c| if c.is_alphanumeric() { c } else { '-' })
+                .collect::<String>()
+                .split('-')
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("-");
+            slug_to_slug.get(&slugified_name).cloned()
+        });
+
+        if let Some(slug) = matched_slug {
+            sqlx::query(
+                "UPDATE universal_skills SET concept_slug = $1 WHERE id = $2 AND concept_slug IS NULL"
+            )
+            .bind(&slug)
+            .bind(&skill_id)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            updated += 1;
+        }
     }
+
+    println!("[graph] concept_slug backfill: {}/{} skills matched", updated, total);
     Ok(updated)
 }

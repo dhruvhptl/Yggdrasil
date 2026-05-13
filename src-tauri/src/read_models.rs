@@ -2411,42 +2411,38 @@ pub async fn get_tailored_projects(
 
     let required_skills_count = required_skills.len() as i32;
 
-    // Load resume profile (most recent)
-    let resume_row = sqlx::query("SELECT parsed FROM resume_profile ORDER BY created_at DESC LIMIT 1")
-        .fetch_optional(&database.pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    // Load resume projects (joined with profile to get resume_id)
+    let projects_rows = sqlx::query(
+        "SELECT rp.name, rp.description, rp.tech_stack, rp.linked_project_id
+         FROM resume_projects rp
+         JOIN resume_profile rprofile ON rp.resume_id = rprofile.id
+         ORDER BY rprofile.created_at DESC, rp.created_at
+         LIMIT 100"
+    )
+    .fetch_all(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
 
-    let resume_projects: Vec<(String, Option<String>, Vec<String>, Option<String>)> = match resume_row {
-        None => vec![],
-        Some(r) => {
-            let parsed: Value = r.try_get("parsed").map_err(|e| e.to_string())?;
-            let empty_array: Vec<Value> = vec![];
-            let projects = parsed.get("projects").and_then(|p| p.as_array()).unwrap_or(&empty_array);
-            projects
-                .iter()
-                .filter_map(|p| {
-                    let name = p.get("name")?.as_str()?.to_string();
-                    let desc = p.get("description").and_then(|d| d.as_str()).map(String::from);
-                    let empty_tech: Vec<Value> = vec![];
-                    let tech_array = p
-                        .get("techStack")
-                        .or_else(|| p.get("tech_stack"))
-                        .and_then(|ts| ts.as_array())
-                        .unwrap_or(&empty_tech);
-                    let tech_stack: Vec<String> = tech_array
-                        .iter()
-                        .filter_map(|t| t.as_str().map(|s| s.to_lowercase()))
-                        .collect();
-                    let linked_id = p.get("linkedProjectId")
-                        .or_else(|| p.get("linked_project_id"))
-                        .and_then(|id| id.as_str())
-                        .map(String::from);
-                    Some((name, desc, tech_stack, linked_id))
+    let resume_projects: Vec<(String, Option<String>, Vec<String>, Option<String>)> = projects_rows
+        .iter()
+        .filter_map(|r| {
+            let name: String = r.try_get("name").ok()?;
+            let description: Option<String> = r.try_get("description").ok();
+            let tech_stack_json: Value = r.try_get("tech_stack").ok()?;
+            let linked_project_id: Option<String> = r.try_get("linked_project_id").ok();
+
+            let tech_stack: Vec<String> = tech_stack_json
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
+                        .collect()
                 })
-                .collect()
-        }
-    };
+                .unwrap_or_default();
+
+            Some((name, description, tech_stack, linked_project_id))
+        })
+        .collect();
 
     // Match projects to job skills
     let mut tailored: Vec<TailoredProject> = resume_projects

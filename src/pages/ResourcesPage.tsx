@@ -4,7 +4,7 @@ import { useSearchParams } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { Trash2, Link, FileText, Globe, BookOpen, X, RefreshCw, CheckCircle2, Minus, XCircle, Filter, Search, ChevronDown, ChevronRight, ChevronUp, Play, Tag, Wand2, Check, Map as MapIcon, BookMarked, Loader2 } from 'lucide-react';
-import { MimirResource, TranscriptJobStats, ResourceStudyMap, StudyMapEntry } from '../types';
+import { MimirResource, TranscriptJobStats, ResourceStudyMap, StudyMapEntry, StudyMapSection } from '../types';
 import { validateOrLog, MimirResourceSchema } from '../lib/validators';
 import { log } from '../lib/logger';
 import { z } from 'zod';
@@ -120,16 +120,76 @@ function StudyMapPanel({
   expandedNodes: Set<string>;
   onToggleNodes: (id: string) => void;
 }) {
-  const allTrees = useMemo(() => {
+  // readProgress maps resourceId -> Set of completed section titles
+  const [readProgress, setReadProgress] = useState<Map<string, Set<string>>>(new Map());
+  const [markingSection, setMarkingSection] = useState<string | null>(null); // "resourceId|sectionTitle"
+
+  const allProjects = useMemo(() => {
     if (!studyMap) return [];
     const seen = new Map<string, string>();
     for (const entry of studyMap.entries) {
       for (const tb of entry.treeBreakdown) {
-        if (!seen.has(tb.treeId)) seen.set(tb.treeId, tb.projectName);
+        if (!seen.has(tb.projectId)) seen.set(tb.projectId, tb.projectName);
       }
     }
-    return [...seen.entries()].map(([treeId, projectName]) => ({ treeId, projectName }));
+    return [...seen.entries()].map(([projectId, projectName]) => ({ projectId, projectName }));
   }, [studyMap]);
+
+  // Load reading progress when a resource is expanded
+  async function loadReadProgress(resourceId: string) {
+    try {
+      const sections = await invoke<string[]>('get_reading_progress', { resourceId });
+      setReadProgress(prev => {
+        const next = new Map(prev);
+        next.set(resourceId, new Set(sections));
+        return next;
+      });
+    } catch (e) {
+      console.error('get_reading_progress failed', e);
+    }
+  }
+
+  function handleToggleNodes(resourceId: string) {
+    onToggleNodes(resourceId);
+    if (!expandedNodes.has(resourceId)) {
+      loadReadProgress(resourceId);
+    }
+  }
+
+  async function handleMarkRead(resourceId: string, section: StudyMapSection) {
+    const key = `${resourceId}|${section.sectionTitle}`;
+    setMarkingSection(key);
+    try {
+      await invoke('mark_section_read', {
+        resourceId,
+        sectionTitle: section.sectionTitle,
+        pageStart: section.pageStart ?? null,
+        pageEnd: section.pageEnd ?? null,
+      });
+      await loadReadProgress(resourceId);
+    } catch (e) {
+      console.error('mark_section_read failed', e);
+    } finally {
+      setMarkingSection(null);
+    }
+  }
+
+  async function handleMarkUpTo(resourceId: string, section: StudyMapSection) {
+    const key = `${resourceId}|${section.sectionTitle}|up_to`;
+    setMarkingSection(key);
+    try {
+      await invoke('mark_sections_read_up_to', {
+        resourceId,
+        sectionTitle: section.sectionTitle,
+        pageStart: section.pageStart ?? null,
+      });
+      await loadReadProgress(resourceId);
+    } catch (e) {
+      console.error('mark_sections_read_up_to failed', e);
+    } finally {
+      setMarkingSection(null);
+    }
+  }
 
   if (loading) {
     return (
@@ -145,17 +205,17 @@ function StudyMapPanel({
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center gap-3 flex-wrap">
-        {allTrees.length > 1 && (
+        {allProjects.length > 1 && (
           <div className="flex items-center gap-1.5 flex-wrap">
-            {allTrees.map(({ treeId, projectName }) => {
-              const active = treeFilter.includes(treeId);
+            {allProjects.map(({ projectId, projectName }) => {
+              const active = treeFilter.includes(projectId);
               return (
                 <button
-                  key={treeId}
+                  key={projectId}
                   onClick={() => onTreeFilterChange(
                     active
-                      ? treeFilter.filter(id => id !== treeId)
-                      : [...treeFilter, treeId]
+                      ? treeFilter.filter(id => id !== projectId)
+                      : [...treeFilter, projectId]
                   )}
                   className={`px-2 py-0.5 rounded-full text-xs font-medium transition-colors ${
                     active
@@ -181,7 +241,13 @@ function StudyMapPanel({
       </div>
 
       <p className="text-xs text-slate-500">
-        Top {studyMap.entries.length} resources covering {studyMap.totalUnlockedNodes} unlocked nodes
+        Top {studyMap.entries.length} resources covering{' '}
+        <span className="text-slate-400">{studyMap.totalUnlockedNodes} unlocked</span>
+        {frontier
+          ? <> + <span className={studyMap.totalFrontierNodes > 0 ? 'text-amber-400' : 'text-slate-600'}>{studyMap.totalFrontierNodes} frontier</span></>
+          : null
+        }
+        {' '}nodes
         {studyMap.totalResourcesWithLinks > 0 && ` · ${studyMap.totalResourcesWithLinks} total linked`}
       </p>
 
@@ -208,6 +274,7 @@ function StudyMapPanel({
         <div className="flex flex-col gap-3">
           {studyMap.entries.map((entry: StudyMapEntry, idx: number) => {
             const nodesExpanded = expandedNodes.has(entry.resourceId);
+            const doneSet = readProgress.get(entry.resourceId) ?? new Set<string>();
             return (
               <div
                 key={entry.resourceId}
@@ -244,7 +311,7 @@ function StudyMapPanel({
                   <div className="flex items-center gap-1.5 flex-wrap pl-7">
                     {entry.treeBreakdown.map(tb => (
                       <span
-                        key={tb.treeId}
+                        key={tb.projectId}
                         className="text-xs text-blue-300 bg-blue-950/40 border border-blue-800/40 rounded-full px-2 py-0.5"
                       >
                         {tb.projectName} · {tb.nodeCount}
@@ -253,33 +320,74 @@ function StudyMapPanel({
                   </div>
                 )}
 
-                {entry.supportedNodes.length > 0 && (
+                {entry.sections.length > 0 && (
                   <div className="pl-7">
                     <button
-                      onClick={() => onToggleNodes(entry.resourceId)}
+                      onClick={() => handleToggleNodes(entry.resourceId)}
                       className="flex items-center gap-1 text-xs text-slate-500 hover:text-slate-300 transition-colors mb-1"
                     >
                       {nodesExpanded
                         ? <ChevronUp className="w-3 h-3" />
                         : <ChevronDown className="w-3 h-3" />}
-                      {nodesExpanded ? 'Hide' : 'Show'} {entry.supportedNodes.length} quest{entry.supportedNodes.length !== 1 ? 's' : ''}
+                      {nodesExpanded ? 'Hide' : 'Show'} {entry.coverageCount} checkpoint{entry.coverageCount !== 1 ? 's' : ''}
                     </button>
                     {nodesExpanded && (
-                      <div className="flex flex-col gap-1">
-                        {entry.supportedNodes.map(node => (
-                          <div key={node.nodeId} className="flex items-center gap-2 text-xs text-slate-400">
-                            <span className="w-1 h-1 rounded-full bg-slate-600 flex-shrink-0" />
-                            <span className="truncate">{node.title}</span>
-                            {node.matchedSectionTitle && (
-                              <span className="text-slate-600 truncate">— {node.matchedSectionTitle}</span>
-                            )}
-                            {node.matchedPageStart != null && (
-                              <span className="text-slate-600 flex-shrink-0">
-                                p.{node.matchedPageStart}{node.matchedPageEnd != null && node.matchedPageEnd !== node.matchedPageStart ? `–${node.matchedPageEnd}` : ''}
-                              </span>
-                            )}
-                          </div>
-                        ))}
+                      <div className="flex flex-col gap-2 mt-1">
+                        {entry.sections.map((section: StudyMapSection) => {
+                          const isRead = doneSet.has(section.sectionTitle);
+                          const markingRead = markingSection === `${entry.resourceId}|${section.sectionTitle}`;
+                          const markingUpTo = markingSection === `${entry.resourceId}|${section.sectionTitle}|up_to`;
+                          return (
+                            <div key={section.sectionTitle} className="flex flex-col gap-1 group">
+                              <div className="flex items-center gap-2 text-xs font-medium">
+                                {/* Read indicator */}
+                                {isRead
+                                  ? <span className="text-emerald-500 flex-shrink-0" title="Read">✓</span>
+                                  : <span className="w-3.5 flex-shrink-0" />}
+                                <span className={`truncate ${isRead ? 'text-slate-600 line-through' : 'text-slate-400'}`}>
+                                  {section.sectionTitle}
+                                </span>
+                                {section.pageStart != null && (
+                                  <span className="text-slate-600 flex-shrink-0">
+                                    pp. {section.pageStart}{section.pageEnd != null && section.pageEnd !== section.pageStart ? `–${section.pageEnd}` : ''}
+                                  </span>
+                                )}
+                                <span className="text-slate-600 flex-shrink-0">· {section.nodeCount} checkpoint{section.nodeCount !== 1 ? 's' : ''}</span>
+                                {/* Action buttons — visible on hover */}
+                                {!isRead && (
+                                  <div className="ml-auto flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0">
+                                    <button
+                                      onClick={() => handleMarkRead(entry.resourceId, section)}
+                                      disabled={!!markingSection}
+                                      className="text-xs text-emerald-600 hover:text-emerald-400 disabled:opacity-40 px-1.5 py-0.5 rounded border border-emerald-900/50 hover:border-emerald-700/60 transition-colors"
+                                      title="Mark this section as read"
+                                    >
+                                      {markingRead ? '…' : '✓ Read'}
+                                    </button>
+                                    {section.pageStart != null && (
+                                      <button
+                                        onClick={() => handleMarkUpTo(entry.resourceId, section)}
+                                        disabled={!!markingSection}
+                                        className="text-xs text-slate-500 hover:text-slate-300 disabled:opacity-40 px-1.5 py-0.5 rounded border border-slate-700/50 hover:border-slate-600 transition-colors"
+                                        title="Mark all sections up to this page as read"
+                                      >
+                                        {markingUpTo ? '…' : '✓ Up to here'}
+                                      </button>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                              <div className="flex flex-col gap-0.5 pl-5">
+                                {section.nodes.map(node => (
+                                  <div key={node.nodeId} className="flex items-center gap-2 text-xs text-slate-500">
+                                    <span className="w-1 h-1 rounded-full bg-slate-700 flex-shrink-0" />
+                                    <span className="truncate">{node.title}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          );
+                        })}
                       </div>
                     )}
                   </div>
@@ -399,7 +507,7 @@ export default function ResourcesPage() {
     setStudyMapLoading(true);
     try {
       const result = await invoke<ResourceStudyMap>('get_resource_study_map', {
-        treeIds: studyMapTreeFilter.length > 0 ? studyMapTreeFilter : null,
+        projectIds: studyMapTreeFilter.length > 0 ? studyMapTreeFilter : null,
         includeFrontier: studyMapFrontier,
       });
       setStudyMap(result);

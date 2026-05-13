@@ -8,14 +8,14 @@ Read `PRD.md` for the full vision. This file is your technical bible.
 
 ---
 
-## Current State (v2.5)
+## Current State (v2.6)
 
 **All core features shipped (Phases 0-6 complete):**
 - Project creation, listing, edit, delete
 - AI tree generation from PRD text and GitHub repo URL (two-phase: concept graph → tree)
 - `analyze_repo` accepts optional `paper_url: Option<String>` and `paper_pdf: Option<String>`; paper context is injected into Phase 1 concept graph extraction as well as the Phase 2 repo profile + per-skill expansion calls
 - Custom canvas-based organic tree renderer — polar coordinate layout via `layoutTree()` (replaces the prior L-system); `NodePlacement[]` shape is unchanged so downstream draw code is untouched
-- Quest tracking with checkpoint completion, notes, unlock mechanics, progress cascade
+- Checkpoint completion, notes, unlock mechanics, progress cascade
 - Mimir: URL/PDF/text ingestion, TOC-aware chunking, 1024-dim embeddings, pgvector storage — fully in Rust, no sidecar
 - Mimir chat: hybrid retrieval (RRF over cosine + FTS), Groq LLaMA 3.3-70b synthesis, reranking, source citations (section title + page range)
 - Mimir chat: persistent session memory per (tree_id, node_id) — `mimir_chat_sessions` + `mimir_chat_messages` tables; last 10 messages injected into context on each query
@@ -23,27 +23,29 @@ Read `PRD.md` for the full vision. This file is your technical bible.
 - Mimir chat: full tree context awareness — `mimir_chat` receives `project_name` + `tree_name`; section 5 builds a phase-breakdown block (overall %, per-phase checkpoints done/total, library coverage) via inline SQL; section 6 branches on `node_is_active` for checkpoint-tutor vs. tree-only mode
 - Mimir chat: GraphRAG traversal — concept-level graph walk before cosine search; prerequisite/successor context injected into synthesis prompt
 - Retrieval logging: every `mimir_chat` retrieval writes a row to `mimir_retrieval_logs` with full stats (k, threshold, candidate counts, hybrid metrics, sources JSONB)
-- Auto-matching resources to quest nodes on tree generation — `mimir_node_links` now persists `matched_chunk_id`, `matched_section_title`, `matched_page_start`, `matched_page_end` so node panels show exact citations
+- Auto-matching resources to checkpoint nodes on tree generation — `mimir_node_links` now persists `matched_chunk_id`, `matched_section_title`, `matched_page_start`, `matched_page_end` so node panels show exact citations
 - Resource library: search, tag filters, type/sort dropdowns, auto-tagging, completion tracking, per-video playlist completion
 - Resource gap finder: surfaces Mimir resources most relevant to unmastered checkpoints (agentic suggestions)
+- Study Map: `get_resource_study_map` read-model command — ranks resources by coverage of unlocked checkpoints, groups matched checkpoints by section for reading-order guidance, optional frontier toggle, per-project filter
 - Work page: co-op tracker + D3 force galaxy visualization + AI skill extraction
 - Jobs page: kanban board + JD analysis + skill demand analytics + follow-up tracker
 - Resume page: paste/upload resume, AI parsing, skill pre-population
 - Ideas page: scratchpad with tags, pin, promote to project
-- Universal Skill Tree V2: canvas-rendered radial tree, domain classification, skill-to-concept edges, gap analysis; domain-agnostic schema (concept/technical/soft/practical/domain/unclassified kinds); skill canonicalization via `skill_aliases` table + merge UI; human-curation columns (`review_needed`, `status`); first-class `skill_evidence` rows
+- Universal Skill Tree V2: canvas-rendered radial tree, domain classification, skill-to-concept edges, gap analysis; domain-agnostic schema (concept/technical/soft/practical/domain/unclassified kinds); skill canonicalization via `skill_aliases` table + merge UI; human-curation columns (`review_needed`, `status`); first-class `skill_evidence` rows; `origin` + `state` columns (migration 037) — `origin` ∈ (resume|ontology|job_gap|resource|tree_quest|work), `state` ∈ (seed|adjacent)
 - Daily Eisenhower Matrix: 2x2 quadrant triage for quests + free-form tasks, day navigation
 - Tree export as ZIP
 - Tree versioning: `tree_versions` table (migration 034); `concept_id`/`concept_slug` stable identity columns; `regenerate_tree` carries mastered concepts forward via KG→tree bridge and runs diff-based state carry-over
 - Background async job queue (`orchestrator.rs`) — `JobQueue` struct with tokio mpsc channel; worker processes RematchAllNodes, ReembedResources, InferSkillDeps, AutoTagResources off the UI thread; emits `ygg-*` Tauri events for progress
-- Read-model helpers (`read_models.rs`) — `get_active_tree_for_project`, `get_node_chat_context`, `get_project_tree_summary`, `get_skill_graph_snapshot`; purpose-built query functions replacing ad-hoc frontend joins
+- Read-model helpers (`read_models.rs`) — `get_active_tree_for_project`, `get_node_chat_context`, `get_project_tree_summary`, `get_skill_graph_snapshot`, `get_node_neighborhood`, `get_resource_study_map`; purpose-built query functions replacing ad-hoc frontend joins
 - Prompt/model version logging — `prompt_logs` table; `log_prompt_call` fire-and-forget helper in `brain.rs`; all `call_llm` sites instrumented (concept_graph, repo_profile, prd_profile, tree_outline, skill_expansion, mimir_chat, mimir_rerank, auto_tag, skill_deps); `get_prompt_stats` Tauri command + dev-only "Model logs" tab in MimirChat.tsx
 - Shared `reqwest::Client` managed as Tauri state — injected into all commands that call external APIs (brain, mimir modules, orchestrator)
 - God module splits: `brain.rs` → `llm_client.rs` + `github.rs` + `prompt_builders.rs` + `tree_persistence.rs`; `mimir.rs` → `mimir_ingest.rs` + `mimir_retrieval.rs` + `mimir_tags.rs` + `mimir_manage.rs`
 - Postgres on Neon with pgvector
-- All migrations (001-036) run automatically on startup
+- All migrations (001-039) run automatically on startup
 - HNSW index on `tree_nodes.title_embedding vector(1024)` (migration 036) — used for async resource→node ANN matching
 - Background async job queue now includes `MatchResourceToNodes { resource_id: String }` — enqueued by `on_resource_ingested_async` after auto-tag completes; worker calls `run_match_resource_to_nodes` with in-memory reranking (same-tree boost -0.05, lexical overlap boost -0.03; top-5, threshold < 0.55)
 - `get_node_neighborhood` command in `read_models.rs` — returns `NodeNeighborhood { prerequisites, dependents, siblings }` each as `Vec<NeighborNode>`; traverses `concept_slug → universal_skills → skill_dependencies → tree_nodes`; top-3 resources per neighbor via `mimir_node_links`
+- YouTube transcript metadata: `transcript_source` / `transcript_mode` / `transcript_chars` columns on `mimir_resources` (migration 038); async `transcript_jobs` retry queue (migration 039)
 
 ---
 
@@ -86,7 +88,7 @@ Read `PRD.md` for the full vision. This file is your technical bible.
 │   │   ├── mimir_tags.rs              # Auto-tagging, tag filter helpers (split from mimir.rs)
 │   │   ├── mimir_manage.rs            # Rescrape, re-embed, resource CRUD, completion (split from mimir.rs)
 │   │   ├── orchestrator.rs            # Background job queue (JobQueue + start_worker) + cascade handlers + ygg-* events; MatchResourceToNodes variant
-│   │   ├── read_models.rs             # Purpose-built read-model Tauri commands (5 helpers, incl. get_node_neighborhood)
+│   │   ├── read_models.rs             # Purpose-built read-model Tauri commands (10 helpers: active tree, node chat context, tree summary, skill graph snapshot, node neighborhood, resource gaps, prereq path, growth recommendations, learning path, study map)
 │   │   ├── work_commands.rs           # Co-op/topic/resource/skill commands
 │   │   ├── job_commands.rs            # Job application commands
 │   │   ├── idea_commands.rs           # Ideas CRUD + promote to project
@@ -95,7 +97,7 @@ Read `PRD.md` for the full vision. This file is your technical bible.
 │   │   ├── daily_commands.rs          # Daily Eisenhower Matrix commands
 │   │   ├── export_commands.rs         # Tree ZIP export
 │   │   └── database.rs               # PgPool connection + migrations
-│   ├── migrations/                    # Auto-run on startup, sequential (001-036)
+│   ├── migrations/                    # Auto-run on startup, sequential (001-039)
 │   └── capabilities/
 │       └── default.json               # Tauri 2 capability grants (includes core:event:allow-listen)
 ├── scraper/                           # Python FastAPI scraper (port 3002)
@@ -140,6 +142,21 @@ tree_nodes        -- id, tree_id FK, parent_id FK, type (trunk/branch/leaf),
                   -- concept_id TEXT,              ← stable identity across tree versions
                   -- concept_slug TEXT,            ← URL-safe slug for same
                   -- title_embedding vector(1024)  ← HNSW index (migration 036) for ANN resource matching
+                  --
+                  -- Node types:
+                  --   trunk  = phase (top-level grouping, never locked)
+                  --   branch = skill  (can be is_locked=true; first skill per phase starts unlocked,
+                  --                    subsequent skills locked until predecessor reaches progress=100)
+                  --   leaf   = checkpoint (always is_locked=false; visibility gated by parent branch lock)
+                  --
+                  -- progress on branch/trunk nodes is the average of their children's progress,
+                  -- cascaded upward by recalculate_tree_progress_inner on every checkpoint completion.
+                  --
+                  -- Unlock mechanic (recalculate_unlocks_inner in orchestrator.rs):
+                  --   1. First branch under each trunk is always unlocked.
+                  --   2. When a branch reaches progress=100, the next sibling branch is unlocked.
+                  --   This fires eagerly on checkpoint completion — there is no steady-state where
+                  --   a branch is locked with a completed predecessor (frontier windows collapse immediately).
 tree_edges        -- id, tree_id FK, source_node_id FK, target_node_id FK
 disciplines       -- id, name, description, color
 ```
@@ -148,8 +165,11 @@ disciplines       -- id, name, description, color
 ```sql
 mimir_resources   -- id, title, url, type, status, user_notes, content_hash, parent_id,
                   -- tags TEXT[], is_completed, created_at, updated_at,
-                  -- raw_text TEXT,          ← full extracted text (PDFs only)
-                  -- sections_json JSONB     ← TOC-aware section structure (PDFs only)
+                  -- raw_text TEXT,               ← full extracted text (PDFs only)
+                  -- sections_json JSONB          ← TOC-aware section structure (PDFs only)
+                  -- transcript_source TEXT       ← youtube_transcript_api | youtubetranscript_dev | metadata_only (migration 038)
+                  -- transcript_mode TEXT         ← captions | asr | none (migration 038)
+                  -- transcript_chars INT         ← length of fetched transcript (migration 038)
 mimir_chunks      -- id, resource_id FK, content, chunk_index,
                   -- section_title TEXT,     ← heading this chunk falls under
                   -- page_start INT,         ← first page of chunk content
@@ -168,6 +188,10 @@ mimir_retrieval_logs   -- id, query, node_id, tree_id, top_k, threshold,
                        -- prematch_chunks_used, rerank_fallback_used,
                        -- lexical_candidates, hybrid_candidates_merged,
                        -- sources JSONB, created_at
+transcript_jobs        -- id, resource_id FK, status (pending|processing|done|failed|skipped),
+                       -- attempts INT, last_error TEXT, next_retry_at TIMESTAMPTZ,
+                       -- created_at, updated_at
+                       -- (migration 039) async retry queue for YouTube transcript fetches
 ```
 
 ### Work tables
@@ -208,9 +232,12 @@ universal_skills     -- id, name, domain TEXT (legacy), domain_id FK skill_domai
                      -- level (1-5), evidence JSONB (legacy), last_updated,
                      -- concept_slug TEXT UNIQUE, parent_skill_id FK,
                      -- review_needed BOOLEAN DEFAULT false,
-                     -- status TEXT CHECK(active|unclassified|archived)
-                     -- origin TEXT (planned: resume_seed|tree_quest|inferred|manual)
-                     -- state TEXT (planned: seed|adjacent|gap|growth_target|mastered)
+                     -- status TEXT CHECK(active|unclassified|archived),
+                     -- origin TEXT NOT NULL DEFAULT 'tree_quest'
+                     --   CHECK(origin IN ('resume','ontology','job_gap','resource','tree_quest','work'))
+                     -- state TEXT NOT NULL DEFAULT 'adjacent'
+                     --   CHECK(state IN ('seed','adjacent'))
+                     -- (migration 037 — backfilled from evidence JSONB)
 
 skill_aliases        -- id, canonical_skill_id FK, alias TEXT UNIQUE, created_at
                      -- alias lookups are case-insensitive (idx on LOWER(alias))
@@ -323,7 +350,7 @@ const result = await invoke<ReturnType>('command_name', { paramName: value });
 3. Call from frontend with `invoke('command_name', { params })`
 
 ### Add a Migration
-Create `src-tauri/migrations/NNN_description.sql` — runs automatically on startup. Never modify existing migrations. Current highest: **036**.
+Create `src-tauri/migrations/NNN_description.sql` — runs automatically on startup. Never modify existing migrations. Current highest: **039**.
 
 ### Add a New Page
 1. Create `src/pages/NewPage.tsx`
@@ -504,6 +531,7 @@ pub(crate) enum OrchestratorJob {
     RescrapeResources { resource_ids: Vec<String> },   // currently unused
     AutoTagResources { resource_ids: Vec<String> },
     MatchResourceToNodes { resource_id: String },      // enqueued after ingest auto-tag completes
+    FetchTranscript { resource_id: String },           // enqueued by periodic poller for YouTube transcript retry jobs
 }
 ```
 `start_worker(pool, app_handle)` is called in `main.rs` setup; the returned `JobQueue` is managed as Tauri state. Channel capacity: 64.
@@ -517,7 +545,7 @@ Workers emit progress/completion events via `app.emit()`. Frontend components su
 
 ## Read Models
 
-`src-tauri/src/read_models.rs` exposes five purpose-built Tauri commands:
+`src-tauri/src/read_models.rs` exposes ten purpose-built Tauri commands:
 
 | Command | Returns | Purpose |
 |---|---|---|
@@ -526,6 +554,11 @@ Workers emit progress/completion events via `app.emit()`. Frontend components su
 | `get_project_tree_summary` | `ProjectTreeSummary` | Full project + tree + phase completion stats |
 | `get_skill_graph_snapshot` | `SkillGraphSnapshot` | Skills + dependencies + gaps in one round trip |
 | `get_node_neighborhood` | `NodeNeighborhood` | Prerequisites, dependents, siblings for a leaf node — each with top-3 resources and skill level |
+| `get_tree_resource_gaps` | `TreeResourceGaps` | Leaf nodes grouped by resource match quality (green/weak/none) for the gap finder UI |
+| `get_prereq_path` | `PrereqPath` | BFS walk from a gap skill backward through prerequisite edges to current seed nodes |
+| `get_growth_recommendations` | `Vec<GrowthTarget>` | Job-demand-weighted skill targets; optional season filter; ranks by gap × demand |
+| `compute_learning_path` | `LearningPath` | Steiner-tree-style ordered acquisition path across all growth targets; feeds Daily Matrix |
+| `get_resource_study_map` | `ResourceStudyMap` | Resources ranked by checkpoint coverage; grouped matched checkpoints by section; optional frontier toggle + per-project filter |
 
 All structs use `#[serde(rename_all = "camelCase")]`.
 
