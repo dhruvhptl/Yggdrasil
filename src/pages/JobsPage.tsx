@@ -655,7 +655,7 @@ function JobDetailPanel({ job, skills, onClose, onUpdate, onSkillsRefresh, onDel
             <div className="mt-2 space-y-2">
               {tailorLoading && <p className="text-slate-500 text-xs">Loading…</p>}
               {!tailorLoading && tailoredData && tailoredData.topProjects.length === 0 && (
-                <p className="text-slate-500 text-xs">No matching projects found.</p>
+                <p className="text-slate-500 text-xs">No resume projects found. <a href="/resume" className="text-blue-400 hover:text-blue-300">Upload a resume</a> to see recommendations.</p>
               )}
               {!tailorLoading && tailoredData && tailoredData.topProjects.map((p, idx) => (
                 <div key={idx} className="bg-slate-800/60 border border-slate-700 rounded-lg p-2.5">
