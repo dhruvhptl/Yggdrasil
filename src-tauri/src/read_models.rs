@@ -2438,16 +2438,15 @@ pub async fn get_tailored_projects(
         .filter_map(|r| {
             let name: String = r.try_get("name").ok()?;
             let description: Option<String> = r.try_get("description").ok();
-            let tech_stack_json: Value = r.try_get("tech_stack").ok()?;
+            let tech_stack_json: Option<Value> = r.try_get("tech_stack").ok();
             let linked_project_id: Option<String> = r.try_get("linked_project_id").ok();
 
             let tech_stack: Vec<String> = tech_stack_json
-                .as_array()
-                .map(|arr| {
+                .and_then(|tj| tj.as_array().map(|arr| {
                     arr.iter()
                         .filter_map(|v| v.as_str().map(|s| normalize_skill(s)))
                         .collect()
-                })
+                }))
                 .unwrap_or_default();
 
             Some((name, description, tech_stack, linked_project_id))
@@ -2471,7 +2470,7 @@ pub async fn get_tailored_projects(
                 .cloned()
                 .collect();
             let match_score = if required_skills.is_empty() {
-                0.0
+                0.5
             } else {
                 matched_skills.len() as f32 / required_skills.len() as f32
             };
