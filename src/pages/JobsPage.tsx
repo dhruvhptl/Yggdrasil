@@ -5,7 +5,6 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { DragDropContext, Droppable, Draggable, DropResult } from '@hello-pangea/dnd';
 import { ExternalLink, Plus, X, RefreshCw, ChevronDown, Calendar, Trash2 } from 'lucide-react';
-import { TailoredProjectsPanel } from '../components/TailoredProjectsPanel';
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
 
@@ -261,11 +260,9 @@ function AddJobForm({ season, onCreated, onClose }: AddJobFormProps) {
 function JobCard({
   job,
   onClick,
-  onTailorClick,
 }: {
   job: JobApplication;
   onClick: () => void;
-  onTailorClick?: () => void;
 }) {
   const badge = followUpBadge(job);
   const overall = computeOverall(job.ratingLocation, job.ratingAlignment, job.ratingSalary, job.ratingRole);
@@ -295,17 +292,6 @@ function JobCard({
           </span>
         )}
       </div>
-      {onTailorClick && (
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onTailorClick();
-          }}
-          className="mt-2 w-full bg-slate-700 hover:bg-slate-600 text-white rounded text-xs py-1 transition-colors"
-        >
-          Tailor Resume
-        </button>
-      )}
     </div>
   );
 }
@@ -323,6 +309,9 @@ interface DetailPanelProps {
 
 function JobDetailPanel({ job, skills, onClose, onUpdate, onSkillsRefresh, onDelete }: DetailPanelProps) {
   const [deleting, setDeleting] = useState(false);
+  const [tailoredData, setTailoredData] = useState<TailoredProjects | null>(null);
+  const [tailorLoading, setTailorLoading] = useState(false);
+  const [tailorOpen, setTailorOpen] = useState(false);
 
   async function handleDelete() {
     if (!window.confirm(`Delete ${job.company} — ${job.position}?`)) return;
@@ -336,6 +325,15 @@ function JobDetailPanel({ job, skills, onClose, onUpdate, onSkillsRefresh, onDel
       setDeleting(false);
     }
   }
+
+  function handleCopyTailored() {
+    if (!tailoredData) return;
+    const text = tailoredData.topProjects
+      .map(p => `• ${p.projectName}: ${p.projectDescription || 'N/A'} (${p.matchedSkills.join(', ')}); ${p.talkingPoints.join('; ')}`)
+      .join('\n');
+    navigator.clipboard.writeText(text).catch(console.error);
+  }
+
   const [notes, setNotes] = useState(job.notes ?? '');
   const [jd, setJd] = useState(job.jobDescription ?? '');
   const [extracting, setExtracting] = useState(false);
@@ -375,6 +373,15 @@ function JobDetailPanel({ job, skills, onClose, onUpdate, onSkillsRefresh, onDel
     };
     setLocalRatings(r);
     localRatingsRef.current = r;
+  }, [job.id]);
+
+  // Fetch tailored projects
+  useEffect(() => {
+    setTailorLoading(true);
+    invoke<TailoredProjects>('get_tailored_projects', { jobId: job.id })
+      .then(setTailoredData)
+      .catch(console.error)
+      .finally(() => setTailorLoading(false));
   }, [job.id]);
 
   // update() always merges patch on top of the full current state so that
@@ -633,6 +640,70 @@ function JobDetailPanel({ job, skills, onClose, onUpdate, onSkillsRefresh, onDel
             )}
           </div>
         )}
+
+        {/* Recommended Projects */}
+        <div>
+          <button
+            onClick={() => setTailorOpen(v => !v)}
+            className="flex items-center justify-between w-full text-xs text-slate-400 hover:text-white transition-colors"
+          >
+            <span className="font-medium uppercase tracking-wide text-[10px]">Recommended Projects</span>
+            <ChevronDown className={`w-3 h-3 transition-transform ${tailorOpen ? 'rotate-180' : ''}`} />
+          </button>
+
+          {tailorOpen && (
+            <div className="mt-2 space-y-2">
+              {tailorLoading && <p className="text-slate-500 text-xs">Loading…</p>}
+              {!tailorLoading && tailoredData && tailoredData.topProjects.length === 0 && (
+                <p className="text-slate-500 text-xs">No matching projects found.</p>
+              )}
+              {!tailorLoading && tailoredData && tailoredData.topProjects.map((p, idx) => (
+                <div key={idx} className="bg-slate-800/60 border border-slate-700 rounded-lg p-2.5">
+                  <p className="text-white text-xs font-medium mb-1">{p.projectName}</p>
+                  <div className="flex items-center gap-2 mb-1.5">
+                    <div className="flex-1 bg-slate-700 rounded-full h-1.5">
+                      <div
+                        className="h-1.5 rounded-full"
+                        style={{
+                          width: `${Math.round(p.matchScore * 100)}%`,
+                          backgroundColor: p.matchScore >= 0.66 ? '#10b981' : p.matchScore >= 0.33 ? '#f59e0b' : '#ef4444',
+                        }}
+                      />
+                    </div>
+                    <span className="text-[10px] text-slate-400 whitespace-nowrap">
+                      {Math.round(p.matchScore * 100)}%
+                    </span>
+                  </div>
+                  {p.matchedSkills.length > 0 && (
+                    <div className="flex flex-wrap gap-1 mb-1">
+                      {p.matchedSkills.map((s, si) => (
+                        <span key={si} className="text-[10px] bg-emerald-900/60 text-emerald-300 px-1.5 py-0.5 rounded-full">{s}</span>
+                      ))}
+                    </div>
+                  )}
+                  {p.missingRequiredSkills.length > 0 && (
+                    <div className="flex flex-wrap gap-1">
+                      {p.missingRequiredSkills.slice(0, 3).map((s, si) => (
+                        <span key={si} className="text-[10px] bg-amber-900/60 text-amber-300 px-1.5 py-0.5 rounded-full">{s}</span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+
+              {tailoredData && tailoredData.topProjects.length > 0 && (
+                <div className="flex gap-2 pt-1">
+                  <button onClick={handleCopyTailored} className="flex-1 text-[10px] bg-slate-700 hover:bg-slate-600 text-white rounded py-1 transition-colors">
+                    Copy
+                  </button>
+                  <button onClick={() => { window.location.href = '/resume'; }} className="flex-1 text-[10px] bg-slate-700 hover:bg-slate-600 text-white rounded py-1 transition-colors">
+                    Resume
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -645,10 +716,9 @@ interface BoardViewProps {
   season: string;
   onJobClick: (job: JobApplication) => void;
   onJobsChange: (jobs: JobApplication[]) => void;
-  onTailorClick?: (job: JobApplication) => void;
 }
 
-function BoardView({ jobs, season, onJobClick, onJobsChange, onTailorClick }: BoardViewProps) {
+function BoardView({ jobs, season, onJobClick, onJobsChange }: BoardViewProps) {
   const [showAddForm, setShowAddForm] = useState(false);
 
   function handleDragEnd(result: DropResult) {
@@ -731,7 +801,6 @@ function BoardView({ jobs, season, onJobClick, onJobsChange, onTailorClick }: Bo
                                 <JobCard
                                   job={job}
                                   onClick={() => onJobClick(job)}
-                                  onTailorClick={onTailorClick ? () => onTailorClick(job) : undefined}
                                 />
                               </div>
                             )}
@@ -1064,10 +1133,6 @@ export default function JobsPage() {
   const [selectedJobSkills, setSelectedJobSkills] = useState<JobSkill[]>([]);
   const [loading, setLoading] = useState(true);
   const [showSeasonMenu, setShowSeasonMenu] = useState(false);
-  const [tailorPanelOpen, setTailorPanelOpen] = useState(false);
-  const [tailorJob, setTailorJob] = useState<JobApplication | null>(null);
-  const [tailoredProjects, setTailoredProjects] = useState<TailoredProjects | null>(null);
-  const [tailorLoading, setTailorLoading] = useState(false);
 
   const loadAll = useCallback(async () => {
     setLoading(true);
@@ -1137,22 +1202,6 @@ export default function JobsPage() {
       .catch(console.error);
   }
 
-  async function handleTailorClick(job: JobApplication) {
-    setTailorJob(job);
-    setTailorLoading(true);
-    try {
-      const data = await invoke<TailoredProjects>('get_tailored_projects', {
-        jobId: job.id,
-      });
-      setTailoredProjects(data);
-      setTailorPanelOpen(true);
-    } catch (err) {
-      console.error('get_tailored_projects failed:', err);
-    } finally {
-      setTailorLoading(false);
-    }
-  }
-
   const tabs: Array<{ id: View; label: string }> = [
     { id: 'board', label: 'Board' },
     { id: 'analytics', label: 'Analytics' },
@@ -1220,7 +1269,6 @@ export default function JobsPage() {
               season={selectedSeason}
               onJobClick={(job) => setSelectedJob(job)}
               onJobsChange={setJobs}
-              onTailorClick={handleTailorClick}
             />
           )}
           {view === 'analytics' && (
@@ -1250,16 +1298,6 @@ export default function JobsPage() {
           onUpdate={handleJobUpdate}
           onSkillsRefresh={setSelectedJobSkills}
           onDelete={handleJobDelete}
-        />
-      )}
-
-      {/* Tailored Projects Panel */}
-      {tailorPanelOpen && tailorJob && tailoredProjects && (
-        <TailoredProjectsPanel
-          job={{ id: tailorJob.id, company: tailorJob.company, position: tailorJob.position }}
-          tailoredData={tailoredProjects}
-          loading={tailorLoading}
-          onClose={() => setTailorPanelOpen(false)}
         />
       )}
     </div>

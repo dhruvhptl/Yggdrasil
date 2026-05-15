@@ -2368,6 +2368,16 @@ pub struct TailoredProjects {
     pub top_projects: Vec<TailoredProject>,
 }
 
+fn normalize_skill(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[tauri::command]
 pub async fn get_tailored_projects(
     job_id: String,
@@ -2404,7 +2414,7 @@ pub async fn get_tailored_projects(
         .iter()
         .map(|r| {
             r.try_get::<String, _>("skill_name")
-                .map(|s| s.to_lowercase())
+                .map(|s| normalize_skill(&s))
                 .map_err(|e| e.to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -2435,7 +2445,7 @@ pub async fn get_tailored_projects(
                 .as_array()
                 .map(|arr| {
                     arr.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
+                        .filter_map(|v| v.as_str().map(|s| normalize_skill(s)))
                         .collect()
                 })
                 .unwrap_or_default();
