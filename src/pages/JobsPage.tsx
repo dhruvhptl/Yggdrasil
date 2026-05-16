@@ -97,7 +97,8 @@ const STATUS_COLORS: Record<Status, string> = {
   rejected: '#ef4444',
 };
 
-const DEFAULT_SEASONS = ['Winter 2026', 'Fall 2025', 'Summer 2025', 'Winter 2025'];
+const DEFAULT_SEASONS = ['Winter 2026'];
+const TERMS = ['Winter', 'Spring', 'Summer', 'Fall'] as const;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -1133,6 +1134,9 @@ export default function JobsPage() {
   const [selectedJobSkills, setSelectedJobSkills] = useState<JobSkill[]>([]);
   const [loading, setLoading] = useState(true);
   const [showSeasonMenu, setShowSeasonMenu] = useState(false);
+  const [showAddSeason, setShowAddSeason] = useState(false);
+  const [newSeasonTerm, setNewSeasonTerm] = useState<typeof TERMS[number]>('Winter');
+  const [newSeasonYear, setNewSeasonYear] = useState<number>(new Date().getFullYear());
 
   const loadAll = useCallback(async () => {
     setLoading(true);
@@ -1195,6 +1199,15 @@ export default function JobsPage() {
     setSelectedJob(null);
   }
 
+  function handleAddSeason() {
+    const newSeason = `${newSeasonTerm} ${newSeasonYear}`;
+    if (!allSeasons.includes(newSeason)) {
+      setAllSeasons((prev) => [...prev, newSeason]);
+    }
+    setSelectedSeason(newSeason);
+    setShowAddSeason(false);
+  }
+
   function handleMarkedFollowUp(_id: string) {
     // Reload to get fresh date_follow_up = NOW()
     invoke<JobApplication[]>('get_jobs', { season: selectedSeason })
@@ -1237,20 +1250,63 @@ export default function JobsPage() {
             className="flex items-center gap-1.5 bg-slate-800 border border-slate-700 hover:border-slate-500 text-slate-300 text-sm px-3 py-1.5 rounded-lg transition-colors"
           >
             {selectedSeason}
-            <ChevronDown className="w-3.5 h-3.5" />
+            <ChevronDown className={`w-3.5 h-3.5 transition-transform ${showSeasonMenu ? 'rotate-180' : ''}`} />
           </button>
           {showSeasonMenu && (
-            <div className="absolute right-0 top-full mt-1 bg-slate-800 border border-slate-700 rounded-lg shadow-xl z-10 min-w-40 py-1">
+            <div className="absolute right-0 top-full mt-1 bg-slate-800 border border-slate-700 rounded-lg shadow-xl z-10 min-w-48 py-1">
               {allSeasons.map((s) => (
                 <button
                   key={s}
-                  onClick={() => { setSelectedSeason(s); setShowSeasonMenu(false); }}
+                  onClick={() => { setSelectedSeason(s); setShowSeasonMenu(false); setShowAddSeason(false); }}
                   className="w-full text-left px-3 py-1.5 text-sm text-slate-300 hover:bg-slate-700 transition-colors"
                   style={{ fontWeight: s === selectedSeason ? 600 : 400 }}
                 >
                   {s}
                 </button>
               ))}
+
+              {/* Divider */}
+              <div className="h-px bg-slate-700 my-1" />
+
+              {/* Add Season button */}
+              <button
+                onClick={() => setShowAddSeason((v) => !v)}
+                className="w-full text-left px-3 py-1.5 text-sm text-slate-400 hover:text-slate-300 hover:bg-slate-700 transition-colors flex items-center gap-2"
+              >
+                <Plus className="w-3 h-3" />
+                Add Season
+              </button>
+
+              {/* Add Season form */}
+              {showAddSeason && (
+                <div className="px-3 py-2 space-y-2 bg-slate-900/50">
+                  <div className="flex gap-2">
+                    <select
+                      value={newSeasonTerm}
+                      onChange={(e) => setNewSeasonTerm(e.target.value as typeof TERMS[number])}
+                      className="flex-1 bg-slate-700 border border-slate-600 rounded text-xs text-white px-2 py-1 focus:outline-none focus:border-slate-500"
+                    >
+                      {TERMS.map((t) => (
+                        <option key={t} value={t}>{t}</option>
+                      ))}
+                    </select>
+                    <input
+                      type="number"
+                      value={newSeasonYear}
+                      onChange={(e) => setNewSeasonYear(parseInt(e.target.value) || new Date().getFullYear())}
+                      min="2020"
+                      max="2100"
+                      className="w-20 bg-slate-700 border border-slate-600 rounded text-xs text-white px-2 py-1 focus:outline-none focus:border-slate-500"
+                    />
+                  </div>
+                  <button
+                    onClick={handleAddSeason}
+                    className="w-full bg-blue-600 hover:bg-blue-500 text-white rounded text-xs py-1 font-medium transition-colors"
+                  >
+                    Add
+                  </button>
+                </div>
+              )}
             </div>
           )}
         </div>
