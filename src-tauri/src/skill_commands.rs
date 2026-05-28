@@ -1366,7 +1366,7 @@ pub async fn classify_skill_domains(
 
         let t0 = std::time::Instant::now();
         let body = serde_json::json!({
-            "model": "llama-3.3-70b-versatile",
+            "model": "meta-llama/llama-4-scout-17b-16e-instruct",
             "messages": [
                 { "role": "user", "content": prompt }
             ],
@@ -1388,7 +1388,7 @@ pub async fn classify_skill_domains(
             Err(e) => {
                 crate::brain::log_prompt_call(
                     database.pool.clone(), "skill_domain_classification",
-                    "llama-3.3-70b-versatile", "skill_domain_class_v2",
+                    "meta-llama/llama-4-scout-17b-16e-instruct", "skill_domain_class_v2",
                     elapsed, false, Some(e.to_string()), None,
                 );
                 failed += chunk.len();
@@ -1398,7 +1398,7 @@ pub async fn classify_skill_domains(
                 Err(e) => {
                     crate::brain::log_prompt_call(
                         database.pool.clone(), "skill_domain_classification",
-                        "llama-3.3-70b-versatile", "skill_domain_class_v2",
+                        "meta-llama/llama-4-scout-17b-16e-instruct", "skill_domain_class_v2",
                         elapsed, false, Some(e.to_string()), None,
                     );
                     failed += chunk.len();
@@ -1428,7 +1428,7 @@ pub async fn classify_skill_domains(
         let output_tokens = json_val["usage"]["completion_tokens"].as_i64();
         crate::brain::log_prompt_call(
             database.pool.clone(), "skill_domain_classification",
-            "llama-3.3-70b-versatile", "skill_domain_class_v2",
+            "meta-llama/llama-4-scout-17b-16e-instruct", "skill_domain_class_v2",
             elapsed, true, None,
             Some(serde_json::json!({ "input_tokens": input_tokens, "output_tokens": output_tokens })),
         );

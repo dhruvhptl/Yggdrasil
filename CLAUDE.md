@@ -28,20 +28,22 @@ Read `PRD.md` for the full vision. This file is your technical bible.
 - Resource gap finder: surfaces Mimir resources most relevant to unmastered checkpoints (agentic suggestions)
 - Study Map: `get_resource_study_map` read-model command — ranks resources by coverage of unlocked checkpoints, groups matched checkpoints by section for reading-order guidance, optional frontier toggle, per-project filter
 - Work page: co-op tracker + D3 force galaxy visualization + AI skill extraction
-- Jobs page: kanban board + JD analysis + skill demand analytics + follow-up tracker
-- Resume page: paste/upload resume, AI parsing, skill pre-population
+- Jobs page: kanban board + JD analysis + skill demand analytics + follow-up tracker; dynamic season selection (term + year picker); tailored projects panel — `get_tailored_projects` ranks resume projects by skill overlap (HashSet match) against required + nice-to-have JD skills; `save_tailored_projects` persists user selection to `job_applications.tailored_projects` JSONB (migration 041)
+- Resume page: paste/upload resume, AI parsing, skill pre-population; parsed projects persisted to `resume_projects` table (id, name, description, tech_stack JSONB, role) — handles NULL tech_stack defensively
 - Ideas page: scratchpad with tags, pin, promote to project
 - Universal Skill Tree V2: canvas-rendered radial tree, domain classification, skill-to-concept edges, gap analysis; domain-agnostic schema (concept/technical/soft/practical/domain/unclassified kinds); skill canonicalization via `skill_aliases` table + merge UI; human-curation columns (`review_needed`, `status`); first-class `skill_evidence` rows; `origin` + `state` columns (migration 037) — `origin` ∈ (resume|ontology|job_gap|resource|tree_quest|work), `state` ∈ (seed|adjacent)
 - Daily Eisenhower Matrix: 2x2 quadrant triage for quests + free-form tasks, day navigation
 - Tree export as ZIP
 - Tree versioning: `tree_versions` table (migration 034); `concept_id`/`concept_slug` stable identity columns; `regenerate_tree` carries mastered concepts forward via KG→tree bridge and runs diff-based state carry-over
 - Background async job queue (`orchestrator.rs`) — `JobQueue` struct with tokio mpsc channel; worker processes RematchAllNodes, ReembedResources, InferSkillDeps, AutoTagResources off the UI thread; emits `ygg-*` Tauri events for progress
-- Read-model helpers (`read_models.rs`) — `get_active_tree_for_project`, `get_node_chat_context`, `get_project_tree_summary`, `get_skill_graph_snapshot`, `get_node_neighborhood`, `get_resource_study_map`; purpose-built query functions replacing ad-hoc frontend joins
+- Read-model helpers (`read_models.rs`) — `get_active_tree_for_project`, `get_node_chat_context`, `get_project_tree_summary`, `get_skill_graph_snapshot`, `get_node_neighborhood`, `get_resource_study_map`, `get_tailored_projects`; purpose-built query functions replacing ad-hoc frontend joins
+- Resource reading progress: `resource_reading_progress` table (migration 040) — per-section completion tracked by `(resource_id, section_title)` with optional `page_start`/`page_end`; commands `mark_section_read`, `mark_sections_read_up_to`, `get_reading_progress`
+- Skills graph redesign: canvas lane layout (domain-grouped columns), hover highlighting (focused subgraph), zoom-adaptive labels, legend, double-click to zoom, fit-all control
 - Prompt/model version logging — `prompt_logs` table; `log_prompt_call` fire-and-forget helper in `brain.rs`; all `call_llm` sites instrumented (concept_graph, repo_profile, prd_profile, tree_outline, skill_expansion, mimir_chat, mimir_rerank, auto_tag, skill_deps); `get_prompt_stats` Tauri command + dev-only "Model logs" tab in MimirChat.tsx
 - Shared `reqwest::Client` managed as Tauri state — injected into all commands that call external APIs (brain, mimir modules, orchestrator)
 - God module splits: `brain.rs` → `llm_client.rs` + `github.rs` + `prompt_builders.rs` + `tree_persistence.rs`; `mimir.rs` → `mimir_ingest.rs` + `mimir_retrieval.rs` + `mimir_tags.rs` + `mimir_manage.rs`
 - Postgres on Neon with pgvector
-- All migrations (001-039) run automatically on startup
+- All migrations (001-041) run automatically on startup
 - HNSW index on `tree_nodes.title_embedding vector(1024)` (migration 036) — used for async resource→node ANN matching
 - Background async job queue now includes `MatchResourceToNodes { resource_id: String }` — enqueued by `on_resource_ingested_async` after auto-tag completes; worker calls `run_match_resource_to_nodes` with in-memory reranking (same-tree boost -0.05, lexical overlap boost -0.03; top-5, threshold < 0.55)
 - `get_node_neighborhood` command in `read_models.rs` — returns `NodeNeighborhood { prerequisites, dependents, siblings }` each as `Vec<NeighborNode>`; traverses `concept_slug → universal_skills → skill_dependencies → tree_nodes`; top-3 resources per neighbor via `mimir_node_links`
@@ -86,18 +88,18 @@ Read `PRD.md` for the full vision. This file is your technical bible.
 │   │   ├── mimir_ingest.rs            # URL/PDF/text ingest pipeline, chunking, embeddings (split from mimir.rs)
 │   │   ├── mimir_retrieval.rs         # Hybrid RAG, GraphRAG traversal, session memory, tree context (split from mimir.rs)
 │   │   ├── mimir_tags.rs              # Auto-tagging, tag filter helpers (split from mimir.rs)
-│   │   ├── mimir_manage.rs            # Rescrape, re-embed, resource CRUD, completion (split from mimir.rs)
+│   │   ├── mimir_manage.rs            # Rescrape, re-embed, resource CRUD, completion, reading progress (mark_section_read / mark_sections_read_up_to / get_reading_progress, migration 040) (split from mimir.rs)
 │   │   ├── orchestrator.rs            # Background job queue (JobQueue + start_worker) + cascade handlers + ygg-* events; MatchResourceToNodes variant
-│   │   ├── read_models.rs             # Purpose-built read-model Tauri commands (10 helpers: active tree, node chat context, tree summary, skill graph snapshot, node neighborhood, resource gaps, prereq path, growth recommendations, learning path, study map)
+│   │   ├── read_models.rs             # Purpose-built read-model Tauri commands (11 helpers: active tree, node chat context, tree summary, skill graph snapshot, node neighborhood, resource gaps, prereq path, growth recommendations, learning path, study map, tailored projects)
 │   │   ├── work_commands.rs           # Co-op/topic/resource/skill commands
-│   │   ├── job_commands.rs            # Job application commands
+│   │   ├── job_commands.rs            # Job application commands + save_tailored_projects (tailored_projects JSONB on job_applications, migration 041)
 │   │   ├── idea_commands.rs           # Ideas CRUD + promote to project
 │   │   ├── resume_commands.rs         # Resume parsing + profile management
 │   │   ├── skill_commands.rs          # Universal skill sync + dependencies + gaps + aliases + merge
 │   │   ├── daily_commands.rs          # Daily Eisenhower Matrix commands
 │   │   ├── export_commands.rs         # Tree ZIP export
 │   │   └── database.rs               # PgPool connection + migrations
-│   ├── migrations/                    # Auto-run on startup, sequential (001-039)
+│   ├── migrations/                    # Auto-run on startup, sequential (001-041)
 │   └── capabilities/
 │       └── default.json               # Tauri 2 capability grants (includes core:event:allow-listen)
 ├── scraper/                           # Python FastAPI scraper (port 3002)
@@ -192,6 +194,9 @@ transcript_jobs        -- id, resource_id FK, status (pending|processing|done|fa
                        -- attempts INT, last_error TEXT, next_retry_at TIMESTAMPTZ,
                        -- created_at, updated_at
                        -- (migration 039) async retry queue for YouTube transcript fetches
+resource_reading_progress -- id, resource_id FK, section_title, page_start, page_end,
+                          -- completed_at, UNIQUE(resource_id, section_title)
+                          -- (migration 040) per-section read tracking for PDFs / structured resources
 ```
 
 ### Work tables
@@ -207,7 +212,8 @@ work_resource_skills -- id, resource_id FK, skill_name, tree_id FK (nullable)
 job_applications  -- id, company, position, location, source, status,
                   -- date_applied, date_follow_up, job_description, link, notes,
                   -- rating_location, rating_alignment, rating_salary, rating_role,
-                  -- season, created_at
+                  -- season, created_at,
+                  -- tailored_projects JSONB         ← saved resume-project recommendation (migration 041)
 job_skills        -- id, job_id FK, skill_name, is_required
 ```
 
@@ -219,6 +225,8 @@ ideas             -- id, content, tag, pinned, created_at
 ### Resume
 ```sql
 resume_profile    -- id, full_text, parsed JSONB, created_at
+resume_projects   -- id, name, description, tech_stack JSONB (nullable), role, created_at
+                  -- (migration 008) — populated from resume parsing; queried by get_tailored_projects
 ```
 
 ### Universal Skills (domain-agnostic v2)
@@ -350,7 +358,7 @@ const result = await invoke<ReturnType>('command_name', { paramName: value });
 3. Call from frontend with `invoke('command_name', { params })`
 
 ### Add a Migration
-Create `src-tauri/migrations/NNN_description.sql` — runs automatically on startup. Never modify existing migrations. Current highest: **039**.
+Create `src-tauri/migrations/NNN_description.sql` — runs automatically on startup. Never modify existing migrations. Current highest: **041**.
 
 ### Add a New Page
 1. Create `src/pages/NewPage.tsx`
@@ -545,7 +553,7 @@ Workers emit progress/completion events via `app.emit()`. Frontend components su
 
 ## Read Models
 
-`src-tauri/src/read_models.rs` exposes ten purpose-built Tauri commands:
+`src-tauri/src/read_models.rs` exposes eleven purpose-built Tauri commands:
 
 | Command | Returns | Purpose |
 |---|---|---|
@@ -559,6 +567,7 @@ Workers emit progress/completion events via `app.emit()`. Frontend components su
 | `get_growth_recommendations` | `Vec<GrowthTarget>` | Job-demand-weighted skill targets; optional season filter; ranks by gap × demand |
 | `compute_learning_path` | `LearningPath` | Steiner-tree-style ordered acquisition path across all growth targets; feeds Daily Matrix |
 | `get_resource_study_map` | `ResourceStudyMap` | Resources ranked by checkpoint coverage; grouped matched checkpoints by section; optional frontier toggle + per-project filter |
+| `get_tailored_projects` | `TailoredProjects` | Ranks `resume_projects` by skill overlap (HashSet match against `job_skills` required + nice-to-have); handles NULL tech_stack; used by TailoredProjectsPanel in JobsPage |
 
 All structs use `#[serde(rename_all = "camelCase")]`.
 

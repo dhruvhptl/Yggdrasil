@@ -8,7 +8,7 @@ import {
   RefreshCw, Loader2, AlertTriangle, Sparkles, FileText, TreePine,
   Briefcase, X, Wand2, GitMerge, Check, Search, Eye, Download, ChevronDown, ChevronRight,
   PanelLeftClose, PanelLeftOpen, RotateCcw, TrendingUp, Zap, Route, BookOpen, ExternalLink,
-  Maximize2,
+  Maximize2, MoreHorizontal,
 } from 'lucide-react';
 import type { UniversalSkill, SkillGap, SkillDependency, SkillAlias, SkillGraphSnapshot, GrowthTarget, PathNode, PrereqPath, LearningStep, LearningPath } from '../types';
 import { validateOrLog, SkillSchema } from '../lib/validators';
@@ -123,11 +123,13 @@ function layoutSkillGraph(
   }
 
   const depth = new Map<string, number>();
+  const visited = new Set<string>();
   const queue: string[] = [];
   for (const s of skills) {
     if ((prereqCount.get(s.id) ?? 0) === 0) {
       depth.set(s.id, 0);
       queue.push(s.id);
+      visited.add(s.id);
     }
   }
   let qi = 0;
@@ -135,8 +137,8 @@ function layoutSkillGraph(
     const id = queue[qi++];
     const d = depth.get(id) ?? 0;
     for (const nextId of (successors.get(id) ?? [])) {
-      const existing = depth.get(nextId) ?? -1;
-      if (d + 1 > existing) {
+      if (!visited.has(nextId)) {
+        visited.add(nextId);
         depth.set(nextId, d + 1);
         queue.push(nextId);
       }
@@ -1504,6 +1506,8 @@ export default function SkillsPage() {
   const [learningPath, setLearningPath] = useState<LearningPath | null>(null);
   const [learningPathLoading, setLearningPathLoading] = useState(false);
   const [learningPathSeason, setLearningPathSeason] = useState<string | null>(null);
+  const [showSyncDropdown, setShowSyncDropdown] = useState(false);
+  const [showOverflowMenu, setShowOverflowMenu] = useState(false);
   const [inferring, setInferring] = useState(false);
   const [classifying, setClassifying] = useState(false);
   const [resetting, setResetting]     = useState(false);
@@ -2083,18 +2087,13 @@ export default function SkillsPage() {
               <button onClick={handleSync} disabled={syncing} className="p-1.5 text-emerald-700 hover:text-emerald-400 disabled:opacity-30 transition-colors" title="Sync All Skills">
                 {syncing ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
               </button>
-              <button onClick={handleSyncJobs} disabled={syncingJobs} className="p-1.5 text-amber-800 hover:text-amber-500 disabled:opacity-30 transition-colors" title="Sync Job Skills">
-                {syncingJobs ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-              </button>
-              <button onClick={handleBackfillSlugs} disabled={backfilling} className="p-1.5 text-emerald-900 hover:text-emerald-600 disabled:opacity-30 transition-colors" title="Backfill Concept Slugs">
-                {backfilling ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-              </button>
               <button onClick={handleExport} disabled={skills.length === 0} className="p-1.5 text-slate-700 hover:text-slate-400 disabled:opacity-30 transition-colors" title="Export as PNG">
                 <Download className="w-4 h-4" />
               </button>
             </div>
           ) : (
             <>
+              {/* Header row */}
               <div className="flex items-center justify-between mb-3">
                 <h1 className="text-sm font-semibold flex items-center gap-2 text-slate-200">
                   <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
@@ -2104,39 +2103,176 @@ export default function SkillsPage() {
                   <button onClick={handleExport} disabled={skills.length === 0} className="p-1.5 text-slate-700 hover:text-slate-400 disabled:opacity-30 transition-colors" title="Export as PNG">
                     <Download className="w-3 h-3" />
                   </button>
+                  {/* ⋯ Overflow menu */}
+                  <div style={{ position: 'relative' }}>
+                    <button
+                      onClick={() => setShowOverflowMenu(v => !v)}
+                      className="p-1.5 text-slate-700 hover:text-slate-400 transition-colors"
+                      title="Maintenance tools"
+                    >
+                      <MoreHorizontal className="w-3 h-3" />
+                    </button>
+                    {showOverflowMenu && (
+                      <>
+                        {/* Click-away backdrop */}
+                        <div style={{ position: 'fixed', inset: 0, zIndex: 98 }} onClick={() => setShowOverflowMenu(false)} />
+                        <div style={{
+                          position: 'absolute', top: '100%', right: 0, zIndex: 99,
+                          width: 224, marginTop: 4,
+                          background: 'rgba(4,8,20,0.97)',
+                          border: '1px solid rgba(255,255,255,0.09)',
+                          borderRadius: 10,
+                          boxShadow: '0 8px 32px rgba(0,0,0,0.7)',
+                          backdropFilter: 'blur(12px)',
+                          padding: '6px 0',
+                        }}>
+                          <div style={{ fontSize: 9, fontWeight: 600, color: '#334155', textTransform: 'uppercase', letterSpacing: '0.08em', padding: '4px 12px 6px' }}>Maintenance</div>
+
+                          {/* Infer Dependencies */}
+                          {skills.length >= 2 && (
+                            <button
+                              onClick={() => { setShowOverflowMenu(false); handleInferDeps(); }}
+                              disabled={inferring}
+                              style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 12px', background: 'none', border: 'none', cursor: inferring ? 'default' : 'pointer', color: inferring ? '#334155' : '#94a3b8', fontSize: 11 }}
+                            >
+                              <span style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                                {inferring ? <Loader2 className="w-3 h-3 animate-spin" /> : <Wand2 style={{ width: 12, height: 12 }} />}
+                                {inferring ? 'Inferring…' : 'Infer Dependencies'}
+                              </span>
+                              <span style={{ fontSize: 8, padding: '1px 5px', borderRadius: 3, background: 'rgba(99,102,241,0.10)', color: '#6366f1', border: '1px solid rgba(99,102,241,0.18)', whiteSpace: 'nowrap' }}>llama-3.3-70b · Groq</span>
+                            </button>
+                          )}
+
+                          {/* Classify Domains */}
+                          <button
+                            onClick={() => { setShowOverflowMenu(false); handleClassifyDomains(); }}
+                            disabled={classifying || skills.length === 0}
+                            style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 12px', background: 'none', border: 'none', cursor: (classifying || skills.length === 0) ? 'default' : 'pointer', color: classifying ? '#334155' : '#94a3b8', fontSize: 11 }}
+                          >
+                            <span style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                              {classifying ? <Loader2 className="w-3 h-3 animate-spin" /> : <Sparkles style={{ width: 12, height: 12 }} />}
+                              {classifying ? 'Classifying…' : 'Classify Domains'}
+                            </span>
+                            <span style={{ fontSize: 8, padding: '1px 5px', borderRadius: 3, background: 'rgba(99,102,241,0.10)', color: '#6366f1', border: '1px solid rgba(99,102,241,0.18)', whiteSpace: 'nowrap' }}>scout-17b · Groq</span>
+                          </button>
+
+                          {/* Reset Domain Assignments */}
+                          <button
+                            onClick={() => {
+                              setShowOverflowMenu(false);
+                              if (window.confirm('Reset all domain assignments? This cannot be undone.')) handleResetDomains();
+                            }}
+                            disabled={resetting || classifying || skills.length === 0}
+                            style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 7, padding: '6px 12px', background: 'none', border: 'none', cursor: (resetting || classifying || skills.length === 0) ? 'default' : 'pointer', color: (resetting || classifying || skills.length === 0) ? '#334155' : '#f87171', fontSize: 11 }}
+                          >
+                            {resetting ? <Loader2 className="w-3 h-3 animate-spin" /> : <RotateCcw style={{ width: 12, height: 12 }} />}
+                            {resetting ? 'Resetting…' : 'Reset Domain Assignments'}
+                          </button>
+
+                          <div style={{ margin: '4px 12px', borderTop: '1px solid rgba(255,255,255,0.06)' }} />
+
+                          {/* Merge Skills */}
+                          {skills.length >= 2 && (
+                            <button
+                              onClick={() => { setShowOverflowMenu(false); setShowMerge(true); }}
+                              style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 7, padding: '6px 12px', background: 'none', border: 'none', cursor: 'pointer', color: '#94a3b8', fontSize: 11 }}
+                            >
+                              <GitMerge style={{ width: 12, height: 12 }} />Merge Skills…
+                            </button>
+                          )}
+
+                          {/* Auto-merge Duplicates */}
+                          {skills.length >= 2 && (
+                            <button
+                              onClick={() => { setShowOverflowMenu(false); handleAutoMergePreview(); }}
+                              style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 7, padding: '6px 12px', background: 'none', border: 'none', cursor: 'pointer', color: '#94a3b8', fontSize: 11 }}
+                            >
+                              <GitMerge style={{ width: 12, height: 12 }} />Auto-merge Duplicates
+                            </button>
+                          )}
+
+                          {/* Backfill Concept Slugs */}
+                          <button
+                            onClick={() => { setShowOverflowMenu(false); handleBackfillSlugs(); }}
+                            disabled={backfilling}
+                            style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 7, padding: '6px 12px', background: 'none', border: 'none', cursor: backfilling ? 'default' : 'pointer', color: backfilling ? '#334155' : '#94a3b8', fontSize: 11 }}
+                          >
+                            {backfilling ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw style={{ width: 12, height: 12 }} />}
+                            {backfilling ? 'Backfilling…' : 'Backfill Concept Slugs'}
+                          </button>
+                        </div>
+                      </>
+                    )}
+                  </div>
                   <button onClick={() => setSidebarCollapsed(true)} className="p-1.5 text-slate-700 hover:text-slate-400 transition-colors" title="Collapse sidebar">
                     <PanelLeftClose className="w-3 h-3" />
                   </button>
                 </div>
               </div>
 
-              <button
-                onClick={handleSync}
-                disabled={syncing}
-                className="w-full py-2 text-xs font-medium rounded-lg transition-colors flex items-center justify-center gap-2"
-                style={{ background: syncing ? 'rgba(255,255,255,0.04)' : 'rgba(16,185,129,0.18)', color: syncing ? '#334155' : '#34d399', border: '1px solid rgba(16,185,129,0.25)' }}
-              >
-                {syncing ? <><Loader2 className="w-3 h-3 animate-spin" />Syncing…</> : <><RefreshCw className="w-3 h-3" />Sync All Skills</>}
-              </button>
+              {/* Sync ▾ dropdown */}
+              <div style={{ position: 'relative' }}>
+                <div className="flex w-full" style={{ borderRadius: 8, overflow: 'hidden', border: '1px solid rgba(16,185,129,0.25)' }}>
+                  <button
+                    onClick={handleSync}
+                    disabled={syncing || syncingJobs}
+                    className="flex-1 py-2 text-xs font-medium transition-colors flex items-center justify-center gap-2"
+                    style={{ background: (syncing || syncingJobs) ? 'rgba(255,255,255,0.04)' : 'rgba(16,185,129,0.18)', color: (syncing || syncingJobs) ? '#334155' : '#34d399', borderRight: '1px solid rgba(16,185,129,0.20)' }}
+                  >
+                    {syncing ? <><Loader2 className="w-3 h-3 animate-spin" />Syncing…</> : syncingJobs ? <><Loader2 className="w-3 h-3 animate-spin" />Syncing Jobs…</> : <><RefreshCw className="w-3 h-3" />Sync</>}
+                  </button>
+                  <button
+                    onClick={() => setShowSyncDropdown(v => !v)}
+                    disabled={syncing || syncingJobs}
+                    className="px-2.5 py-2 text-xs transition-colors flex items-center"
+                    style={{ background: (syncing || syncingJobs) ? 'rgba(255,255,255,0.04)' : 'rgba(16,185,129,0.18)', color: (syncing || syncingJobs) ? '#334155' : '#34d399' }}
+                    title="Sync options"
+                  >
+                    <ChevronDown className="w-3 h-3" />
+                  </button>
+                </div>
+                {showSyncDropdown && (
+                  <>
+                    <div style={{ position: 'fixed', inset: 0, zIndex: 98 }} onClick={() => setShowSyncDropdown(false)} />
+                    <div style={{
+                      position: 'absolute', top: '100%', left: 0, right: 0, zIndex: 99,
+                      marginTop: 4,
+                      background: 'rgba(4,8,20,0.97)',
+                      border: '1px solid rgba(255,255,255,0.09)',
+                      borderRadius: 8,
+                      boxShadow: '0 8px 24px rgba(0,0,0,0.7)',
+                      backdropFilter: 'blur(12px)',
+                      overflow: 'hidden',
+                    }}>
+                      <button
+                        onClick={() => { setShowSyncDropdown(false); handleSync(); }}
+                        disabled={syncing}
+                        style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: 'none', border: 'none', cursor: syncing ? 'default' : 'pointer', color: '#94a3b8', fontSize: 11, textAlign: 'left' }}
+                      >
+                        <RefreshCw style={{ width: 12, height: 12, color: '#34d399' }} />
+                        <div>
+                          <div style={{ color: '#d1fae5', fontWeight: 500 }}>Sync All Skills</div>
+                          <div style={{ fontSize: 9, color: '#475569', marginTop: 1 }}>Resume, trees, work, jobs</div>
+                        </div>
+                      </button>
+                      <div style={{ borderTop: '1px solid rgba(255,255,255,0.06)' }} />
+                      <button
+                        onClick={() => { setShowSyncDropdown(false); handleSyncJobs(); }}
+                        disabled={syncingJobs}
+                        style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: 'none', border: 'none', cursor: syncingJobs ? 'default' : 'pointer', color: '#94a3b8', fontSize: 11, textAlign: 'left' }}
+                      >
+                        <RefreshCw style={{ width: 12, height: 12, color: '#fbbf24' }} />
+                        <div>
+                          <div style={{ color: '#fef3c7', fontWeight: 500 }}>Sync Job Skills</div>
+                          <div style={{ fontSize: 9, color: '#475569', marginTop: 1 }}>Job applications only</div>
+                        </div>
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
 
-              <button
-                onClick={handleSyncJobs}
-                disabled={syncingJobs}
-                className="w-full py-2 text-xs font-medium rounded-lg transition-colors flex items-center justify-center gap-2 mt-1.5"
-                style={{ background: syncingJobs ? 'rgba(255,255,255,0.04)' : 'rgba(245,158,11,0.12)', color: syncingJobs ? '#334155' : '#fbbf24', border: '1px solid rgba(245,158,11,0.2)' }}
-              >
-                {syncingJobs ? <><Loader2 className="w-3 h-3 animate-spin" />Syncing…</> : <>Sync Job Skills</>}
-              </button>
-
-              <button
-                onClick={handleBackfillSlugs}
-                disabled={backfilling}
-                className="w-full py-2 text-xs font-medium rounded-lg transition-colors flex items-center justify-center gap-2 mt-1.5"
-                style={{ background: backfilling ? 'rgba(255,255,255,0.04)' : 'rgba(16,185,129,0.08)', color: backfilling ? '#334155' : '#6ee7b7', border: '1px solid rgba(16,185,129,0.15)' }}
-              >
-                {backfilling ? <><Loader2 className="w-3 h-3 animate-spin" />Backfilling…</> : <>Backfill Concept Slugs</>}
-              </button>
-
+              {/* Growth Plan + Learning Path */}
               <div className="flex gap-1.5 mt-1.5">
                 <button
                   onClick={handleOpenGrowthPlan}
@@ -2151,57 +2287,6 @@ export default function SkillsPage() {
                   style={{ background: 'rgba(99,102,241,0.12)', color: '#818cf8', border: '1px solid rgba(99,102,241,0.25)' }}
                 >
                   <Route className="w-3 h-3" />Learning Path
-                </button>
-              </div>
-
-              {skills.length >= 2 && (
-                <button
-                  onClick={handleInferDeps}
-                  disabled={inferring}
-                  className="w-full mt-1.5 py-1.5 text-xs rounded-lg transition-colors flex items-center justify-center gap-2"
-                  style={{ background: 'rgba(255,255,255,0.03)', color: '#475569', border: '1px solid rgba(255,255,255,0.05)' }}
-                >
-                  {inferring ? <><Loader2 className="w-3 h-3 animate-spin" />Inferring…</> : <><Wand2 className="w-3 h-3" />Infer Dependencies</>}
-                </button>
-              )}
-
-              {skills.length >= 2 && (
-                <button
-                  onClick={() => setShowMerge(true)}
-                  className="w-full mt-1.5 py-1.5 text-xs rounded-lg transition-colors flex items-center justify-center gap-2"
-                  style={{ background: 'rgba(255,255,255,0.03)', color: '#475569', border: '1px solid rgba(255,255,255,0.05)' }}
-                >
-                  <GitMerge className="w-3 h-3" />Merge Skills
-                </button>
-              )}
-
-              {skills.length >= 2 && (
-                <button
-                  onClick={handleAutoMergePreview}
-                  className="w-full mt-1.5 py-1.5 text-xs rounded-lg transition-colors flex items-center justify-center gap-2"
-                  style={{ background: 'rgba(16,185,129,0.06)', color: '#6ee7b7', border: '1px solid rgba(16,185,129,0.12)' }}
-                >
-                  <GitMerge className="w-3 h-3" />Auto-merge duplicates
-                </button>
-              )}
-
-              <div className="flex gap-1.5 mt-1.5">
-                <button
-                  onClick={handleClassifyDomains}
-                  disabled={classifying || resetting || skills.length === 0}
-                  className="flex-1 py-1.5 text-xs rounded-lg transition-colors flex items-center justify-center gap-1.5"
-                  style={{ background: 'rgba(255,255,255,0.03)', color: classifying ? '#334155' : '#818cf8', border: '1px solid rgba(99,102,241,0.15)' }}
-                >
-                  {classifying ? <><Loader2 className="w-3 h-3 animate-spin" />Classifying…</> : <><Sparkles className="w-3 h-3" />Classify</>}
-                </button>
-                <button
-                  onClick={handleResetDomains}
-                  disabled={resetting || classifying || skills.length === 0}
-                  className="py-1.5 px-2.5 text-xs rounded-lg transition-colors flex items-center justify-center"
-                  style={{ background: 'rgba(255,255,255,0.03)', color: resetting ? '#334155' : '#475569', border: '1px solid rgba(255,255,255,0.06)' }}
-                  title="Reset all domain assignments"
-                >
-                  {resetting ? <Loader2 className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />}
                 </button>
               </div>
             </>

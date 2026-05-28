@@ -58,7 +58,7 @@ Yggdrasil puts it all in one place.
 
 ---
 
-## Current State (v2.5)
+## Current State (v2.6)
 
 ### What's Built & Working
 
@@ -105,10 +105,15 @@ Yggdrasil puts it all in one place.
 | Universal Skills — Domain-agnostic schema | ✅ Done | skill_domains table seeded; kind widened to 6 values; review_needed + status columns; skill_evidence first-class rows |
 | Universal Skills — Provenance columns | ✅ Done | origin + state columns live (migration 037); origin ∈ (resume|ontology|job_gap|resource|tree_quest|work); state ∈ (seed|adjacent); backfilled from evidence JSONB |
 | Universal Skills — Canonicalization | ✅ Done | skill_aliases table + merge UI; alias lookups case-insensitive |
-| Jobs Page | ✅ Done | Kanban + skill gap detection |
-| Resume Page | ✅ Done | Auto-parse, skill extraction |
+| Skills Graph — Lane layout redesign | ✅ Done | Domain-grouped lane layout, hover highlighting (focused subgraph), zoom-adaptive labels, legend, double-click to zoom, fit-all control |
+| Phase 2 Skill Graph — Prereq paths | ✅ Done | `get_prereq_path` BFS walk from gap skill backward through prerequisite edges to nearest seed; powers SkillPanel prerequisite display |
+| Phase 3 Skill Graph — Growth recommendations + Learning Path | ✅ Done | `get_growth_recommendations` (job-demand-weighted gap × demand); `compute_learning_path` Steiner-tree-style ordered acquisition path feeding Daily Matrix |
+| Jobs Page | ✅ Done | Kanban + skill gap detection + dynamic season selection (term + year picker) |
+| Jobs Page — Tailored Projects | ✅ Done | TailoredProjectsPanel ranks resume projects by skill overlap against JD; `get_tailored_projects` + `save_tailored_projects` persist selection to `job_applications.tailored_projects` JSONB (migration 041) |
+| Resume Page | ✅ Done | Auto-parse, skill extraction; parsed projects persisted to `resume_projects` table (handles NULL tech_stack defensively) |
 | Work Page | ✅ Done | Co-op tracker, skill extraction |
 | Daily Matrix | ✅ Done | Eisenhower 2x2 triage for quests + free-form tasks |
+| Resource Reading Progress | ✅ Done | `resource_reading_progress` table (migration 040); per-section completion by `(resource_id, section_title)` with optional page range; `mark_section_read` / `mark_sections_read_up_to` / `get_reading_progress` commands |
 
 ---
 
@@ -125,7 +130,9 @@ Yggdrasil puts it all in one place.
 | AI generation | Gemini Flash via OpenRouter (tree gen + concept graphs) | ✅ |
 | AI chat / extraction | Groq — LLaMA 3.3-70b-versatile + 3.1-8b-instant | ✅ |
 | Tree visualization | Custom HTML Canvas (tapered filled branches, polar layout) | ✅ |
-| Work/Skills galaxy | D3 force simulation | ✅ |
+| Work/Skills galaxy | Custom HTML Canvas (radial tree, same renderer as YggdrasilTree.tsx) | ✅ |
+| HNSW index | pgvector HNSW on tree_nodes.title_embedding vector(1024) (migration 036) | ✅ |
+| Transcript jobs | async transcript_jobs retry queue (migrations 038-039); transcript_source/mode/chars on mimir_resources | ✅ |
 | Mimir | Native Rust — mimir_ingest / mimir_retrieval / mimir_tags / mimir_manage | ✅ |
 | Hybrid retrieval | RRF over pgvector cosine + Postgres FTS (GIN tsvector) | ✅ |
 | Chat session memory | mimir_chat_sessions + mimir_chat_messages tables | ✅ |
@@ -174,21 +181,15 @@ Python scraper (port 3002)     ←→  OpenRouter (embeddings + tree gen)
 
 ## Immediate Priorities (Now)
 
-### 1. Ingest the Mimir Library
+### 1. Smarter retrieval signals
 
-- Upload key PDFs (textbooks, papers) — section-aware chunking now preserves TOC structure
-- Ingest YouTube playlists for active learning tracks
-- Run Re-embed PDFs after any embedding model change
+`usage_weight` column on `mimir_chunks`, feedback signals (`mimir_feedback` table), dynamic context injection in `mimir_chat`. The agentic suggestions / gap finder / study map all rely on cold matching today — feedback closes the loop.
 
-### 2. Climb Trees
+### 2. Browser extension
 
-Generate and climb trees for active projects. Take notes in checkpoint panels. Use Mimir chat while climbing. Document every pain point — these feed the V2 roadmap.
+One-click ingest of the current page into Mimir, auto-tag by domain, optional link-to-checkpoint picker. Lowers ingest friction for the long tail of resources discovered while browsing.
 
-### 3. Add Remaining Jobs
-
-Expand the job tracker. Target: 50+ jobs before reviewing skill gap analysis.
-
-### 4. V2 Build Sequence (after climbing)
+### 3. V2 Build Sequence
 
 In order — each depends on the previous being stable:
 
@@ -201,10 +202,13 @@ In order — each depends on the previous being stable:
 7. ~~**Tree versioning + diff-based updates**~~ ✅ Done — tree_versions table, concept_id stable identity, regenerate_tree KG bridge + diff carry-over
 8. ~~**Async resource→node matching with reranking**~~ ✅ Done — MatchResourceToNodes job variant; HNSW index on title_embedding; in-memory same-tree + lexical reranking
 9. ~~**Graph neighborhood panel**~~ ✅ Done — get_node_neighborhood command; NodePanel prerequisites/dependents/siblings section with clickable rows
-10. **Recursive prerequisite paths** (Phase 2 skill graph) — `get_gap_path` command; breadth-first walk from gap node to current seeds; ordered learning path per gap
-11. **Graph-aware gap planner** (Phase 3 skill graph) — aggregate growth targets, dedup shared prerequisites, produce ranked acquisition sequence for Daily Matrix
-12. **Smarter retrieval** — usage_weight column on mimir_chunks, feedback signals (mimir_feedback table), dynamic context injection
-13. **Browser extension** — one-click ingest of the current page into Mimir, auto-tag by domain, optional link-to-checkpoint picker
+10. ~~**Recursive prerequisite paths**~~ ✅ Done — `get_prereq_path` BFS walk from gap to seed; ordered learning path per gap
+11. ~~**Graph-aware gap planner**~~ ✅ Done — `get_growth_recommendations` + `compute_learning_path` aggregate growth targets, dedup shared prereqs, produce ranked acquisition sequence for Daily Matrix
+12. ~~**Skills graph visual redesign**~~ ✅ Done — domain-grouped lane layout, hover highlighting, zoom-adaptive labels, legend, double-click zoom, fit-all
+13. ~~**Tailored projects per job**~~ ✅ Done — `get_tailored_projects` ranks resume projects by skill overlap; `save_tailored_projects` persists to `job_applications.tailored_projects` (migration 041)
+14. ~~**Resource reading progress**~~ ✅ Done — `resource_reading_progress` table (migration 040); per-section completion tracking
+15. **Smarter retrieval** — usage_weight column on mimir_chunks, feedback signals (mimir_feedback table), dynamic context injection
+16. **Browser extension** — one-click ingest of the current page into Mimir, auto-tag by domain, optional link-to-checkpoint picker
 
 ---
 
