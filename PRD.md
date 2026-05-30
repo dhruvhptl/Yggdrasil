@@ -114,6 +114,10 @@ Yggdrasil puts it all in one place.
 | Work Page | ✅ Done | Co-op tracker, skill extraction |
 | Daily Matrix | ✅ Done | Eisenhower 2x2 triage for quests + free-form tasks |
 | Resource Reading Progress | ✅ Done | `resource_reading_progress` table (migration 040); per-section completion by `(resource_id, section_title)` with optional page range; `mark_section_read` / `mark_sections_read_up_to` / `get_reading_progress` commands |
+| Skill→resource linking — chapter-granular | ✅ Done | `mimir_skill_links` table (migration 043+045); links skills to specific resource chapters via `matched_section_title + matched_page_start/end`; two partial unique indexes for sectioned vs. whole-resource rows; `match_skill_to_resources` + `run_skill_resource_backfill` commands |
+| Skill→resource linking — LLM extraction | ✅ Done | `OrchestratorJob::ExtractSkillsFromResource` auto-fires after ingest; samples 30 diverse chunks, ANN pre-filters to 50 candidate skills, `google/gemini-3.1-flash-lite` verifies which the resource actually teaches; writes `source='llm_extraction', confidence=0.9` to `mimir_skill_links`; never overwrites manual links; `extract_skills_backfill` for bulk re-processing; `source` + `confidence` provenance columns (migration 046) |
+| Skill embeddings + ANN inference | ✅ Done | `universal_skills.embedding vector(1024)` + HNSW index (migration 044); `backfill_skill_embeddings_cmd`; ANN-driven dep inference (`infer_skill_deps_ann`) clusters nearby skills and asks LLaMA to verify edges; replaces alphabetical batching |
+| Skill detail panel | ✅ Done | `SkillDetailPanel` with prereqs/unlocks/related, linked trees, projects, chapter-granular resource pills, similar skills ANN section, status/notes editing |
 
 ---
 
@@ -386,13 +390,24 @@ Trees today are one-shot — regenerating discards everything. V2 treats each ge
 
 ### Current State
 
-Mimir is a RAG system — it indexes resources and retrieves relevant chunks via cosine similarity. Quality improves as the library grows, but there is no feedback loop and no memory. Every query starts from scratch.
+Mimir is a RAG system — it indexes resources and retrieves relevant chunks via cosine similarity. Skill→resource links are now written by three pipelines in priority order:
+
+1. **LLM extraction** (`source='llm_extraction'`) — `google/gemini-3.1-flash-lite` verifies which skills a resource actually teaches, after ANN pre-filtering to 50 candidates. Fires automatically after every ingest. This is the primary path going forward.
+2. **Tree bridge** (`source='tree_bridge'`) — written when a tree is generated; links skills whose `concept_slug` matches a tree node to resources matched to that node.
+3. **ANN** (`source='ann'`) — legacy; written by `MatchResourceToNodes` via the concept_slug bridge. Superseded by LLM extraction.
+4. **Manual** (`source='manual'`) — user-created; never overwritten by any automated path.
 
 ```
-Query → embed → cosine search → rerank → synthesize → response
-                     ↑
-               no feedback, no weighting, no history
+Ingest → auto-tag → MatchResourceToNodes (ANN bridge) → ExtractSkillsFromResource (LLM)
+                                                               ↓
+                                                    mimir_skill_links (source, confidence)
 ```
+
+### Planned Next
+
+- **Graph propagation** — when a skill is linked to a resource, propagate the link to prerequisite skills at reduced confidence (e.g., if "Backpropagation" is confirmed, auto-link "Chain Rule" at confidence 0.6)
+- **Mimir brain command** — `get_skill_graph_health` read-model: coverage %, skills with 0 resources, resources with 0 skills, confidence distribution histogram
+- **concept_slug FK refactor** — replace TEXT concept_slug join with a proper UUID FK between `tree_nodes` and `universal_skills` to enforce referential integrity
 
 ### V2 — Smarter Retrieval
 

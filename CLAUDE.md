@@ -43,11 +43,15 @@ Read `PRD.md` for the full vision. This file is your technical bible.
 - Shared `reqwest::Client` managed as Tauri state — injected into all commands that call external APIs (brain, mimir modules, orchestrator)
 - God module splits: `brain.rs` → `llm_client.rs` + `github.rs` + `prompt_builders.rs` + `tree_persistence.rs`; `mimir.rs` → `mimir_ingest.rs` + `mimir_retrieval.rs` + `mimir_tags.rs` + `mimir_manage.rs`
 - Postgres on Neon with pgvector
-- All migrations (001-041) run automatically on startup
+- All migrations (001-046) run automatically on startup
 - HNSW index on `tree_nodes.title_embedding vector(1024)` (migration 036) — used for async resource→node ANN matching
+- HNSW index on `universal_skills.embedding vector(1024)` (migration 044) — used for skill similarity ANN + ANN-driven dep inference
 - Background async job queue now includes `MatchResourceToNodes { resource_id: String }` — enqueued by `on_resource_ingested_async` after auto-tag completes; worker calls `run_match_resource_to_nodes` with in-memory reranking (same-tree boost -0.05, lexical overlap boost -0.03; top-5, threshold < 0.55)
+- Background async job queue also includes `ExtractSkillsFromResource { resource_id: String }` — enqueued after `MatchResourceToNodes`; samples up to 30 diverse chunks, ANN pre-filters to 50 candidate skills from `universal_skills.embedding`, sends to `google/gemini-3.1-flash-lite` for verification, writes confirmed skills to `mimir_skill_links` with `source='llm_extraction', confidence=0.9`; never overwrites `source='manual'`; `extract_skills_backfill` Tauri command enqueues all resources in bulk
 - `get_node_neighborhood` command in `read_models.rs` — returns `NodeNeighborhood { prerequisites, dependents, siblings }` each as `Vec<NeighborNode>`; traverses `concept_slug → universal_skills → skill_dependencies → tree_nodes`; top-3 resources per neighbor via `mimir_node_links`
 - YouTube transcript metadata: `transcript_source` / `transcript_mode` / `transcript_chars` columns on `mimir_resources` (migration 038); async `transcript_jobs` retry queue (migration 039)
+- Skill→resource linking: `mimir_skill_links` table (migration 043) with `source` + `confidence` provenance columns (migration 046); `source` ∈ (manual|ann|tree_bridge|llm_extraction); `llm_extraction` is the primary path going forward — ANN links (source='ann') are legacy and will be superseded by LLM-verified extraction over time
+- Planned next: graph propagation (propagate skill links through prerequisite edges), Mimir brain command for graph health inspection, concept_slug FK refactor to proper UUID join
 
 ---
 
@@ -89,7 +93,7 @@ Read `PRD.md` for the full vision. This file is your technical bible.
 │   │   ├── mimir_retrieval.rs         # Hybrid RAG, GraphRAG traversal, session memory, tree context (split from mimir.rs)
 │   │   ├── mimir_tags.rs              # Auto-tagging, tag filter helpers (split from mimir.rs)
 │   │   ├── mimir_manage.rs            # Rescrape, re-embed, resource CRUD, completion, reading progress (mark_section_read / mark_sections_read_up_to / get_reading_progress, migration 040) (split from mimir.rs)
-│   │   ├── orchestrator.rs            # Background job queue (JobQueue + start_worker) + cascade handlers + ygg-* events; MatchResourceToNodes variant
+│   │   ├── orchestrator.rs            # Background job queue (JobQueue + start_worker) + cascade handlers + ygg-* events; MatchResourceToNodes + ExtractSkillsFromResource variants; extract_skills_backfill Tauri command
 │   │   ├── read_models.rs             # Purpose-built read-model Tauri commands (11 helpers: active tree, node chat context, tree summary, skill graph snapshot, node neighborhood, resource gaps, prereq path, growth recommendations, learning path, study map, tailored projects)
 │   │   ├── work_commands.rs           # Co-op/topic/resource/skill commands
 │   │   ├── job_commands.rs            # Job application commands + save_tailored_projects (tailored_projects JSONB on job_applications, migration 041)
@@ -99,7 +103,7 @@ Read `PRD.md` for the full vision. This file is your technical bible.
 │   │   ├── daily_commands.rs          # Daily Eisenhower Matrix commands
 │   │   ├── export_commands.rs         # Tree ZIP export
 │   │   └── database.rs               # PgPool connection + migrations
-│   ├── migrations/                    # Auto-run on startup, sequential (001-041)
+│   ├── migrations/                    # Auto-run on startup, sequential (001-046)
 │   └── capabilities/
 │       └── default.json               # Tauri 2 capability grants (includes core:event:allow-listen)
 ├── scraper/                           # Python FastAPI scraper (port 3002)
@@ -197,6 +201,22 @@ transcript_jobs        -- id, resource_id FK, status (pending|processing|done|fa
 resource_reading_progress -- id, resource_id FK, section_title, page_start, page_end,
                           -- completed_at, UNIQUE(resource_id, section_title)
                           -- (migration 040) per-section read tracking for PDFs / structured resources
+mimir_skill_links  -- id, skill_id FK universal_skills, resource_id FK mimir_resources,
+                   -- relevance_score FLOAT,
+                   -- matched_chunk_id FK mimir_chunks,    ← best chunk for this link
+                   -- matched_section_title TEXT,          ← chapter/section the chunk falls under
+                   -- matched_page_start INT, matched_page_end INT,
+                   -- source TEXT NOT NULL DEFAULT 'ann'   ← (migration 046)
+                   --   CHECK(source IN ('manual','ann','tree_bridge','llm_extraction'))
+                   -- confidence FLOAT                     ← (migration 046) model confidence (NULL for non-LLM)
+                   -- Two partial unique indexes (migration 045):
+                   --   UNIQUE(skill_id, resource_id, matched_section_title) WHERE matched_section_title IS NOT NULL
+                   --   UNIQUE(skill_id, resource_id) WHERE matched_section_title IS NULL
+                   -- source semantics:
+                   --   manual         — user-created via link_resource_to_node; relevance_score=1.0; never overwritten
+                   --   ann            — legacy; written by MatchResourceToNodes via concept_slug bridge; superseded by llm_extraction
+                   --   tree_bridge    — written by tree_persistence.rs tag_skills_for_tree; no chunk context
+                   --   llm_extraction — primary path; gemini-3.1-flash-lite verified; confidence=0.9
 ```
 
 ### Work tables
@@ -258,6 +278,15 @@ skill_evidence       -- id, skill_id FK, source_type CHECK(resume|tree_quest|wor
                      --   manual|mimir_resource|job_demand|external),
                      -- source_id TEXT, payload JSONB, recorded_at;
                      -- UNIQUE(skill_id, source_type, COALESCE(source_id,''))
+```
+
+### Skill graph tables (migration 043+)
+```sql
+skill_profiles       -- id, skill_id FK universal_skills UNIQUE, status TEXT, notes TEXT, created_at, updated_at
+                     -- status ∈ (active|archived|learning|mastered|untouched)
+                     -- human-curation layer on top of universal_skills
+skill_trees          -- id, skill_id FK, tree_id FK — many-to-many: which trees cover a given skill
+skill_project_links  -- id, skill_id FK, project_id FK — skills linked to non-Skills projects
 ```
 
 ### Daily Matrix
