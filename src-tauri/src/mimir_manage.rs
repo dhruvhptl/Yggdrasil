@@ -138,6 +138,29 @@ pub async fn link_resource_to_node(
     .await
     .map_err(|e| e.to_string())?;
 
+    // Parallel manual link to skill via concept_slug bridge (mig 043 + 045).
+    // Manual links have no matched chunk → whole-resource entry, section is NULL.
+    let link_skill_id = uuid::Uuid::new_v4().to_string();
+    let _ = sqlx::query(
+        "INSERT INTO mimir_skill_links \
+           (id, skill_id, resource_id, relevance_score) \
+         SELECT $1, u.id, $2, 1.0 \
+         FROM tree_nodes n \
+         JOIN universal_skills u ON u.concept_slug = n.concept_slug \
+         WHERE n.id = $3 \
+           AND u.concept_slug IS NOT NULL \
+         ON CONFLICT (skill_id, resource_id) \
+           WHERE matched_section_title IS NULL \
+         DO UPDATE SET \
+           relevance_score = EXCLUDED.relevance_score"
+    )
+    .bind(&link_skill_id)
+    .bind(&resource_id)
+    .bind(&node_id)
+    .execute(&database.pool)
+    .await
+    .ok();
+
     Ok(())
 }
 

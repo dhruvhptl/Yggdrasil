@@ -95,6 +95,64 @@ pub fn vector_str(embedding: &[f32]) -> String {
     format!("[{}]", parts.join(","))
 }
 
+/// Batch embedding via the same OpenRouter endpoint as `get_embedding`.
+/// Sends all texts in a single request and returns one vector per input,
+/// in the same order. Used by skill embedding backfill (50 per call).
+pub async fn get_embeddings_batch(client: &reqwest::Client, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+    if texts.is_empty() { return Ok(Vec::new()); }
+    let api_key = crate::mimir::openrouter_api_key()?;
+
+    let body = json!({
+        "model": "perplexity/pplx-embed-v1-0.6b",
+        "input": texts,
+    });
+
+    let response = client
+        .post("https://openrouter.ai/api/v1/embeddings")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(60))
+        .send()
+        .await
+        .map_err(|e| format!("OpenRouter batch embedding request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let err_text = response.text().await.unwrap_or_default();
+        return Err(format!("OpenRouter batch embedding error: {}", err_text));
+    }
+
+    let result: serde_json::Value = response.json().await
+        .map_err(|e| format!("Failed to parse batch embedding response: {}", e))?;
+
+    let data = result["data"].as_array()
+        .ok_or_else(|| "batch embedding: missing data array".to_string())?;
+
+    if data.len() != texts.len() {
+        return Err(format!(
+            "batch embedding: expected {} vectors, got {}", texts.len(), data.len()
+        ));
+    }
+
+    let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+    for entry in data {
+        let arr = entry["embedding"].as_array()
+            .ok_or_else(|| "batch embedding: entry missing 'embedding' array".to_string())?;
+        let raw: Vec<f32> = arr.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect();
+        if raw.len() != EMBED_DIM {
+            return Err(format!(
+                "batch embedding: expected {} dims, got {}", EMBED_DIM, raw.len()
+            ));
+        }
+        // L2-normalize, matching single-shot behavior.
+        let norm: f32 = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let normed = if norm < 1e-9 { raw } else { raw.iter().map(|x| x / norm).collect() };
+        out.push(normed);
+    }
+
+    Ok(out)
+}
+
 // ─── Text chunking ──────────────────────────────────────────────────────────
 
 pub fn chunk_text(text: &str, max_words: usize) -> Vec<String> {

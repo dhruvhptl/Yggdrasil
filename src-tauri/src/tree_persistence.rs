@@ -6,6 +6,11 @@ use crate::database::Database;
 use crate::llm_client::SkillTree;
 use crate::prompt_builders::Concept;
 
+// Synthetic "Skills" project (migration 043, Option C) — all skill-seeded
+// trees live under this id. skill_project_links should NOT include this row;
+// the skill→tree linkage is recorded in skill_trees instead.
+const SKILLS_PROJECT_ID: &str = "00000000-0000-0000-0000-000000000001";
+
 // ─── Database helpers ────────────────────────────────────────────────────────
 
 /// Save AI-generated skill tree to database.
@@ -196,7 +201,117 @@ pub(crate) async fn save_tree_to_database(
         }
     }
 
+    // ── Skill tagging pass (fire-and-forget) ────────────────────────────────
+    // Walk this tree's nodes, resolve concept_slug → universal_skills.id, and
+    // populate skill_trees (always) + skill_project_links (skipping the
+    // synthetic Skills project). Errors are logged, never propagated — tree
+    // generation has already succeeded by this point.
+    let _ = tag_skills_for_tree(
+        &database.pool,
+        &tree_id,
+        &skill_tree.project_id,
+    ).await;
+
     Ok((tree_id, leaf_node_ids))
+}
+
+/// Resolve concept_slugs on a freshly inserted tree to skill_ids and write
+/// link rows into skill_trees and skill_project_links. Best-effort — every
+/// step swallows its own errors.
+async fn tag_skills_for_tree(
+    pool: &sqlx::PgPool,
+    tree_id: &str,
+    project_id: &str,
+) -> () {
+    // 1. Collect distinct non-null concept_slugs for this tree.
+    let slug_rows = match sqlx::query(
+        "SELECT DISTINCT concept_slug FROM tree_nodes \
+         WHERE tree_id = $1 AND concept_slug IS NOT NULL"
+    )
+    .bind(tree_id)
+    .fetch_all(pool)
+    .await {
+        Ok(rs) => rs,
+        Err(e) => {
+            println!("⚠️  tag_skills_for_tree: load slugs failed: {}", e);
+            return;
+        }
+    };
+
+    if slug_rows.is_empty() {
+        return;
+    }
+
+    let slugs: Vec<String> = slug_rows.iter()
+        .filter_map(|r| r.try_get::<String, _>("concept_slug").ok())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if slugs.is_empty() {
+        return;
+    }
+
+    let is_skills_project = project_id == SKILLS_PROJECT_ID;
+    let mut linked_trees = 0usize;
+    let mut linked_projects = 0usize;
+
+    // 2-4. Per-slug resolution + inserts.
+    for slug in &slugs {
+        let skill_row = sqlx::query(
+            "SELECT id FROM universal_skills WHERE concept_slug = $1 LIMIT 1"
+        )
+        .bind(slug)
+        .fetch_optional(pool)
+        .await;
+
+        let skill_id: String = match skill_row {
+            Ok(Some(r)) => match r.try_get("id") {
+                Ok(s) => s,
+                Err(_) => continue,
+            },
+            Ok(None) => continue,
+            Err(e) => {
+                println!("⚠️  tag_skills_for_tree: resolve '{}' failed: {}", slug, e);
+                continue;
+            }
+        };
+
+        // skill_trees — always.
+        match sqlx::query(
+            "INSERT INTO skill_trees (skill_id, tree_id) VALUES ($1, $2) \
+             ON CONFLICT DO NOTHING"
+        )
+        .bind(&skill_id)
+        .bind(tree_id)
+        .execute(pool)
+        .await {
+            Ok(r) if r.rows_affected() > 0 => linked_trees += 1,
+            Ok(_) => {} // already linked
+            Err(e) => println!("⚠️  tag_skills_for_tree: skill_trees insert failed for {}: {}", skill_id, e),
+        }
+
+        // skill_project_links — skip the synthetic Skills project.
+        if !is_skills_project {
+            match sqlx::query(
+                "INSERT INTO skill_project_links (skill_id, project_id) VALUES ($1, $2) \
+                 ON CONFLICT DO NOTHING"
+            )
+            .bind(&skill_id)
+            .bind(project_id)
+            .execute(pool)
+            .await {
+                Ok(r) if r.rows_affected() > 0 => linked_projects += 1,
+                Ok(_) => {}
+                Err(e) => println!("⚠️  tag_skills_for_tree: skill_project_links insert failed for {}: {}", skill_id, e),
+            }
+        }
+    }
+
+    if linked_trees > 0 || linked_projects > 0 {
+        println!(
+            "🏷️  Skill tagging: {} skill→tree, {} skill→project links written",
+            linked_trees, linked_projects,
+        );
+    }
 }
 
 // ─── Mastered concepts ───────────────────────────────────────────────────────

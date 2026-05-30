@@ -1,6 +1,6 @@
 // src/pages/TreesPage.tsx
 import { useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { TreePine, Trash2 } from "lucide-react";
 import { Project } from "../types";
@@ -9,6 +9,7 @@ export default function TreesPage() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
 
   async function handleDeleteProject(e: React.MouseEvent, projectId: string) {
     e.stopPropagation();
@@ -27,6 +28,21 @@ export default function TreesPage() {
       .catch((err) => console.error("Failed to load projects:", err))
       .finally(() => setLoading(false));
   }, []);
+
+  // If we arrived via `/trees?selected=<treeId>` (e.g. from Growth Plan
+  // "Open tree →"), resolve the tree to its project and route to the
+  // existing canvas — which is how every other tree open works on this page.
+  useEffect(() => {
+    const selectedTreeId = searchParams.get("selected");
+    if (!selectedTreeId) return;
+    invoke<{ projectId: string } | null>("get_project_id_for_tree", { treeId: selectedTreeId })
+      .then((row) => {
+        if (row && row.projectId) {
+          navigate(`/project/${row.projectId}`, { replace: true });
+        }
+      })
+      .catch((err) => console.error("Failed to resolve selected tree:", err));
+  }, [searchParams, navigate]);
 
   return (
     <div className="p-6 max-w-2xl mx-auto flex flex-col gap-6">

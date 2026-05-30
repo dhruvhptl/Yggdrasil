@@ -185,12 +185,21 @@ pub(crate) async fn upsert_skill(
     // to false — only the explicit mark_skill_reviewed command does that.
     // origin is sticky (set once, never overwritten). state is recomputed on sync.
     let no_domain = domain.is_none();
+    // Guard: only write concept_slug if no *other* row already claims it.
+    // The unique partial index idx_universal_skills_concept_slug forbids
+    // duplicates among non-null slugs. Distinct skill names can slugify to
+    // the same value (e.g. "K-Means" and "K Means" both → "k-means"),
+    // and ON CONFLICT (LOWER(name)) does not catch that race.
     let row = sqlx::query(
         "INSERT INTO universal_skills
              (id, name, concept_slug, domain, level, evidence, last_updated, status, review_needed, origin, state)
-         VALUES ($1, $2, $3, $4, 1, $5::jsonb, NOW(),
-                 CASE WHEN $4 IS NULL THEN 'unclassified' ELSE 'active' END,
-                 $6, $7, $8)
+         VALUES (
+             $1, $2,
+             CASE WHEN EXISTS (SELECT 1 FROM universal_skills WHERE concept_slug = $3)
+                  THEN NULL ELSE $3 END,
+             $4, 1, $5::jsonb, NOW(),
+             CASE WHEN $4 IS NULL THEN 'unclassified' ELSE 'active' END,
+             $6, $7, $8)
          ON CONFLICT (LOWER(name)) DO UPDATE SET
              evidence = universal_skills.evidence || $5::jsonb,
              concept_slug = COALESCE(universal_skills.concept_slug, EXCLUDED.concept_slug),
@@ -354,10 +363,15 @@ pub(crate) async fn sync_jobs_inner(pool: &PgPool) -> Result<SyncResult, String>
         let slug = canonical.to_lowercase().replace(' ', "-");
         let evidence_arr = serde_json::json!([evidence]);
 
+        // Same slug-collision guard as upsert_skill — see comment there.
         let result = sqlx::query(
             "INSERT INTO universal_skills
                  (id, name, concept_slug, level, evidence, last_updated, status, review_needed, origin, state)
-             VALUES ($1, $2, $3, 1, $4::jsonb, NOW(), 'unclassified', true, 'job_gap', 'adjacent')
+             VALUES (
+                 $1, $2,
+                 CASE WHEN EXISTS (SELECT 1 FROM universal_skills WHERE concept_slug = $3)
+                      THEN NULL ELSE $3 END,
+                 1, $4::jsonb, NOW(), 'unclassified', true, 'job_gap', 'adjacent')
              ON CONFLICT (LOWER(name)) DO UPDATE SET
                  evidence = universal_skills.evidence || $4::jsonb,
                  state = CASE WHEN universal_skills.state = 'seed' THEN 'seed' ELSE 'adjacent' END,
@@ -491,10 +505,28 @@ pub async fn sync_all_skills(
 
     // Prune skills that still have empty evidence after the full sync —
     // these are stale rows whose sources (resources, tree nodes) no longer exist.
+    // Excludes "engaged" skills: those linked to a tree or with a non-default
+    // profile status. Without this guard, manually-curated rows (added to a
+    // skill_trees row, marked in_progress, etc.) get nuked when their source
+    // evidence happens to drop in a given sync run.
     let pruned = sqlx::query(
         "DELETE FROM skill_dependencies
-         WHERE source_skill_id IN (SELECT id FROM universal_skills WHERE evidence = '[]'::jsonb)
-            OR target_skill_id IN (SELECT id FROM universal_skills WHERE evidence = '[]'::jsonb)"
+         WHERE source_skill_id IN (
+             SELECT id FROM universal_skills
+             WHERE evidence = '[]'::jsonb
+               AND id NOT IN (SELECT skill_id FROM skill_trees)
+               AND id NOT IN (
+                   SELECT skill_id FROM skill_profiles WHERE status NOT IN ('untouched')
+               )
+         )
+            OR target_skill_id IN (
+             SELECT id FROM universal_skills
+             WHERE evidence = '[]'::jsonb
+               AND id NOT IN (SELECT skill_id FROM skill_trees)
+               AND id NOT IN (
+                   SELECT skill_id FROM skill_profiles WHERE status NOT IN ('untouched')
+               )
+         )"
     )
     .execute(&database.pool)
     .await
@@ -502,7 +534,12 @@ pub async fn sync_all_skills(
     .rows_affected();
 
     let deleted = sqlx::query(
-        "DELETE FROM universal_skills WHERE evidence = '[]'::jsonb"
+        "DELETE FROM universal_skills
+         WHERE evidence = '[]'::jsonb
+           AND id NOT IN (SELECT skill_id FROM skill_trees)
+           AND id NOT IN (
+               SELECT skill_id FROM skill_profiles WHERE status NOT IN ('untouched')
+           )"
     )
     .execute(&database.pool)
     .await
@@ -513,11 +550,64 @@ pub async fn sync_all_skills(
         println!("🌳 Pruned {} stale skills ({} dep rows)", deleted, pruned);
     }
 
+    // ── Fix 3: orphan cleanup ──────────────────────────────────────────────
+    // ON DELETE CASCADE on these FKs should handle this automatically when
+    // migrations are clean, but stale rows from older schema versions or
+    // half-rolled-back DELETEs can leave dangling references. Belt-and-braces.
+    let orphan_trees = sqlx::query(
+        "DELETE FROM skill_trees \
+         WHERE skill_id NOT IN (SELECT id FROM universal_skills)"
+    )
+    .execute(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .rows_affected();
+
+    let orphan_projects = sqlx::query(
+        "DELETE FROM skill_project_links \
+         WHERE skill_id NOT IN (SELECT id FROM universal_skills)"
+    )
+    .execute(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .rows_affected();
+
+    let orphan_resources = sqlx::query(
+        "DELETE FROM mimir_skill_links \
+         WHERE skill_id NOT IN (SELECT id FROM universal_skills)"
+    )
+    .execute(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .rows_affected();
+
+    let orphan_profiles = sqlx::query(
+        "DELETE FROM skill_profiles \
+         WHERE skill_id NOT IN (SELECT id FROM universal_skills)"
+    )
+    .execute(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .rows_affected();
+
+    if orphan_trees + orphan_projects + orphan_resources + orphan_profiles > 0 {
+        println!(
+            "🧹 Orphan cleanup — skill_trees: {}, skill_project_links: {}, mimir_skill_links: {}, skill_profiles: {}",
+            orphan_trees, orphan_projects, orphan_resources, orphan_profiles,
+        );
+    }
+
     let r4 = sync_jobs_inner(&database.pool).await?;
 
     sync_concept_slugs_inner(&database.pool).await?;
     recalculate_levels_inner(&database.pool).await?;
     expand_seed_neighbors(&database.pool).await?;
+
+    // Recompute skill_profiles.status from current origin + skill_trees state.
+    // Non-fatal: log on failure but don't roll back the sync.
+    if let Err(e) = refresh_skill_statuses(&database.pool).await {
+        println!("⚠️  refresh_skill_statuses failed (non-fatal): {}", e);
+    }
 
     println!("🌳 Synced all skills: resume={}, trees={}, work={}, jobs={}", r1.upserted, r2.upserted, r3.upserted, r4.upserted);
     Ok(vec![r1, r2, r3, r4])
@@ -662,14 +752,44 @@ pub async fn infer_skill_dependencies(
     client: State<'_, reqwest::Client>,
     database: State<'_, Database>,
 ) -> Result<usize, String> {
-    infer_skill_deps_inner(&*client, &database.pool).await
+    // Routed to the ANN-driven inferencer. The legacy alphabetical-batch
+    // implementation (`infer_skill_deps_inner`) remains defined below but
+    // is no longer called from anywhere.
+    infer_skill_deps_ann(&*client, &database.pool).await
 }
 
 pub(crate) async fn infer_skill_deps_inner(client: &reqwest::Client, pool: &PgPool) -> Result<usize, String> {
-    let rows = sqlx::query("SELECT id, name FROM universal_skills ORDER BY name")
+    // Skip transient job_gap skills with no engagement signal. They tend to
+    // churn (deleted in the next sync prune if no longer in any JD), so paying
+    // an LLM round-trip on them is wasted budget. A skill is included iff:
+    //   - origin is resume/work/tree_quest (durable sources), OR
+    //   - has a skill_trees row (user opened a tree for it), OR
+    //   - has a non-untouched skill_profiles status
+    let rows = sqlx::query(
+        "SELECT u.id, u.name
+         FROM universal_skills u
+         WHERE u.origin IN ('resume', 'work', 'tree_quest')
+            OR EXISTS (SELECT 1 FROM skill_trees st WHERE st.skill_id = u.id)
+            OR EXISTS (
+                SELECT 1 FROM skill_profiles sp
+                WHERE sp.skill_id = u.id AND sp.status NOT IN ('untouched')
+            )
+         ORDER BY u.name"
+    )
         .fetch_all(pool)
         .await
         .map_err(|e| e.to_string())?;
+
+    // Count what was filtered out so we can surface it.
+    let total_row = sqlx::query("SELECT COUNT(*)::bigint AS n FROM universal_skills")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let total: i64 = total_row.try_get("n").unwrap_or(0);
+    let skipped = (total as usize).saturating_sub(rows.len());
+    if skipped > 0 {
+        println!("⚡ Skipped dep inference for {} transient job_gap skills", skipped);
+    }
 
     if rows.len() < 2 { return Ok(0); }
 
@@ -897,6 +1017,295 @@ pub(crate) async fn infer_skill_deps_inner(client: &reqwest::Client, pool: &PgPo
 
     println!("🔗 Inferred {} skill deps ({} prereq pairs, {} related triples, {} batches)",
         count, all_pairs.len(), all_related.len(), batches.len());
+    Ok(count)
+}
+
+// ─── ANN-driven dep inference (replaces alphabetical batching) ──────────────
+
+/// New dep inferencer: builds LLM batches from semantic neighborhoods rather
+/// than alphabetical chunks. Every embedded skill becomes a cluster center;
+/// its top-12 nearest neighbors form the cluster. Heavily-overlapping clusters
+/// are skipped via a pair-dedup HashSet. Final batches pack up to 5 clusters
+/// into one LLM call (~65 skills max, deduplicated to unique names).
+///
+/// Reads embeddings only via server-side cosine queries — no Vec<f32> decoding
+/// (the codebase has no pgvector Rust crate). All ANN work happens in HNSW.
+pub(crate) async fn infer_skill_deps_ann(client: &reqwest::Client, pool: &PgPool) -> Result<usize, String> {
+    // 1. Load every embedded skill — id + name.
+    let rows = sqlx::query(
+        "SELECT id, name
+         FROM universal_skills
+         WHERE embedding IS NOT NULL
+         ORDER BY id"
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let total_skills_row = sqlx::query("SELECT COUNT(*)::bigint AS n FROM universal_skills")
+        .fetch_one(pool).await.map_err(|e| e.to_string())?;
+    let total_skills: i64 = total_skills_row.try_get("n").unwrap_or(0);
+    let skipped_unembedded = (total_skills as usize).saturating_sub(rows.len());
+    if skipped_unembedded > 0 {
+        println!("⚡ Skipped dep inference for {} unembedded skills", skipped_unembedded);
+    }
+
+    if rows.len() < 2 { return Ok(0); }
+
+    let centers: Vec<(String, String)> = rows.iter().filter_map(|r| {
+        let id: String = r.try_get("id").ok()?;
+        let name: String = r.try_get("name").ok()?;
+        Some((id, name))
+    }).collect();
+
+    let name_to_id: std::collections::HashMap<String, String> = centers.iter()
+        .map(|(id, name)| (name.clone(), id.clone()))
+        .collect();
+    let lower_to_id: std::collections::HashMap<String, String> = centers.iter()
+        .map(|(id, name)| (name.to_lowercase(), id.clone()))
+        .collect();
+
+    // 2. For each center, fetch its top-12 neighbors as (id, name) pairs.
+    //    Uses a correlated subquery to feed the center's own embedding into
+    //    the cosine ORDER BY — avoids needing a Vec<f32> decoder.
+    struct Cluster { center_id: String, member_ids: Vec<String>, member_names: Vec<String> }
+    let mut clusters: Vec<Cluster> = Vec::with_capacity(centers.len());
+
+    for (center_id, center_name) in &centers {
+        let neighbor_rows = sqlx::query(
+            "SELECT u.id, u.name
+             FROM universal_skills u,
+                  (SELECT embedding FROM universal_skills WHERE id = $1) src
+             WHERE u.embedding IS NOT NULL
+               AND u.id != $1
+             ORDER BY u.embedding <=> src.embedding
+             LIMIT 12"
+        )
+        .bind(center_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("neighbor query failed for {}: {}", center_id, e))?;
+
+        let mut member_ids = Vec::with_capacity(13);
+        let mut member_names = Vec::with_capacity(13);
+        member_ids.push(center_id.clone());
+        member_names.push(center_name.clone());
+        for r in &neighbor_rows {
+            if let (Ok(id), Ok(name)) = (
+                r.try_get::<String, _>("id"),
+                r.try_get::<String, _>("name"),
+            ) {
+                member_ids.push(id);
+                member_names.push(name);
+            }
+        }
+        clusters.push(Cluster { center_id: center_id.clone(), member_ids, member_names });
+    }
+
+    // 3. Pair-dedup: skip clusters where >50% of pairs are already covered.
+    //    Pairs are stored as sorted tuples so (a,b) == (b,a).
+    let mut seen_pairs: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    fn ordered_pair(a: &str, b: &str) -> (String, String) {
+        if a < b { (a.to_string(), b.to_string()) } else { (b.to_string(), a.to_string()) }
+    }
+
+    let mut kept_clusters: Vec<Cluster> = Vec::new();
+    let mut skipped_clusters = 0usize;
+    for cluster in clusters {
+        let mut all_pairs_in_cluster: Vec<(String, String)> = Vec::new();
+        for i in 0..cluster.member_ids.len() {
+            for j in (i + 1)..cluster.member_ids.len() {
+                all_pairs_in_cluster.push(ordered_pair(&cluster.member_ids[i], &cluster.member_ids[j]));
+            }
+        }
+        let total = all_pairs_in_cluster.len().max(1);
+        let already_seen = all_pairs_in_cluster.iter().filter(|p| seen_pairs.contains(*p)).count();
+        if already_seen * 2 > total {
+            skipped_clusters += 1;
+            continue;
+        }
+        for p in &all_pairs_in_cluster { seen_pairs.insert(p.clone()); }
+        kept_clusters.push(cluster);
+    }
+    if skipped_clusters > 0 {
+        println!("🔁 ANN: skipped {} redundant clusters (>50% pairs already covered)", skipped_clusters);
+    }
+    if kept_clusters.is_empty() { return Ok(0); }
+
+    // 4. Pack 5 clusters per LLM batch, deduplicating skill names within the batch.
+    const CLUSTERS_PER_BATCH: usize = 5;
+    let batches: Vec<Vec<&Cluster>> = kept_clusters
+        .chunks(CLUSTERS_PER_BATCH)
+        .map(|chunk| chunk.iter().collect())
+        .collect();
+
+    let api_key = std::env::var("GROQ_API_KEY")
+        .map_err(|_| "GROQ_API_KEY environment variable not set".to_string())?;
+
+    let system_prompt = "You are a technical curriculum expert. Given a list of skills that are semantically related, identify prerequisite relationships between them.\n\n\
+        A prerequisite means: you cannot meaningfully learn skill B without first understanding skill A.\n\n\
+        Rules:\n\
+        - Only include strong, unambiguous prerequisites\n\
+        - Both skills must be from the provided list\n\
+        - Return ONLY a JSON array, no markdown, no explanation\n\
+        - Format: [{\"from\": \"prerequisite_skill\", \"to\": \"dependent_skill\"}]\n\
+        - Maximum 20 pairs per response\n\
+        - If no strong prerequisites exist, return []";
+
+    #[derive(Deserialize)]
+    struct DepPair { from: String, to: String }
+
+    let mut all_pairs: Vec<DepPair> = Vec::new();
+    let mut batches_run = 0usize;
+
+    for (i, batch) in batches.iter().enumerate() {
+        if i > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+
+        // Deduplicate skill names within the batch.
+        let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut deduped_names: Vec<&str> = Vec::new();
+        for cluster in batch {
+            for name in &cluster.member_names {
+                if seen_names.insert(name.as_str()) {
+                    deduped_names.push(name.as_str());
+                }
+            }
+        }
+
+        let user_prompt = format!("Skills: {}", deduped_names.join(", "));
+        let t0 = std::time::Instant::now();
+        let response = client
+            .post(GROQ_API_URL)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "model": "llama-3.3-70b-versatile",
+                "messages": [
+                    { "role": "system", "content": system_prompt },
+                    { "role": "user",   "content": user_prompt }
+                ],
+                "temperature": 0.1,
+                "max_tokens": 800
+            }))
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await;
+
+        let elapsed = t0.elapsed().as_millis() as i64;
+        batches_run += 1;
+
+        match response {
+            Err(e) => {
+                crate::brain::log_prompt_call(
+                    pool.clone(), "skill_deps_ann", "llama-3.3-70b-versatile", "skill_deps_ann_v1",
+                    elapsed, false, Some(e.to_string()), None,
+                );
+                println!("⚠️  ANN batch {} HTTP failed (non-fatal): {}", i + 1, e);
+                continue;
+            }
+            Ok(resp) => {
+                let body: serde_json::Value = match resp.json().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        println!("⚠️  ANN batch {} body parse failed: {}", i + 1, e);
+                        continue;
+                    }
+                };
+                let content = body["choices"][0]["message"]["content"].as_str().unwrap_or("[]");
+                let clean = content
+                    .trim()
+                    .trim_start_matches("```json")
+                    .trim_start_matches("```")
+                    .trim_end_matches("```")
+                    .trim();
+                let batch_pairs: Vec<DepPair> = match serde_json::from_str(clean) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let preview: String = clean.chars().take(200).collect();
+                        println!("⚠️  dep parse failed for batch {}: {} | response: {}", i + 1, e, preview);
+                        Vec::new()
+                    }
+                };
+                crate::brain::log_prompt_call(
+                    pool.clone(), "skill_deps_ann", "llama-3.3-70b-versatile", "skill_deps_ann_v1",
+                    elapsed, true, None,
+                    Some(serde_json::json!({ "batch": i, "skills": deduped_names.len(), "pairs": batch_pairs.len() })),
+                );
+                println!("🔗 ANN batch {}: {} pairs from {} skills", i + 1, batch_pairs.len(), deduped_names.len());
+                all_pairs.extend(batch_pairs);
+            }
+        }
+    }
+
+    // 5. Resolve names → ids once, in memory, before touching the DB. This
+    //    way we collect the final (source_id, target_id) write set up front
+    //    and the actual transaction window stays short.
+    let mut resolved_pairs: Vec<(String, String)> = Vec::with_capacity(all_pairs.len());
+    let mut unknown_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let _ = &name_to_id; // name_to_id retained for parity with old code; lower_to_id is the one we use
+
+    for pair in &all_pairs {
+        let from_id = lower_to_id.get(&pair.from.to_lowercase());
+        let to_id = lower_to_id.get(&pair.to.to_lowercase());
+        match (from_id, to_id) {
+            (Some(fid), Some(tid)) if fid != tid => {
+                resolved_pairs.push((fid.clone(), tid.clone()));
+            }
+            (Some(_), Some(_)) => { /* self-loop, drop */ }
+            _ => {
+                if from_id.is_none() { unknown_names.insert(pair.from.clone()); }
+                if to_id.is_none() { unknown_names.insert(pair.to.clone()); }
+            }
+        }
+    }
+
+    for name in &unknown_names {
+        println!("⚠️  dep unknown skill: {}", name);
+    }
+
+    // 6. Atomic swap. We open the transaction here — not at the top of the
+    //    function — because holding a tx across LLM calls would pin a Neon
+    //    connection in idle-in-transaction state for tens of seconds per
+    //    batch and risk hitting the server's idle timeout. The atomicity the
+    //    spec asks for ("if the LLM calls fail partway through, the old
+    //    edges are not lost") is preserved either way: any LLM/HTTP error
+    //    above returns Err before we reach this point, so the DELETE never
+    //    runs and the existing graph stays intact.
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+
+    sqlx::query(
+        "DELETE FROM skill_dependencies
+         WHERE relationship = 'prerequisite' AND is_manual = false"
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut count = 0usize;
+    for (fid, tid) in &resolved_pairs {
+        let dep_id = Uuid::new_v4().to_string();
+        let res = sqlx::query(
+            "INSERT INTO skill_dependencies (id, source_skill_id, target_skill_id, relationship)
+             VALUES ($1, $2, $3, 'prerequisite')
+             ON CONFLICT (source_skill_id, target_skill_id) DO NOTHING"
+        )
+        .bind(&dep_id)
+        .bind(fid)
+        .bind(tid)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+        if res.rows_affected() > 0 { count += 1; }
+    }
+
+    tx.commit().await.map_err(|e| e.to_string())?;
+
+    println!(
+        "🔗 Inferred {} skill deps via ANN ({} pairs, {} batches)",
+        count, all_pairs.len(), batches_run,
+    );
     Ok(count)
 }
 
@@ -1268,6 +1677,617 @@ pub async fn mark_skill_reviewed(
     Ok(())
 }
 
+// ─── skill_profiles mutations (status + notes from the Skill Detail panel) ──
+
+#[tauri::command]
+pub async fn update_skill_status(
+    skill_id: String,
+    status: String,
+    database: State<'_, Database>,
+) -> Result<(), String> {
+    if !["untouched", "in_progress", "practiced", "mastered"].contains(&status.as_str()) {
+        return Err(format!("invalid status: {}", status));
+    }
+    // Upsert so newly synced skills without a profile row still accept writes.
+    sqlx::query(
+        "INSERT INTO skill_profiles (skill_id, status, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (skill_id) DO UPDATE SET
+             status = EXCLUDED.status,
+             updated_at = NOW()"
+    )
+    .bind(&skill_id)
+    .bind(&status)
+    .execute(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn update_skill_notes(
+    skill_id: String,
+    notes: String,
+    database: State<'_, Database>,
+) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO skill_profiles (skill_id, notes, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (skill_id) DO UPDATE SET
+             notes = EXCLUDED.notes,
+             updated_at = NOW()"
+    )
+    .bind(&skill_id)
+    .bind(&notes)
+    .execute(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// ─── Skill status refresh ────────────────────────────────────────────────────
+
+/// Recompute `skill_profiles.status` for every skill based on derived signals.
+///
+/// Priority order (highest wins, evaluated as three sequential upserts):
+///   1. mastered     — already 'mastered'; never auto-downgrade. Preserved by
+///                     the `WHERE skill_profiles.status != 'mastered'` clause
+///                     in every UPDATE branch below.
+///   2. practiced    — origin IN ('resume','work')
+///   3. in_progress  — at least one row in skill_trees AND origin NOT IN
+///                     ('resume','work')
+///   4. untouched    — everything else (lowest priority; ON CONFLICT DO NOTHING
+///                     so we never overwrite an existing status).
+///
+/// Runs inside a single transaction so concurrent reads see a consistent set.
+pub(crate) async fn refresh_skill_statuses(pool: &PgPool) -> Result<(), String> {
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+
+    // 2. practiced — resume/work skills
+    sqlx::query(
+        "INSERT INTO skill_profiles (skill_id, status, updated_at)
+         SELECT id, 'practiced', NOW()
+         FROM universal_skills
+         WHERE origin IN ('resume', 'work')
+         ON CONFLICT (skill_id) DO UPDATE SET
+             status = EXCLUDED.status,
+             updated_at = NOW()
+         WHERE skill_profiles.status != 'mastered'
+           AND skill_profiles.status != EXCLUDED.status"
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("refresh practiced failed: {}", e))?;
+
+    // 3. in_progress — has a skill_trees row, origin is not resume/work
+    sqlx::query(
+        "INSERT INTO skill_profiles (skill_id, status, updated_at)
+         SELECT u.id, 'in_progress', NOW()
+         FROM universal_skills u
+         WHERE u.origin NOT IN ('resume', 'work')
+           AND EXISTS (SELECT 1 FROM skill_trees st WHERE st.skill_id = u.id)
+         ON CONFLICT (skill_id) DO UPDATE SET
+             status = EXCLUDED.status,
+             updated_at = NOW()
+         WHERE skill_profiles.status NOT IN ('practiced', 'mastered')
+           AND skill_profiles.status != EXCLUDED.status"
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("refresh in_progress failed: {}", e))?;
+
+    // 4. untouched — ensure every skill has a profile row, never overwrite
+    sqlx::query(
+        "INSERT INTO skill_profiles (skill_id, status, updated_at)
+         SELECT id, 'untouched', NOW()
+         FROM universal_skills
+         ON CONFLICT (skill_id) DO NOTHING"
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("refresh untouched failed: {}", e))?;
+
+    tx.commit().await.map_err(|e| format!("refresh commit failed: {}", e))?;
+
+    // Summary log
+    if let Ok(rows) = sqlx::query(
+        "SELECT status, COUNT(*)::bigint AS n FROM skill_profiles GROUP BY status"
+    )
+    .fetch_all(pool)
+    .await {
+        let mut counts: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+        for r in rows {
+            let status: String = r.try_get("status").unwrap_or_default();
+            let n: i64 = r.try_get("n").unwrap_or(0);
+            counts.insert(status, n);
+        }
+        println!(
+            "🩺 refresh_skill_statuses: mastered: {}, practiced: {}, in_progress: {}, untouched: {}",
+            counts.get("mastered").copied().unwrap_or(0),
+            counts.get("practiced").copied().unwrap_or(0),
+            counts.get("in_progress").copied().unwrap_or(0),
+            counts.get("untouched").copied().unwrap_or(0),
+        );
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn refresh_skill_statuses_cmd(
+    database: State<'_, Database>,
+) -> Result<(), String> {
+    refresh_skill_statuses(&database.pool).await
+}
+
+// ─── Skill embedding backfill ────────────────────────────────────────────────
+
+/// Embed every `universal_skills` row whose `embedding` column is NULL.
+/// Reuses the same OpenRouter pplx-embed-v1-0.6b endpoint as Mimir chunks,
+/// batched 50 per call. Returns the count embedded.
+///
+/// Called automatically at the tail of `classify_skill_domains` so newly
+/// synced + classified skills get embedded on every sync without UI prompts.
+pub(crate) async fn backfill_skill_embeddings(
+    client: &reqwest::Client,
+    pool: &PgPool,
+) -> Result<usize, String> {
+    let rows = sqlx::query(
+        "SELECT us.id, us.name, us.display_name, sd.name as domain_name
+         FROM universal_skills us
+         LEFT JOIN skill_domains sd ON sd.id = us.domain_id
+         WHERE us.embedding IS NULL
+         ORDER BY us.id"
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if rows.is_empty() { return Ok(0); }
+
+    struct Pending { id: String, text: String }
+    let pending: Vec<Pending> = rows.iter().filter_map(|r| {
+        let id: String = r.try_get("id").ok()?;
+        let name: String = r.try_get("name").ok()?;
+        let display_name: String = r.try_get::<Option<String>, _>("display_name").ok().flatten().unwrap_or_default();
+        let domain_name: String = r.try_get::<Option<String>, _>("domain_name").ok().flatten().unwrap_or_default();
+        let text = format!("{} {} {}", name, display_name, domain_name)
+            .split_whitespace().collect::<Vec<_>>().join(" ");
+        if text.is_empty() { return None; }
+        Some(Pending { id, text })
+    }).collect();
+
+    let total = pending.len();
+    let mut embedded = 0usize;
+
+    const BATCH_SIZE: usize = 50;
+    for batch in pending.chunks(BATCH_SIZE) {
+        let texts: Vec<String> = batch.iter().map(|p| p.text.clone()).collect();
+        let embeddings = match crate::mimir_ingest::get_embeddings_batch(client, &texts).await {
+            Ok(v) => v,
+            Err(e) => {
+                println!("⚠️  backfill_skill_embeddings batch failed: {}", e);
+                continue;
+            }
+        };
+        if embeddings.len() != batch.len() {
+            println!(
+                "⚠️  backfill_skill_embeddings batch length mismatch: got {} for {} inputs",
+                embeddings.len(), batch.len()
+            );
+            continue;
+        }
+        for (p, emb) in batch.iter().zip(embeddings.iter()) {
+            let vec_str = crate::mimir_ingest::vector_str(emb);
+            match sqlx::query(
+                "UPDATE universal_skills SET embedding = $1::vector WHERE id = $2"
+            )
+            .bind(&vec_str)
+            .bind(&p.id)
+            .execute(pool)
+            .await {
+                Ok(_) => embedded += 1,
+                Err(e) => println!("⚠️  embed UPDATE failed for {}: {}", p.id, e),
+            }
+        }
+    }
+
+    println!("🧠 Embedded {}/{} skills", embedded, total);
+    Ok(embedded)
+}
+
+#[tauri::command]
+pub async fn backfill_skill_embeddings_cmd(
+    client: State<'_, reqwest::Client>,
+    database: State<'_, Database>,
+) -> Result<String, String> {
+    let n = backfill_skill_embeddings(&*client, &database.pool).await?;
+    Ok(format!("Embedded {} skills", n))
+}
+
+#[tauri::command]
+pub async fn get_similar_skills(
+    skill_id: String,
+    limit: Option<usize>,
+    database: State<'_, Database>,
+) -> Result<Vec<crate::read_models::NearestSkill>, String> {
+    let limit = limit.unwrap_or(8) as i64;
+    let pool = &database.pool;
+
+    // First check the source skill has an embedding — early-return empty if not.
+    // This avoids running an expensive ORDER BY against a NULL probe vector
+    // (Postgres would error, but we'd rather degrade silently).
+    let probe = sqlx::query(
+        "SELECT 1 AS ok FROM universal_skills
+         WHERE id = $1 AND embedding IS NOT NULL
+         LIMIT 1"
+    )
+    .bind(&skill_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if probe.is_none() {
+        return Ok(Vec::new());
+    }
+
+    // Single-query ANN: subquery pulls the source row's embedding and feeds
+    // it back into the cosine ORDER BY. HNSW index (mig 044) handles it.
+    let rows = sqlx::query(
+        "SELECT u.id,
+                u.name,
+                (u.embedding <=> src.embedding)::float4 AS distance
+         FROM universal_skills u,
+              (SELECT embedding FROM universal_skills WHERE id = $1) src
+         WHERE u.embedding IS NOT NULL
+           AND u.id != $1
+         ORDER BY u.embedding <=> src.embedding
+         LIMIT $2"
+    )
+    .bind(&skill_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(rows.iter().filter_map(|r| {
+        Some(crate::read_models::NearestSkill {
+            skill_id: r.try_get("id").ok()?,
+            name: r.try_get("name").ok()?,
+            distance: r.try_get::<f32, _>("distance").unwrap_or(1.0),
+        })
+    }).collect())
+}
+
+// ─── Direct skill → resource ANN (bypasses concept_slug bridge) ──────────────
+
+/// Match a skill against the full Mimir chunk corpus by cosine distance.
+/// Groups winning chunks by (resource_id, section_title) so a textbook with
+/// multiple relevant chapters surfaces as multiple link rows. Chunks with
+/// NULL section_title fall through to whole-resource entries.
+///
+/// Writes results into `mimir_skill_links` with section metadata denormalized
+/// for the panel renderer. Returns the count of rows upserted.
+#[tauri::command]
+pub async fn match_skill_to_resources(
+    skill_id: String,
+    limit: Option<usize>,
+    database: State<'_, Database>,
+) -> Result<usize, String> {
+    let limit_i = limit.unwrap_or(8) as i64;
+    let pool = &database.pool;
+
+    // Probe: skill must exist + have an embedding.
+    let probe = sqlx::query(
+        "SELECT 1 AS ok FROM universal_skills \
+         WHERE id = $1 AND embedding IS NOT NULL LIMIT 1"
+    )
+    .bind(&skill_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if probe.is_none() { return Ok(0); }
+
+    // Sectioned candidates — group by (resource_id, section_title), MIN distance
+    // per group, take one representative chunk per group via DISTINCT ON.
+    let sectioned_rows = sqlx::query(
+        "SELECT DISTINCT ON (mc.resource_id, mc.section_title) \
+                mc.resource_id, \
+                mc.id AS chunk_id, \
+                mc.section_title, \
+                mc.page_start, \
+                mc.page_end, \
+                (me.embedding <=> src.embedding)::float4 AS distance \
+         FROM mimir_chunks mc \
+         JOIN mimir_embeddings me ON me.chunk_id = mc.id \
+         CROSS JOIN (SELECT embedding FROM universal_skills WHERE id = $1) src \
+         WHERE mc.section_title IS NOT NULL \
+         ORDER BY mc.resource_id, mc.section_title, me.embedding <=> src.embedding \
+         LIMIT $2"
+    )
+    .bind(&skill_id)
+    .bind(limit_i * 4) // over-fetch sectioned candidates so the final mix has variety
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("sectioned ANN failed: {}", e))?;
+
+    // Whole-resource candidates — for resources whose chunks have no section,
+    // take the single best-matching chunk per resource.
+    let whole_rows = sqlx::query(
+        "SELECT DISTINCT ON (mc.resource_id) \
+                mc.resource_id, \
+                mc.id AS chunk_id, \
+                (me.embedding <=> src.embedding)::float4 AS distance \
+         FROM mimir_chunks mc \
+         JOIN mimir_embeddings me ON me.chunk_id = mc.id \
+         CROSS JOIN (SELECT embedding FROM universal_skills WHERE id = $1) src \
+         WHERE mc.section_title IS NULL \
+         ORDER BY mc.resource_id, me.embedding <=> src.embedding \
+         LIMIT $2"
+    )
+    .bind(&skill_id)
+    .bind(limit_i * 2)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("whole-resource ANN failed: {}", e))?;
+
+    // Merge + sort by distance ASC, truncate to limit
+    struct Candidate {
+        resource_id: String,
+        chunk_id: String,
+        section_title: Option<String>,
+        page_start: Option<i32>,
+        page_end: Option<i32>,
+        distance: f32,
+    }
+    let mut all: Vec<Candidate> = Vec::with_capacity(sectioned_rows.len() + whole_rows.len());
+    for r in &sectioned_rows {
+        all.push(Candidate {
+            resource_id: match r.try_get("resource_id") { Ok(v) => v, Err(_) => continue },
+            chunk_id: r.try_get("chunk_id").unwrap_or_default(),
+            section_title: r.try_get("section_title").ok(),
+            page_start: r.try_get("page_start").ok(),
+            page_end: r.try_get("page_end").ok(),
+            distance: r.try_get::<f32, _>("distance").unwrap_or(1.0),
+        });
+    }
+    for r in &whole_rows {
+        all.push(Candidate {
+            resource_id: match r.try_get("resource_id") { Ok(v) => v, Err(_) => continue },
+            chunk_id: r.try_get("chunk_id").unwrap_or_default(),
+            section_title: None,
+            page_start: None,
+            page_end: None,
+            distance: r.try_get::<f32, _>("distance").unwrap_or(1.0),
+        });
+    }
+    all.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal));
+    all.truncate(limit_i as usize);
+
+    let mut written = 0usize;
+    for c in &all {
+        if let Some(ref section) = c.section_title {
+            let row_id = Uuid::new_v4().to_string();
+            let res = sqlx::query(
+                "INSERT INTO mimir_skill_links \
+                   (id, skill_id, resource_id, relevance_score, \
+                    matched_chunk_id, matched_section_title, matched_page_start, matched_page_end) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                 ON CONFLICT (skill_id, resource_id, matched_section_title) \
+                   WHERE matched_section_title IS NOT NULL \
+                 DO UPDATE SET \
+                   relevance_score = EXCLUDED.relevance_score, \
+                   matched_chunk_id = EXCLUDED.matched_chunk_id, \
+                   matched_page_start = EXCLUDED.matched_page_start, \
+                   matched_page_end = EXCLUDED.matched_page_end"
+            )
+            .bind(&row_id)
+            .bind(&skill_id)
+            .bind(&c.resource_id)
+            .bind(c.distance)
+            .bind(&c.chunk_id)
+            .bind(section)
+            .bind(c.page_start)
+            .bind(c.page_end)
+            .execute(pool)
+            .await;
+            if res.is_ok() { written += 1; }
+        } else {
+            let row_id = Uuid::new_v4().to_string();
+            let res = sqlx::query(
+                "INSERT INTO mimir_skill_links \
+                   (id, skill_id, resource_id, relevance_score, matched_chunk_id) \
+                 VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT (skill_id, resource_id) \
+                   WHERE matched_section_title IS NULL \
+                 DO UPDATE SET \
+                   relevance_score = EXCLUDED.relevance_score, \
+                   matched_chunk_id = EXCLUDED.matched_chunk_id"
+            )
+            .bind(&row_id)
+            .bind(&skill_id)
+            .bind(&c.resource_id)
+            .bind(c.distance)
+            .bind(&c.chunk_id)
+            .execute(pool)
+            .await;
+            if res.is_ok() { written += 1; }
+        }
+    }
+
+    Ok(written)
+}
+
+// ─── Backfill: match every embedded skill to resources ──────────────────────
+
+#[tauri::command]
+pub async fn run_skill_resource_backfill(
+    database: State<'_, Database>,
+) -> Result<String, String> {
+    let pool = &database.pool;
+
+    let rows = sqlx::query(
+        "SELECT id FROM universal_skills WHERE embedding IS NOT NULL ORDER BY id"
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let total = rows.len();
+    if total == 0 {
+        return Ok("No embedded skills to backfill".to_string());
+    }
+
+    let mut processed = 0usize;
+    let mut total_written = 0usize;
+    for r in &rows {
+        let skill_id: String = match r.try_get("id") { Ok(v) => v, Err(_) => continue };
+        // Inline the match logic so we can take pool by &, not by State.
+        match run_skill_match_inner(pool, &skill_id, 8).await {
+            Ok(n) => total_written += n,
+            Err(e) => println!("⚠️  backfill failed for skill {}: {}", skill_id, e),
+        }
+        processed += 1;
+        if processed % 25 == 0 {
+            println!("📚 skill→resource backfill: {}/{} skills processed", processed, total);
+        }
+    }
+
+    let summary = format!(
+        "Matched {} skill→resource links across {} skills",
+        total_written, processed,
+    );
+    println!("📚 {}", summary);
+    Ok(summary)
+}
+
+/// Internal: same as match_skill_to_resources but operating on a borrowed pool
+/// so the backfill loop can call it directly without a Tauri State.
+async fn run_skill_match_inner(
+    pool: &PgPool,
+    skill_id: &str,
+    limit: usize,
+) -> Result<usize, String> {
+    let limit_i = limit as i64;
+
+    let probe = sqlx::query(
+        "SELECT 1 AS ok FROM universal_skills \
+         WHERE id = $1 AND embedding IS NOT NULL LIMIT 1"
+    )
+    .bind(skill_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if probe.is_none() { return Ok(0); }
+
+    let sectioned_rows = sqlx::query(
+        "SELECT DISTINCT ON (mc.resource_id, mc.section_title) \
+                mc.resource_id, mc.id AS chunk_id, mc.section_title, \
+                mc.page_start, mc.page_end, \
+                (me.embedding <=> src.embedding)::float4 AS distance \
+         FROM mimir_chunks mc \
+         JOIN mimir_embeddings me ON me.chunk_id = mc.id \
+         CROSS JOIN (SELECT embedding FROM universal_skills WHERE id = $1) src \
+         WHERE mc.section_title IS NOT NULL \
+         ORDER BY mc.resource_id, mc.section_title, me.embedding <=> src.embedding \
+         LIMIT $2"
+    )
+    .bind(skill_id)
+    .bind(limit_i * 4)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let whole_rows = sqlx::query(
+        "SELECT DISTINCT ON (mc.resource_id) \
+                mc.resource_id, mc.id AS chunk_id, \
+                (me.embedding <=> src.embedding)::float4 AS distance \
+         FROM mimir_chunks mc \
+         JOIN mimir_embeddings me ON me.chunk_id = mc.id \
+         CROSS JOIN (SELECT embedding FROM universal_skills WHERE id = $1) src \
+         WHERE mc.section_title IS NULL \
+         ORDER BY mc.resource_id, me.embedding <=> src.embedding \
+         LIMIT $2"
+    )
+    .bind(skill_id)
+    .bind(limit_i * 2)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    struct C {
+        resource_id: String,
+        chunk_id: String,
+        section_title: Option<String>,
+        page_start: Option<i32>,
+        page_end: Option<i32>,
+        distance: f32,
+    }
+    let mut all: Vec<C> = Vec::with_capacity(sectioned_rows.len() + whole_rows.len());
+    for r in &sectioned_rows {
+        all.push(C {
+            resource_id: match r.try_get("resource_id") { Ok(v) => v, Err(_) => continue },
+            chunk_id: r.try_get("chunk_id").unwrap_or_default(),
+            section_title: r.try_get("section_title").ok(),
+            page_start: r.try_get("page_start").ok(),
+            page_end: r.try_get("page_end").ok(),
+            distance: r.try_get::<f32, _>("distance").unwrap_or(1.0),
+        });
+    }
+    for r in &whole_rows {
+        all.push(C {
+            resource_id: match r.try_get("resource_id") { Ok(v) => v, Err(_) => continue },
+            chunk_id: r.try_get("chunk_id").unwrap_or_default(),
+            section_title: None,
+            page_start: None,
+            page_end: None,
+            distance: r.try_get::<f32, _>("distance").unwrap_or(1.0),
+        });
+    }
+    all.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal));
+    all.truncate(limit);
+
+    let mut written = 0usize;
+    for c in &all {
+        if let Some(ref section) = c.section_title {
+            let row_id = Uuid::new_v4().to_string();
+            let res = sqlx::query(
+                "INSERT INTO mimir_skill_links \
+                   (id, skill_id, resource_id, relevance_score, \
+                    matched_chunk_id, matched_section_title, matched_page_start, matched_page_end) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                 ON CONFLICT (skill_id, resource_id, matched_section_title) \
+                   WHERE matched_section_title IS NOT NULL \
+                 DO UPDATE SET \
+                   relevance_score = EXCLUDED.relevance_score, \
+                   matched_chunk_id = EXCLUDED.matched_chunk_id, \
+                   matched_page_start = EXCLUDED.matched_page_start, \
+                   matched_page_end = EXCLUDED.matched_page_end"
+            )
+            .bind(&row_id).bind(skill_id).bind(&c.resource_id).bind(c.distance)
+            .bind(&c.chunk_id).bind(section).bind(c.page_start).bind(c.page_end)
+            .execute(pool).await;
+            if res.is_ok() { written += 1; }
+        } else {
+            let row_id = Uuid::new_v4().to_string();
+            let res = sqlx::query(
+                "INSERT INTO mimir_skill_links \
+                   (id, skill_id, resource_id, relevance_score, matched_chunk_id) \
+                 VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT (skill_id, resource_id) \
+                   WHERE matched_section_title IS NULL \
+                 DO UPDATE SET \
+                   relevance_score = EXCLUDED.relevance_score, \
+                   matched_chunk_id = EXCLUDED.matched_chunk_id"
+            )
+            .bind(&row_id).bind(skill_id).bind(&c.resource_id).bind(c.distance).bind(&c.chunk_id)
+            .execute(pool).await;
+            if res.is_ok() { written += 1; }
+        }
+    }
+    Ok(written)
+}
+
 // ─── Domain classification ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1284,6 +2304,36 @@ pub async fn classify_skill_domains(
     database: State<'_, Database>,
 ) -> Result<ClassificationResult, String> {
     let api_key = std::env::var("GROQ_API_KEY").map_err(|_| "GROQ_API_KEY not set".to_string())?;
+
+    // ── Step 1: ensure the skill_domains table is populated ─────────────────
+    // Seed common domain names the LLM tends to return. Idempotent: ON CONFLICT
+    // on name skips existing rows. Uses generated UUIDs for new rows; existing
+    // seeds (e.g. 'dom-*' slugs from migration 029) are untouched.
+    let seed_names: [&str; 35] = [
+        "Machine Learning", "Data Science", "Software Engineering",
+        "Web Development", "DevOps", "Engineering", "Computing",
+        "Mathematics", "Physics", "Business", "Communication",
+        "Databases", "Natural Language Processing", "Deep Learning",
+        "Computer Vision", "Research Methods", "Science", "Visualization",
+        "Cybersecurity", "Materials Science", "Energy",
+        "Systems Programming", "High-Performance Computing",
+        "Distributed Systems", "Human-Computer Interaction",
+        "Robotics", "Simulation", "Hardware", "Embedded Systems",
+        "Quantum Computing", "Design", "GIS", "Bioinformatics",
+        "Control Systems", "Signal Processing",
+    ];
+    for name in seed_names.iter() {
+        let new_id = Uuid::new_v4().to_string();
+        let _ = sqlx::query(
+            "INSERT INTO skill_domains (id, name, description)
+             VALUES ($1, $2, '')
+             ON CONFLICT (name) DO NOTHING"
+        )
+        .bind(&new_id)
+        .bind(*name)
+        .execute(&database.pool)
+        .await;
+    }
 
     // Load all domains with descriptions
     let domain_rows = sqlx::query(
@@ -1304,8 +2354,40 @@ pub async fn classify_skill_domains(
         (id, name, desc)
     }).collect();
 
-    // Build a set of valid IDs for post-LLM validation — prevents FK violations
-    // when the model hallucinates an ID not present in skill_domains.
+    // ── Step 2: name → id resolution map ────────────────────────────────────
+    // The LLM frequently returns a domain *name* rather than the exact id we
+    // listed. Build a normalized lookup keyed by lowercase, stripped of
+    // spaces / hyphens / underscores, mapping to the canonical id.
+    fn normalize_domain_key(s: &str) -> String {
+        s.to_lowercase()
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '-' && *c != '_')
+            .collect()
+    }
+    let mut domain_lookup: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (id, name, _) in &domains {
+        domain_lookup.insert(normalize_domain_key(name), id.clone());
+        domain_lookup.insert(normalize_domain_key(id), id.clone());
+    }
+
+    // Explicit aliases for compound names (redundant with the normalize step
+    // above, kept defensively so the lookup survives future normalizer changes).
+    let alias_pairs: [(&str, &str); 4] = [
+        ("quantumcomputing", "Quantum Computing"),
+        ("embeddedsystems",  "Embedded Systems"),
+        ("controlsystems",   "Control Systems"),
+        ("signalprocessing", "Signal Processing"),
+    ];
+    for (alias, canonical_name) in alias_pairs.iter() {
+        if let Some(canonical_id) = domains.iter()
+            .find(|(_, n, _)| n == canonical_name)
+            .map(|(id, _, _)| id.clone())
+        {
+            domain_lookup.insert((*alias).to_string(), canonical_id);
+        }
+    }
+
+    // Kept for the "did this id exist at all" check inside the loop.
     let valid_domain_ids: std::collections::HashSet<&str> =
         domains.iter().map(|(id, _, _)| id.as_str()).collect();
 
@@ -1434,19 +2516,39 @@ pub async fn classify_skill_domains(
         );
 
         for (skill_id, domain_id) in &mapping {
-            // Reject hallucinated IDs before they hit the FK constraint
-            if !valid_domain_ids.contains(domain_id.as_str()) {
-                eprintln!("⚠️ LLM returned unknown domain_id '{}' for skill {} — skipping", domain_id, skill_id);
-                failed += 1;
-                continue;
-            }
+            // Resolve via normalized name/id lookup before hitting the FK.
+            // This rescues responses where the LLM returns "Machine Learning"
+            // instead of the canonical id we showed it.
+            let resolved_id = match domain_lookup.get(&normalize_domain_key(domain_id)) {
+                Some(id) => id.clone(),
+                None => {
+                    if valid_domain_ids.contains(domain_id.as_str()) {
+                        domain_id.clone()
+                    } else {
+                        eprintln!("⚠️ LLM returned unknown domain_id '{}' for skill {} — skipping", domain_id, skill_id);
+                        failed += 1;
+                        continue;
+                    }
+                }
+            };
 
+            // Null out embedding when domain_id changes so the post-classify
+            // backfill_skill_embeddings call re-embeds with the new domain
+            // name baked into the embed text. The IS DISTINCT FROM guard
+            // means unchanged classifications don't trigger a wasted re-embed.
             let res = sqlx::query(
                 "UPDATE universal_skills
-                 SET domain_id = $1, status = 'active', review_needed = false, last_updated = NOW()
+                 SET domain_id = $1,
+                     status = 'active',
+                     review_needed = false,
+                     last_updated = NOW(),
+                     embedding = CASE
+                         WHEN domain_id IS DISTINCT FROM $1 THEN NULL
+                         ELSE embedding
+                     END
                  WHERE id = $2"
             )
-            .bind(domain_id)
+            .bind(&resolved_id)
             .bind(skill_id)
             .execute(&database.pool)
             .await;
@@ -1471,6 +2573,13 @@ pub async fn classify_skill_domains(
     }
 
     println!("🏷️ classify_skill_domains: {classified}/{total} classified, {failed} failed");
+
+    // Auto-embed newly classified skills. Non-fatal — log on failure but
+    // never block classification results from returning.
+    if let Err(e) = backfill_skill_embeddings(&*client, &database.pool).await {
+        println!("⚠️  backfill_skill_embeddings (post-classify) failed: {}", e);
+    }
+
     Ok(ClassificationResult { total, classified, failed })
 }
 
@@ -1599,15 +2708,26 @@ pub async fn sync_concept_slugs_inner(pool: &PgPool) -> Result<usize, String> {
         });
 
         if let Some(slug) = matched_slug {
-            sqlx::query(
-                "UPDATE universal_skills SET concept_slug = $1 WHERE id = $2 AND concept_slug IS NULL"
+            // Guard the unique partial index on concept_slug. Multiple skills
+            // can match the same tree_node slug (e.g. surviving skills after
+            // a merge prune); the first wins, the rest skip silently.
+            let result = sqlx::query(
+                "UPDATE universal_skills
+                 SET concept_slug = $1
+                 WHERE id = $2
+                   AND concept_slug IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM universal_skills WHERE concept_slug = $1
+                   )"
             )
             .bind(&slug)
             .bind(&skill_id)
             .execute(pool)
             .await
             .map_err(|e| e.to_string())?;
-            updated += 1;
+            if result.rows_affected() > 0 {
+                updated += 1;
+            }
         }
     }
 

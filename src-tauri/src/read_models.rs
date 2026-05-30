@@ -2503,3 +2503,946 @@ pub async fn get_tailored_projects(
         top_projects: tailored,
     })
 }
+
+// ─── GapPath ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillStep {
+    pub skill_id: String,
+    pub skill_name: String,
+    pub level: i32,
+    pub state: String,
+    pub origin: String,
+    pub has_tree: bool,
+    pub tree_node_id: Option<String>,
+    pub tree_project_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GapPath {
+    pub gap_skill_id: String,
+    pub gap_skill_name: String,
+    pub path: Vec<SkillStep>,
+    pub estimated_depth: u32,
+}
+
+#[tauri::command]
+pub async fn get_gap_path(
+    skill_id: String,
+    database: State<'_, Database>,
+) -> Result<GapPath, String> {
+    let pool = &database.pool;
+
+    let target_row = sqlx::query(
+        "SELECT id, name, COALESCE(level, 0) AS level
+         FROM universal_skills
+         WHERE id = $1"
+    )
+    .bind(&skill_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("skill not found: {}", skill_id))?;
+
+    let gap_skill_name: String = target_row.try_get("name").map_err(|e| e.to_string())?;
+
+    let skill_rows = sqlx::query(
+        "SELECT id, name, COALESCE(state, 'adjacent') AS state,
+                COALESCE(origin, 'tree_quest') AS origin,
+                COALESCE(level, 0) AS level,
+                concept_slug
+         FROM universal_skills"
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    struct SkillMeta {
+        name: String,
+        state: String,
+        origin: String,
+        level: i32,
+        concept_slug: Option<String>,
+    }
+    let skill_meta: std::collections::HashMap<String, SkillMeta> = skill_rows.iter()
+        .filter_map(|r| {
+            let id: String = r.try_get("id").ok()?;
+            Some((id, SkillMeta {
+                name: r.try_get("name").ok()?,
+                state: r.try_get("state").ok()?,
+                origin: r.try_get("origin").ok()?,
+                level: r.try_get("level").unwrap_or(0),
+                concept_slug: r.try_get::<Option<String>, _>("concept_slug").ok().flatten(),
+            }))
+        })
+        .collect();
+
+    let dep_rows = sqlx::query(
+        "SELECT source_skill_id, target_skill_id
+         FROM skill_dependencies
+         WHERE relationship = 'prerequisite'"
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut prereqs_of: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for r in &dep_rows {
+        let source: String = match r.try_get("source_skill_id") { Ok(v) => v, Err(_) => continue };
+        let target: String = match r.try_get("target_skill_id") { Ok(v) => v, Err(_) => continue };
+        prereqs_of.entry(target).or_default().push(source);
+    }
+
+    const MAX_DEPTH: u32 = 8;
+    let mut depth_of: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut queue: std::collections::VecDeque<(String, u32)> = std::collections::VecDeque::new();
+    queue.push_back((skill_id.clone(), 0));
+    depth_of.insert(skill_id.clone(), 0);
+
+    while let Some((cur, d)) = queue.pop_front() {
+        if d >= MAX_DEPTH { continue; }
+        if cur != skill_id {
+            if let Some(meta) = skill_meta.get(&cur) {
+                if meta.level >= 2 { continue; }
+            }
+        }
+        if let Some(parents) = prereqs_of.get(&cur) {
+            for p in parents {
+                if !depth_of.contains_key(p) {
+                    depth_of.insert(p.clone(), d + 1);
+                    queue.push_back((p.clone(), d + 1));
+                }
+            }
+        }
+    }
+
+    let slugs: Vec<String> = depth_of.keys()
+        .filter_map(|id| skill_meta.get(id).and_then(|m| m.concept_slug.clone()))
+        .collect();
+    let mut slug_to_node: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
+    if !slugs.is_empty() {
+        let node_rows = sqlx::query(
+            "SELECT n.id, n.concept_slug, t.project_id
+             FROM tree_nodes n
+             JOIN trees t ON t.id = n.tree_id
+             WHERE n.concept_slug = ANY($1)"
+        )
+        .bind(&slugs)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        for r in node_rows {
+            let id: String = match r.try_get("id") { Ok(v) => v, Err(_) => continue };
+            let project_id: String = match r.try_get("project_id") { Ok(v) => v, Err(_) => continue };
+            let slug: Option<String> = r.try_get("concept_slug").ok();
+            if let Some(s) = slug {
+                slug_to_node.entry(s).or_insert((id, project_id));
+            }
+        }
+    }
+
+    let mut entries: Vec<(String, u32)> = depth_of.iter()
+        .filter(|(id, _)| **id != skill_id)
+        .map(|(id, d)| (id.clone(), *d))
+        .collect();
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let mut path: Vec<SkillStep> = entries.into_iter()
+        .filter_map(|(id, _)| {
+            let meta = skill_meta.get(&id)?;
+            let node_info = meta.concept_slug.as_ref().and_then(|s| slug_to_node.get(s).cloned());
+            let (tree_node_id, tree_project_id) = match node_info {
+                Some((n, p)) => (Some(n), Some(p)),
+                None => (None, None),
+            };
+            Some(SkillStep {
+                skill_id: id,
+                skill_name: meta.name.clone(),
+                level: meta.level,
+                state: meta.state.clone(),
+                origin: meta.origin.clone(),
+                has_tree: tree_node_id.is_some(),
+                tree_node_id,
+                tree_project_id,
+            })
+        })
+        .collect();
+
+    let target_meta = skill_meta.get(&skill_id);
+    let target_state = target_meta.map(|m| m.state.clone()).unwrap_or_else(|| "gap".to_string());
+    let target_origin = target_meta.map(|m| m.origin.clone()).unwrap_or_else(|| "job_gap".to_string());
+    let target_level = target_meta.map(|m| m.level).unwrap_or(0);
+    let target_slug = target_meta.and_then(|m| m.concept_slug.clone());
+    let target_node_info = target_slug.as_ref().and_then(|s| slug_to_node.get(s).cloned());
+    let (target_node, target_project) = match target_node_info {
+        Some((n, p)) => (Some(n), Some(p)),
+        None => (None, None),
+    };
+    path.push(SkillStep {
+        skill_id: skill_id.clone(),
+        skill_name: gap_skill_name.clone(),
+        level: target_level,
+        state: target_state,
+        origin: target_origin,
+        has_tree: target_node.is_some(),
+        tree_node_id: target_node,
+        tree_project_id: target_project,
+    });
+
+    let estimated_depth = depth_of.values().copied().max().unwrap_or(0);
+
+    Ok(GapPath {
+        gap_skill_id: skill_id,
+        gap_skill_name,
+        path,
+        estimated_depth,
+    })
+}
+
+// ─── SkillInlineContext (Learning Path inline expander) ──────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InlinePrereq {
+    pub skill_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InlineUnlock {
+    pub skill_id: String,
+    pub name: String,
+    pub job_demand_count: i32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InlineRelated {
+    pub skill_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InlineResource {
+    pub title: String,
+    pub url: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillInlineContext {
+    pub prereqs_done: Vec<InlinePrereq>,
+    pub unlocks: Vec<InlineUnlock>,
+    pub related: Vec<InlineRelated>,
+    pub resources: Vec<InlineResource>,
+}
+
+#[tauri::command]
+pub async fn get_skill_inline_context(
+    skill_id: String,
+    database: State<'_, Database>,
+) -> Result<SkillInlineContext, String> {
+    let pool = &database.pool;
+
+    // Look up this skill's name + domain so we can drive the "related" query.
+    let row = sqlx::query(
+        "SELECT name, domain_id FROM universal_skills WHERE id = $1"
+    )
+    .bind(&skill_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (skill_name, domain_id): (String, Option<String>) = match row {
+        None => return Err(format!("skill not found: {}", skill_id)),
+        Some(r) => (
+            r.try_get("name").map_err(|e| e.to_string())?,
+            r.try_get::<Option<String>, _>("domain_id").ok().flatten(),
+        ),
+    };
+
+    // ── prereqs_done ────────────────────────────────────────────────────────
+    // skills A such that A is a prerequisite of skill_id AND A is seed-state
+    let prereq_rows = sqlx::query(
+        "SELECT u.id, u.name
+         FROM skill_dependencies d
+         JOIN universal_skills u ON u.id = d.source_skill_id
+         WHERE d.target_skill_id = $1
+           AND d.relationship = 'prerequisite'
+           AND u.state = 'seed'
+         ORDER BY u.name ASC"
+    )
+    .bind(&skill_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let prereqs_done: Vec<InlinePrereq> = prereq_rows.iter().filter_map(|r| {
+        Some(InlinePrereq {
+            skill_id: r.try_get("id").ok()?,
+            name: r.try_get("name").ok()?,
+        })
+    }).collect();
+
+    // ── unlocks ─────────────────────────────────────────────────────────────
+    // skills B such that skill_id is a prerequisite of B, ranked by job demand
+    let unlock_rows = sqlx::query(
+        "SELECT u.id, u.name,
+                COALESCE((
+                    SELECT COUNT(DISTINCT j.job_id)::int
+                    FROM job_skills j
+                    WHERE LOWER(j.skill_name) = LOWER(u.name)
+                ), 0) AS demand
+         FROM skill_dependencies d
+         JOIN universal_skills u ON u.id = d.target_skill_id
+         WHERE d.source_skill_id = $1
+         ORDER BY demand DESC, u.name ASC
+         LIMIT 5"
+    )
+    .bind(&skill_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let unlocks: Vec<InlineUnlock> = unlock_rows.iter().filter_map(|r| {
+        Some(InlineUnlock {
+            skill_id: r.try_get("id").ok()?,
+            name: r.try_get("name").ok()?,
+            job_demand_count: r.try_get::<i32, _>("demand").unwrap_or(0),
+        })
+    }).collect();
+
+    // ── related (same domain, co-occur in jobs) ─────────────────────────────
+    // Find jobs requiring this skill, then count other skills appearing in
+    // those same jobs. Filter to same domain. Exclude this skill itself.
+    let related: Vec<InlineRelated> = if let Some(dom) = domain_id {
+        let related_rows = sqlx::query(
+            "WITH this_jobs AS (
+                 SELECT DISTINCT j.job_id
+                 FROM job_skills j
+                 WHERE LOWER(j.skill_name) = LOWER($1)
+             )
+             SELECT u.id, u.name, COUNT(DISTINCT j2.job_id) AS overlap
+             FROM job_skills j2
+             JOIN this_jobs tj ON tj.job_id = j2.job_id
+             JOIN universal_skills u ON LOWER(u.name) = LOWER(j2.skill_name)
+             WHERE u.id != $2
+               AND u.domain_id = $3
+             GROUP BY u.id, u.name
+             ORDER BY overlap DESC, u.name ASC
+             LIMIT 5"
+        )
+        .bind(&skill_name)
+        .bind(&skill_id)
+        .bind(&dom)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        related_rows.iter().filter_map(|r| {
+            Some(InlineRelated {
+                skill_id: r.try_get("id").ok()?,
+                name: r.try_get("name").ok()?,
+            })
+        }).collect()
+    } else {
+        Vec::new()
+    };
+
+    // ── resources ───────────────────────────────────────────────────────────
+    let resource_rows = sqlx::query(
+        "SELECT mr.title, mr.url
+         FROM mimir_skill_links msl
+         JOIN mimir_resources mr ON mr.id = msl.resource_id
+         WHERE msl.skill_id = $1
+         ORDER BY msl.relevance_score DESC NULLS LAST
+         LIMIT 5"
+    )
+    .bind(&skill_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let resources: Vec<InlineResource> = resource_rows.iter().filter_map(|r| {
+        Some(InlineResource {
+            title: r.try_get("title").ok()?,
+            url: r.try_get("url").ok()?,
+        })
+    }).collect();
+
+    Ok(SkillInlineContext { prereqs_done, unlocks, related, resources })
+}
+
+// ─── SkillGraphContext (GraphRAG-seeded tree generation) ────────────────────
+
+#[tauri::command]
+pub async fn get_skill_graph_context(
+    skill_id: String,
+    database: State<'_, Database>,
+) -> Result<String, String> {
+    let pool = &database.pool;
+
+    let row = sqlx::query(
+        "SELECT u.name,
+                COALESCE(d.name, '') AS domain
+         FROM universal_skills u
+         LEFT JOIN skill_domains d ON d.id = u.domain_id
+         WHERE u.id = $1"
+    )
+    .bind(&skill_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("skill not found: {}", skill_id))?;
+
+    let skill_name: String = row.try_get("name").map_err(|e| e.to_string())?;
+    let domain: String = row.try_get("domain").unwrap_or_default();
+
+    // Job demand for the focal skill
+    let demand_row = sqlx::query(
+        "SELECT COUNT(DISTINCT job_id)::int AS n
+         FROM job_skills
+         WHERE LOWER(skill_name) = LOWER($1)"
+    )
+    .bind(&skill_name)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let job_demand_count: i32 = demand_row.try_get("n").unwrap_or(0);
+
+    // Load all prereq edges once, then BFS both directions from skill_id, depth 3, cap 40 nodes
+    let edges_rows = sqlx::query(
+        "SELECT source_skill_id, target_skill_id
+         FROM skill_dependencies
+         WHERE relationship = 'prerequisite'"
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut prereqs_of: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut unlocks_of: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for r in &edges_rows {
+        let s: String = match r.try_get("source_skill_id") { Ok(v) => v, Err(_) => continue };
+        let t: String = match r.try_get("target_skill_id") { Ok(v) => v, Err(_) => continue };
+        // source is prerequisite of target, target unlocks once source learned.
+        prereqs_of.entry(t.clone()).or_default().push(s.clone());
+        unlocks_of.entry(s).or_default().push(t);
+    }
+
+    fn bfs_collect(
+        start: &str,
+        adj: &std::collections::HashMap<String, Vec<String>>,
+        max_depth: u32,
+        cap: usize,
+    ) -> Vec<(String, u32)> {
+        let mut visited: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut queue: std::collections::VecDeque<(String, u32)> = std::collections::VecDeque::new();
+        queue.push_back((start.to_string(), 0));
+        visited.insert(start.to_string(), 0);
+        while let Some((cur, d)) = queue.pop_front() {
+            if visited.len() >= cap { break; }
+            if d >= max_depth { continue; }
+            if let Some(neighbors) = adj.get(&cur) {
+                for n in neighbors {
+                    if !visited.contains_key(n) {
+                        visited.insert(n.clone(), d + 1);
+                        queue.push_back((n.clone(), d + 1));
+                    }
+                }
+            }
+        }
+        let mut out: Vec<(String, u32)> = visited.into_iter()
+            .filter(|(id, _)| id != start)
+            .collect();
+        out.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        out
+    }
+
+    let cap_per_side = 20;
+    let prereq_ids = bfs_collect(&skill_id, &prereqs_of, 3, cap_per_side);
+    let unlock_ids = bfs_collect(&skill_id, &unlocks_of, 3, cap_per_side);
+
+    // Resolve all referenced ids to names in one shot.
+    let mut all_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (id, _) in prereq_ids.iter().chain(unlock_ids.iter()) {
+        all_ids.insert(id.clone());
+    }
+    let id_list: Vec<String> = all_ids.into_iter().collect();
+    let name_rows = sqlx::query(
+        "SELECT id, name FROM universal_skills WHERE id = ANY($1)"
+    )
+    .bind(&id_list)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let id_to_name: std::collections::HashMap<String, String> = name_rows.iter()
+        .filter_map(|r| Some((r.try_get("id").ok()?, r.try_get("name").ok()?)))
+        .collect();
+
+    // Ordered prereqs root→leaf: deepest first (furthest from skill_id), then shallower
+    let mut prereq_chain: Vec<&(String, u32)> = prereq_ids.iter().collect();
+    prereq_chain.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let prereq_names: Vec<String> = prereq_chain.iter()
+        .filter_map(|(id, _)| id_to_name.get(id).cloned())
+        .collect();
+
+    let unlock_names: Vec<String> = unlock_ids.iter()
+        .filter_map(|(id, _)| id_to_name.get(id).cloned())
+        .collect();
+
+    // Top 10 market co-occurrences: skills sharing the most jobs via job_skills
+    let cooc_rows = sqlx::query(
+        "WITH this_jobs AS (
+             SELECT DISTINCT job_id
+             FROM job_skills
+             WHERE LOWER(skill_name) = LOWER($1)
+         )
+         SELECT j.skill_name, COUNT(DISTINCT j.job_id) AS overlap
+         FROM job_skills j
+         JOIN this_jobs tj ON tj.job_id = j.job_id
+         WHERE LOWER(j.skill_name) != LOWER($1)
+         GROUP BY j.skill_name
+         ORDER BY overlap DESC, j.skill_name ASC
+         LIMIT 10"
+    )
+    .bind(&skill_name)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let cooc_names: Vec<String> = cooc_rows.iter()
+        .filter_map(|r| r.try_get::<String, _>("skill_name").ok())
+        .collect();
+
+    // Build markdown
+    let domain_line = if domain.is_empty() { "(unclassified)".to_string() } else { domain };
+    let prereq_block = if prereq_names.is_empty() { "(none in graph)".to_string() } else { prereq_names.join(", ") };
+    let unlock_block = if unlock_names.is_empty() { "(none in graph)".to_string() } else { unlock_names.join(", ") };
+    let cooc_block = if cooc_names.is_empty() { "(no job data)".to_string() } else { cooc_names.join(", ") };
+
+    let md = format!(
+        "## Skill Graph Context: {skill_name}\n\
+         Domain: {domain_line} | Required by {job_demand_count} jobs\n\n\
+         ### Prerequisites (what to know first)\n\
+         {prereq_block}\n\n\
+         ### Unlocks (what this enables)\n\
+         {unlock_block}\n\n\
+         ### Market Co-occurrence (skills hired alongside this)\n\
+         {cooc_block}\n"
+    );
+
+    Ok(md)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillTreeRef {
+    pub tree_id: String,
+    pub tree_title: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TreeProjectRef {
+    pub project_id: String,
+}
+
+#[tauri::command]
+pub async fn get_project_id_for_tree(
+    tree_id: String,
+    database: State<'_, Database>,
+) -> Result<Option<TreeProjectRef>, String> {
+    let row = sqlx::query("SELECT project_id FROM trees WHERE id = $1")
+        .bind(&tree_id)
+        .fetch_optional(&database.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(row.and_then(|r| r.try_get::<String, _>("project_id").ok())
+        .map(|project_id| TreeProjectRef { project_id }))
+}
+
+#[tauri::command]
+pub async fn get_tree_for_skill(
+    skill_id: String,
+    database: State<'_, Database>,
+) -> Result<Option<SkillTreeRef>, String> {
+    let pool = &database.pool;
+
+    // Stage 1 — skill_trees (post-migration 043 canonical path).
+    let direct = sqlx::query(
+        "SELECT t.id AS tree_id, t.name AS tree_name
+         FROM skill_trees st
+         JOIN trees t ON t.id = st.tree_id
+         WHERE st.skill_id = $1
+           AND t.archived_at IS NULL
+         ORDER BY t.created_at DESC
+         LIMIT 1"
+    )
+    .bind(&skill_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if let Some(r) = direct {
+        let tree_id: String = r.try_get("tree_id").unwrap_or_default();
+        let tree_title: String = r.try_get("tree_name").unwrap_or_default();
+        return Ok(Some(SkillTreeRef { tree_id, tree_title }));
+    }
+
+    // Stage 2 — fallback via concept_slug for pre-migration trees.
+    let fallback = sqlx::query(
+        "SELECT t.id AS tree_id, t.name AS tree_name
+         FROM universal_skills u
+         JOIN tree_nodes n ON n.concept_slug = u.concept_slug
+         JOIN trees t ON t.id = n.tree_id
+         WHERE u.id = $1
+           AND n.concept_slug IS NOT NULL
+           AND t.archived_at IS NULL
+         ORDER BY t.created_at DESC
+         LIMIT 1"
+    )
+    .bind(&skill_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(fallback.map(|r| {
+        let tree_id: String = r.try_get("tree_id").unwrap_or_default();
+        let tree_title: String = r.try_get("tree_name").unwrap_or_default();
+        SkillTreeRef { tree_id, tree_title }
+    }))
+}
+
+// ─── SkillDetail (right-side drawer) ─────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetailPrereq {
+    pub skill_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetailUnlock {
+    pub skill_id: String,
+    pub name: String,
+    pub job_demand_count: i32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetailRelated {
+    pub skill_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetailTree {
+    pub tree_id: String,
+    pub tree_title: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetailProject {
+    pub project_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetailResource {
+    pub resource_id: String,
+    pub title: String,
+    pub url: String,
+    pub relevance_score: Option<f32>,
+    pub section_title: Option<String>,
+    pub page_start: Option<i32>,
+    pub page_end: Option<i32>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillDetail {
+    pub skill_id: String,
+    pub name: String,
+    pub display_name: Option<String>,
+    pub domain_name: Option<String>,
+    pub origin: String,
+    pub state: String,
+    pub status: String,
+    pub job_demand_count: i32,
+    pub prereqs: Vec<DetailPrereq>,
+    pub unlocks: Vec<DetailUnlock>,
+    pub related: Vec<DetailRelated>,
+    pub trees: Vec<DetailTree>,
+    pub projects: Vec<DetailProject>,
+    pub resources: Vec<DetailResource>,
+    pub notes: Option<String>,
+}
+
+const SKILLS_PROJECT_ID: &str = "00000000-0000-0000-0000-000000000001";
+
+#[tauri::command]
+pub async fn get_skill_detail(
+    skill_id: String,
+    database: State<'_, Database>,
+) -> Result<SkillDetail, String> {
+    let pool = &database.pool;
+
+    // Core skill row + domain name + status + notes (left joins so missing
+    // skill_profiles row produces defaults rather than failing).
+    let core = sqlx::query(
+        "SELECT u.name,
+                u.display_name,
+                u.domain_id,
+                COALESCE(u.origin, 'tree_quest') AS origin,
+                COALESCE(u.state, 'adjacent') AS state,
+                u.concept_slug,
+                COALESCE(d.name, '') AS domain_name,
+                COALESCE(sp.status, 'untouched') AS status,
+                sp.notes AS notes
+         FROM universal_skills u
+         LEFT JOIN skill_domains d ON d.id = u.domain_id
+         LEFT JOIN skill_profiles sp ON sp.skill_id = u.id
+         WHERE u.id = $1"
+    )
+    .bind(&skill_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("skill not found: {}", skill_id))?;
+
+    let name: String = core.try_get("name").map_err(|e| e.to_string())?;
+    let display_name: Option<String> = core.try_get("display_name").ok();
+    let origin: String = core.try_get("origin").map_err(|e| e.to_string())?;
+    let state: String = core.try_get("state").map_err(|e| e.to_string())?;
+    let status: String = core.try_get("status").unwrap_or_else(|_| "untouched".to_string());
+    let notes: Option<String> = core.try_get("notes").ok();
+    let domain_raw: String = core.try_get("domain_name").unwrap_or_default();
+    let domain_name: Option<String> = if domain_raw.is_empty() { None } else { Some(domain_raw) };
+
+    // Focal skill's own job demand count (case-insensitive match on job_skills.skill_name)
+    let demand_row = sqlx::query(
+        "SELECT COUNT(DISTINCT job_id)::int AS n
+         FROM job_skills
+         WHERE LOWER(skill_name) = LOWER($1)"
+    )
+    .bind(&name)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let job_demand_count: i32 = demand_row.try_get("n").unwrap_or(0);
+
+    // Direct prereqs (depth 1)
+    let prereq_rows = sqlx::query(
+        "SELECT u.id, u.name
+         FROM skill_dependencies d
+         JOIN universal_skills u ON u.id = d.source_skill_id
+         WHERE d.target_skill_id = $1
+           AND d.relationship = 'prerequisite'
+         ORDER BY u.name ASC"
+    )
+    .bind(&skill_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let prereqs: Vec<DetailPrereq> = prereq_rows.iter().filter_map(|r| {
+        Some(DetailPrereq {
+            skill_id: r.try_get("id").ok()?,
+            name: r.try_get("name").ok()?,
+        })
+    }).collect();
+
+    // Direct unlocks (depth 1) with per-row job demand
+    let unlock_rows = sqlx::query(
+        "SELECT u.id, u.name,
+                COALESCE((
+                    SELECT COUNT(DISTINCT j.job_id)::int
+                    FROM job_skills j
+                    WHERE LOWER(j.skill_name) = LOWER(u.name)
+                ), 0) AS demand
+         FROM skill_dependencies d
+         JOIN universal_skills u ON u.id = d.target_skill_id
+         WHERE d.source_skill_id = $1
+         ORDER BY demand DESC, u.name ASC"
+    )
+    .bind(&skill_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let unlocks: Vec<DetailUnlock> = unlock_rows.iter().filter_map(|r| {
+        Some(DetailUnlock {
+            skill_id: r.try_get("id").ok()?,
+            name: r.try_get("name").ok()?,
+            job_demand_count: r.try_get::<i32, _>("demand").unwrap_or(0),
+        })
+    }).collect();
+
+    // Related — same domain, co-occur in same jobs, top 5
+    let domain_id: Option<String> = core.try_get::<Option<String>, _>("domain_id").ok().flatten();
+    let related: Vec<DetailRelated> = if let Some(dom) = domain_id {
+        let rows = sqlx::query(
+            "WITH this_jobs AS (
+                 SELECT DISTINCT job_id
+                 FROM job_skills
+                 WHERE LOWER(skill_name) = LOWER($1)
+             )
+             SELECT u.id, u.name, COUNT(DISTINCT j2.job_id) AS overlap
+             FROM job_skills j2
+             JOIN this_jobs tj ON tj.job_id = j2.job_id
+             JOIN universal_skills u ON LOWER(u.name) = LOWER(j2.skill_name)
+             WHERE u.id != $2
+               AND u.domain_id = $3
+             GROUP BY u.id, u.name
+             ORDER BY overlap DESC, u.name ASC
+             LIMIT 5"
+        )
+        .bind(&name)
+        .bind(&skill_id)
+        .bind(&dom)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        rows.iter().filter_map(|r| Some(DetailRelated {
+            skill_id: r.try_get("id").ok()?,
+            name: r.try_get("name").ok()?,
+        })).collect()
+    } else {
+        Vec::new()
+    };
+
+    // Trees — from skill_trees, active only
+    let tree_rows = sqlx::query(
+        "SELECT t.id, t.name
+         FROM skill_trees st
+         JOIN trees t ON t.id = st.tree_id
+         WHERE st.skill_id = $1
+           AND t.archived_at IS NULL
+         ORDER BY t.created_at DESC"
+    )
+    .bind(&skill_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let trees: Vec<DetailTree> = tree_rows.iter().filter_map(|r| Some(DetailTree {
+        tree_id: r.try_get("id").ok()?,
+        tree_title: r.try_get("name").ok()?,
+    })).collect();
+
+    // Projects — from skill_project_links, excluding the special Skills project
+    let project_rows = sqlx::query(
+        "SELECT p.id, p.name
+         FROM skill_project_links spl
+         JOIN projects p ON p.id = spl.project_id
+         WHERE spl.skill_id = $1
+           AND p.id != $2
+         ORDER BY p.name ASC"
+    )
+    .bind(&skill_id)
+    .bind(SKILLS_PROJECT_ID)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let projects: Vec<DetailProject> = project_rows.iter().filter_map(|r| Some(DetailProject {
+        project_id: r.try_get("id").ok()?,
+        name: r.try_get("name").ok()?,
+    })).collect();
+
+    // Resources — top 8 by relevance_score ASC (lower = better).
+    // Multiple rows per resource are possible when the skill matches
+    // distinct chapters/sections (mig 045 widened the unique key).
+    let resource_rows = sqlx::query(
+        "SELECT mr.id, mr.title, mr.url, msl.relevance_score, \
+                msl.matched_section_title, msl.matched_page_start, msl.matched_page_end \
+         FROM mimir_skill_links msl \
+         JOIN mimir_resources mr ON mr.id = msl.resource_id \
+         WHERE msl.skill_id = $1 \
+         ORDER BY msl.relevance_score ASC NULLS LAST \
+         LIMIT 8"
+    )
+    .bind(&skill_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let resources: Vec<DetailResource> = resource_rows.iter().filter_map(|r| Some(DetailResource {
+        resource_id: r.try_get("id").ok()?,
+        title: r.try_get("title").ok()?,
+        url: r.try_get("url").ok()?,
+        relevance_score: r.try_get("relevance_score").ok(),
+        section_title: r.try_get("matched_section_title").ok().flatten(),
+        page_start: r.try_get("matched_page_start").ok().flatten(),
+        page_end: r.try_get("matched_page_end").ok().flatten(),
+    })).collect();
+
+    Ok(SkillDetail {
+        skill_id,
+        name,
+        display_name,
+        domain_name,
+        origin,
+        state,
+        status,
+        job_demand_count,
+        prereqs,
+        unlocks,
+        related,
+        trees,
+        projects,
+        resources,
+        notes,
+    })
+}
+
+// ─── ANN skill similarity (migration 044) ───────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NearestSkill {
+    pub skill_id: String,
+    pub name: String,
+    pub distance: f32,
+}
+
+/// Cosine-distance ANN over `universal_skills.embedding` (HNSW index, mig 044).
+/// `exclude_ids` is filtered server-side via `id != ALL($2)`.
+pub async fn find_nearest_skills(
+    pool: &sqlx::PgPool,
+    embedding: &[f32],
+    limit: usize,
+    exclude_ids: &[String],
+) -> Result<Vec<NearestSkill>, String> {
+    let vec_str = crate::mimir_ingest::vector_str(embedding);
+    let limit_i64 = limit as i64;
+
+    let rows = sqlx::query(
+        "SELECT id, name, (embedding <=> $1::vector)::float4 AS distance
+         FROM universal_skills
+         WHERE embedding IS NOT NULL
+           AND id != ALL($2)
+         ORDER BY embedding <=> $1::vector
+         LIMIT $3"
+    )
+    .bind(&vec_str)
+    .bind(exclude_ids)
+    .bind(limit_i64)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(rows.iter().filter_map(|r| {
+        Some(NearestSkill {
+            skill_id: r.try_get("id").ok()?,
+            name: r.try_get("name").ok()?,
+            distance: r.try_get::<f32, _>("distance").unwrap_or(1.0),
+        })
+    }).collect())
+}

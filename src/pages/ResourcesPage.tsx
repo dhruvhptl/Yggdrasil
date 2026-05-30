@@ -427,6 +427,10 @@ export default function ResourcesPage() {
   const [rematchResult, setRematchResult] = useState<string | null>(null);
   const [reembedding, setReembedding] = useState(false);
   const [reembedResult, setReembedResult] = useState<string | null>(null);
+  const [skillBackfilling, setSkillBackfilling] = useState(false);
+  const [skillBackfillResult, setSkillBackfillResult] = useState<string | null>(null);
+  const [llmExtracting, setLlmExtracting] = useState(false);
+  const [llmExtractResult, setLlmExtractResult] = useState<string | null>(null);
   const [completionFilter, setCompletionFilter] = useState<'all' | 'completed' | 'incomplete'>('all');
   const [nodePopoverFor, setNodePopoverFor] = useState<string | null>(null);
   const [nodePopoverTitles, setNodePopoverTitles] = useState<string[]>([]);
@@ -585,6 +589,38 @@ export default function ResourcesPage() {
       setTimeout(() => setReembedResult(null), 5000);
     } finally {
       setReembedding(false);
+    }
+  }
+
+  async function handleLlmSkillExtraction() {
+    if (llmExtracting) return;
+    setLlmExtracting(true);
+    setLlmExtractResult(null);
+    try {
+      const result = await invoke<string>('extract_skills_backfill');
+      setLlmExtractResult(result);
+      setTimeout(() => setLlmExtractResult(null), 10000);
+    } catch (err) {
+      setLlmExtractResult(`Failed: ${err}`);
+      setTimeout(() => setLlmExtractResult(null), 8000);
+    } finally {
+      setLlmExtracting(false);
+    }
+  }
+
+  async function handleSkillResourceBackfill() {
+    if (skillBackfilling) return;
+    setSkillBackfilling(true);
+    setSkillBackfillResult(null);
+    try {
+      const result = await invoke<string>('run_skill_resource_backfill');
+      setSkillBackfillResult(result);
+      setTimeout(() => setSkillBackfillResult(null), 8000);
+    } catch (err) {
+      setSkillBackfillResult(`Failed: ${err}`);
+      setTimeout(() => setSkillBackfillResult(null), 8000);
+    } finally {
+      setSkillBackfilling(false);
     }
   }
 
@@ -1439,6 +1475,28 @@ export default function ResourcesPage() {
                   {reembedding ? 'Re-embedding…' : 'Re-embed PDFs'}
                 </button>
 
+                {/* Backfill skill → chapter links */}
+                <button
+                  onClick={handleSkillResourceBackfill}
+                  disabled={skillBackfilling}
+                  className="flex items-center gap-1.5 text-xs text-slate-400 hover:text-indigo-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                  title="Match every embedded skill to top resource chapters via direct ANN. Slow but worth running once after embedding all skills."
+                >
+                  <Link className={`w-3.5 h-3.5 ${skillBackfilling ? 'animate-spin' : ''}`} />
+                  {skillBackfilling ? 'Linking skills…' : 'Link skills → chapters'}
+                </button>
+
+                {/* LLM skill extraction backfill */}
+                <button
+                  onClick={handleLlmSkillExtraction}
+                  disabled={llmExtracting}
+                  className="flex items-center gap-1.5 text-xs text-slate-400 hover:text-violet-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                  title="Enqueue all resources for LLM-based skill extraction (Gemini). Runs in background — fast to enqueue, slow to process."
+                >
+                  <Wand2 className={`w-3.5 h-3.5 ${llmExtracting ? 'animate-spin' : ''}`} />
+                  {llmExtracting ? 'Enqueueing…' : 'Extract skills (LLM)'}
+                </button>
+
                 {/* Re-scrape all */}
                 {urlResources.length > 0 && (
                   <button
@@ -1517,6 +1575,16 @@ export default function ResourcesPage() {
               {reembedResult && (
                 <div className={`text-xs px-3 py-1.5 rounded-md ${reembedResult.startsWith('Failed') ? 'bg-red-950/40 text-red-400 border border-red-800/50' : 'bg-amber-950/40 text-amber-400 border border-amber-800/50'}`}>
                   {reembedResult}
+                </div>
+              )}
+              {skillBackfillResult && (
+                <div className={`text-xs px-3 py-1.5 rounded-md ${skillBackfillResult.startsWith('Failed') ? 'bg-red-950/40 text-red-400 border border-red-800/50' : 'bg-indigo-950/40 text-indigo-400 border border-indigo-800/50'}`}>
+                  {skillBackfillResult}
+                </div>
+              )}
+              {llmExtractResult && (
+                <div className={`text-xs px-3 py-1.5 rounded-md ${llmExtractResult.startsWith('Failed') ? 'bg-red-950/40 text-red-400 border border-red-800/50' : 'bg-violet-950/40 text-violet-400 border border-violet-800/50'}`}>
+                  {llmExtractResult}
                 </div>
               )}
 

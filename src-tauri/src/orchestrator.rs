@@ -24,6 +24,7 @@ pub(crate) enum OrchestratorJob {
     AutoTagResources { resource_ids: Vec<String> },
     MatchResourceToNodes { resource_id: String },
     FetchTranscript { resource_id: String },
+    ExtractSkillsFromResource { resource_id: String },
 }
 
 // ─── JobQueue (managed Tauri state) ──────────────────────────────────────────
@@ -100,6 +101,9 @@ pub fn start_worker(pool: PgPool, app: AppHandle, client: reqwest::Client) -> Jo
                 }
                 OrchestratorJob::FetchTranscript { resource_id } => {
                     run_fetch_transcript(&pool, &app, &client, &resource_id).await;
+                }
+                OrchestratorJob::ExtractSkillsFromResource { resource_id } => {
+                    run_extract_skills_from_resource(&pool, &client, &resource_id).await;
                 }
             }
         }
@@ -263,7 +267,9 @@ async fn run_reembed_resources(pool: &PgPool, app: &AppHandle, client: &reqwest:
 }
 
 async fn run_infer_skill_deps(pool: &PgPool, app: &AppHandle, client: &reqwest::Client) {
-    match crate::skill_commands::infer_skill_deps_inner(client, pool).await {
+    // Switched to ANN-driven inference (skill_commands::infer_skill_deps_ann).
+    // The old alphabetical-batch path is kept in skill_commands.rs but unused.
+    match crate::skill_commands::infer_skill_deps_ann(client, pool).await {
         Ok(count) => println!("🔗 [job/infer-deps] {} deps written", count),
         Err(e) => println!("⚠️  [job/infer-deps] failed: {}", e),
     }
@@ -342,6 +348,14 @@ pub async fn on_resource_ingested_async(
     }).await {
         Ok(()) => println!("🔍 [orch/debug] MatchResourceToNodes enqueued OK for {}", resource_id),
         Err(e) => println!("⚠️  [orch] enqueue MatchResourceToNodes failed: {}", e),
+    }
+
+    // Enqueue LLM skill extraction (runs after node matching has settled in queue).
+    match queue.send(OrchestratorJob::ExtractSkillsFromResource {
+        resource_id: resource_id.to_string(),
+    }).await {
+        Ok(()) => println!("🔍 [orch/debug] ExtractSkillsFromResource enqueued OK for {}", resource_id),
+        Err(e) => println!("⚠️  [orch] enqueue ExtractSkillsFromResource failed: {}", e),
     }
 
     let _ = app.emit("ygg-resource-ingested", serde_json::json!({
@@ -791,6 +805,272 @@ async fn write_mimir_resource_evidence(pool: &PgPool, resource_id: &str) -> usiz
     written
 }
 
+// ─── LLM skill extraction from resource ──────────────────────────────────────
+
+/// Sample up to 30 chunks from a resource, run ANN pre-filter to find candidate
+/// skills, then ask Gemini to pick which slugs actually apply. Writes results to
+/// mimir_skill_links with source='llm_extraction'. Never overwrites manual links.
+/// Returns count of rows upserted (0 on any error).
+async fn run_extract_skills_from_resource(pool: &PgPool, client: &reqwest::Client, resource_id: &str) {
+    match extract_skills_from_resource_inner(pool, client, resource_id).await {
+        Ok(n) => {
+            if n > 0 {
+                println!("🧠 [job/skill-extract] {} skills linked for resource {}", n, resource_id);
+            }
+        }
+        Err(e) => println!("⚠️  [job/skill-extract] failed for {}: {}", resource_id, e),
+    }
+}
+
+async fn extract_skills_from_resource_inner(
+    pool: &PgPool,
+    client: &reqwest::Client,
+    resource_id: &str,
+) -> Result<usize, String> {
+    // ── 1. Fetch resource title ────────────────────────────────────────────────
+    let title_row = sqlx::query(
+        "SELECT title FROM mimir_resources WHERE id = $1"
+    )
+    .bind(resource_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let title: String = match title_row {
+        Some(r) => r.try_get("title").unwrap_or_default(),
+        None => return Ok(0),
+    };
+    if title.is_empty() { return Ok(0); }
+
+    // ── 2. Sample up to 30 chunks ─────────────────────────────────────────────
+    // Prefer diverse sections: DISTINCT ON section_title if sections exist.
+    let sectioned_chunks = sqlx::query(
+        "SELECT DISTINCT ON (mc.section_title) mc.id, mc.content, mc.section_title \
+         FROM mimir_chunks mc \
+         WHERE mc.resource_id = $1 AND mc.section_title IS NOT NULL \
+         ORDER BY mc.section_title, mc.chunk_index ASC \
+         LIMIT 30"
+    )
+    .bind(resource_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let chunk_rows = if sectioned_chunks.is_empty() {
+        // Flat fallback: evenly-spaced chunks
+        sqlx::query(
+            "SELECT mc.id, mc.content, mc.section_title \
+             FROM mimir_chunks mc \
+             WHERE mc.resource_id = $1 \
+             ORDER BY mc.chunk_index ASC \
+             LIMIT 30"
+        )
+        .bind(resource_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?
+    } else {
+        sectioned_chunks
+    };
+
+    if chunk_rows.is_empty() { return Ok(0); }
+
+    // Extract chunk ids for ANN pre-filter
+    let chunk_ids: Vec<String> = chunk_rows.iter()
+        .filter_map(|r| r.try_get::<String, _>("id").ok())
+        .collect();
+    if chunk_ids.is_empty() { return Ok(0); }
+
+    // ── 3. ANN pre-filter: find candidate skills ───────────────────────────────
+    // For each sample chunk, find top 15 skills by cosine distance.
+    // Union and dedup, keep top 50 by average distance.
+
+    // Build a single query using ANY($1) over chunk ids, joining to skill embeddings
+    // via CROSS JOIN pattern. We select (skill_id, distance) per chunk, then aggregate.
+    let ann_rows = sqlx::query(
+        "SELECT u.id AS skill_id, u.name, u.concept_slug, \
+                AVG((me.embedding <=> u.embedding)::float8) AS avg_dist \
+         FROM mimir_chunks mc \
+         JOIN mimir_embeddings me ON me.chunk_id = mc.id \
+         CROSS JOIN universal_skills u \
+         WHERE mc.id = ANY($1) \
+           AND u.embedding IS NOT NULL \
+           AND u.concept_slug IS NOT NULL \
+           AND u.status != 'archived' \
+         GROUP BY u.id, u.name, u.concept_slug \
+         ORDER BY avg_dist ASC \
+         LIMIT 50"
+    )
+    .bind(&chunk_ids)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("ANN pre-filter failed: {}", e))?;
+
+    if ann_rows.is_empty() { return Ok(0); }
+
+    // Build candidate list for the prompt
+    struct SkillCandidate {
+        skill_id: String,
+        name: String,
+        slug: String,
+    }
+    let candidates: Vec<SkillCandidate> = ann_rows.iter().filter_map(|r| {
+        Some(SkillCandidate {
+            skill_id: r.try_get("skill_id").ok()?,
+            name: r.try_get("name").ok()?,
+            slug: r.try_get("concept_slug").ok()?,
+        })
+    }).collect();
+
+    if candidates.is_empty() { return Ok(0); }
+
+    // ── 4. Build LLM prompt ───────────────────────────────────────────────────
+    // Collect excerpt text from chunks (first 300 chars each, newline separated)
+    let excerpts: Vec<String> = chunk_rows.iter().filter_map(|r| {
+        let content: String = r.try_get("content").ok()?;
+        let truncated: String = content.chars().take(300).collect();
+        Some(truncated)
+    }).collect();
+
+    let candidate_list = candidates.iter()
+        .map(|c| format!("{}: {}", c.slug, c.name))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let system_prompt = "You are a conservative skill tagger. \
+        Given excerpts from a learning resource and a list of skill slug:name pairs, \
+        return ONLY a JSON array of the slugs that this resource genuinely teaches or covers. \
+        Be selective — only include slugs for skills that are meaningfully present. \
+        Return an empty array [] if none apply. \
+        Return ONLY a valid JSON array of strings, no other text.";
+
+    let user_prompt = format!(
+        "Resource: \"{title}\"\n\n\
+         Excerpts:\n---\n{excerpts}\n---\n\n\
+         Candidate skills (slug: name):\n{candidate_list}\n\n\
+         Which of these slugs does this resource meaningfully cover? Return a JSON array of slugs only.",
+        title = title,
+        excerpts = excerpts.join("\n\n"),
+        candidate_list = candidate_list,
+    );
+
+    // ── 5. Call LLM ──────────────────────────────────────────────────────────
+    let api_key = std::env::var("OPENROUTER_API_KEY")
+        .map_err(|_| "OPENROUTER_API_KEY not set".to_string())?;
+    let base_url = "https://openrouter.ai/api/v1/chat/completions";
+    let model = "google/gemini-3.1-flash-lite";
+
+    let t_start = std::time::Instant::now();
+    let (content, latency_ms) = crate::llm_client::call_llm(
+        client, base_url, &api_key, model,
+        system_prompt, &user_prompt,
+        500, false,
+    ).await.unwrap_or_else(|e| {
+        println!("⚠️  [skill-extract] LLM call failed: {}", e);
+        (String::new(), t_start.elapsed().as_millis() as i64)
+    });
+
+    // Fire-and-forget prompt log
+    crate::brain::log_prompt_call(
+        pool.clone(), "extract_skills_from_resource", model,
+        "skill_extraction_v1", latency_ms, true, None, None,
+    );
+
+    if content.is_empty() { return Ok(0); }
+
+    // ── 6. Parse JSON response ────────────────────────────────────────────────
+    let clean = content
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+
+    let returned_slugs: Vec<String> = serde_json::from_str(clean).unwrap_or_default();
+    if returned_slugs.is_empty() { return Ok(0); }
+
+    // Validate: only keep slugs that are in our candidate set
+    let valid_slugs: std::collections::HashSet<&str> = candidates.iter()
+        .map(|c| c.slug.as_str())
+        .collect();
+    let slug_to_id: std::collections::HashMap<&str, &str> = candidates.iter()
+        .map(|c| (c.slug.as_str(), c.skill_id.as_str()))
+        .collect();
+
+    let accepted: Vec<&SkillCandidate> = candidates.iter()
+        .filter(|c| {
+            returned_slugs.iter().any(|s| s == &c.slug) && valid_slugs.contains(c.slug.as_str())
+        })
+        .collect();
+
+    if accepted.is_empty() { return Ok(0); }
+
+    // ── 7. Upsert into mimir_skill_links ─────────────────────────────────────
+    // source='llm_extraction', confidence=0.9, relevance_score=0.0 (placeholder)
+    // Never overwrite source='manual'.
+    let mut written = 0usize;
+    for skill in &accepted {
+        let _ = slug_to_id.get(skill.slug.as_str()); // silence unused warning
+        let row_id = uuid::Uuid::new_v4().to_string();
+        let res = sqlx::query(
+            "INSERT INTO mimir_skill_links \
+               (id, skill_id, resource_id, relevance_score, source, confidence) \
+             VALUES ($1, $2, $3, 0.0, 'llm_extraction', 0.9) \
+             ON CONFLICT (skill_id, resource_id) \
+               WHERE matched_section_title IS NULL \
+             DO UPDATE SET \
+               source = CASE WHEN mimir_skill_links.source = 'manual' \
+                             THEN mimir_skill_links.source \
+                             ELSE 'llm_extraction' END, \
+               confidence = CASE WHEN mimir_skill_links.source = 'manual' \
+                                 THEN mimir_skill_links.confidence \
+                                 ELSE 0.9 END"
+        )
+        .bind(&row_id)
+        .bind(&skill.skill_id)
+        .bind(resource_id)
+        .execute(pool)
+        .await;
+
+        match res {
+            Ok(_) => written += 1,
+            Err(e) => println!("⚠️  [skill-extract] insert failed for slug '{}': {}", skill.slug, e),
+        }
+    }
+
+    Ok(written)
+}
+
+/// Tauri command: iterate all resources and enqueue ExtractSkillsFromResource for each.
+/// Returns a summary string.
+#[tauri::command]
+pub async fn extract_skills_backfill(
+    database: tauri::State<'_, crate::database::Database>,
+    queue: tauri::State<'_, JobQueue>,
+) -> Result<String, String> {
+    let rows = sqlx::query(
+        "SELECT id FROM mimir_resources ORDER BY created_at ASC"
+    )
+    .fetch_all(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let total = rows.len();
+    let mut enqueued = 0usize;
+    for row in &rows {
+        let resource_id: String = match row.try_get("id") {
+            Ok(v) => v, Err(_) => continue,
+        };
+        if queue.send(OrchestratorJob::ExtractSkillsFromResource {
+            resource_id,
+        }).await.is_ok() {
+            enqueued += 1;
+        }
+    }
+
+    Ok(format!("Enqueued {} / {} resources for skill extraction", enqueued, total))
+}
+
 // ─── run_fetch_transcript ─────────────────────────────────────────────────────
 
 async fn run_fetch_transcript(pool: &PgPool, app: &AppHandle, client: &reqwest::Client, resource_id: &str) {
@@ -1228,6 +1508,66 @@ async fn run_match_resource_to_nodes(pool: &PgPool, app: &AppHandle, client: &re
         .bind(resource_id)
         .bind(&candidate.node_id)
         .bind(candidate.final_score as f32)
+        .execute(pool)
+        .await
+        .ok();
+
+        // Parallel skill link via concept_slug bridge (migration 043 + 045).
+        // Propagates the winning chunk's section metadata from mimir_node_links
+        // so the skill panel can render chapter-granular citations.
+        // Two inserts because the unique indexes on mimir_skill_links are
+        // partial (section IS NOT NULL vs section IS NULL) and Postgres
+        // ON CONFLICT inference can only target one at a time.
+        let id_sectioned = uuid::Uuid::new_v4().to_string();
+        let _ = sqlx::query(
+            "INSERT INTO mimir_skill_links \
+               (id, skill_id, resource_id, relevance_score, \
+                matched_chunk_id, matched_section_title, matched_page_start, matched_page_end) \
+             SELECT $1, u.id, $2, $3, \
+                    mnl.matched_chunk_id, mnl.matched_section_title, \
+                    mnl.matched_page_start, mnl.matched_page_end \
+             FROM tree_nodes n \
+             JOIN universal_skills u ON u.concept_slug = n.concept_slug \
+             JOIN mimir_node_links mnl ON mnl.node_id = n.id AND mnl.resource_id = $2 \
+             WHERE n.id = $4 \
+               AND u.concept_slug IS NOT NULL \
+               AND mnl.matched_section_title IS NOT NULL \
+             ON CONFLICT (skill_id, resource_id, matched_section_title) \
+               WHERE matched_section_title IS NOT NULL \
+             DO UPDATE SET \
+               relevance_score = EXCLUDED.relevance_score, \
+               matched_chunk_id = EXCLUDED.matched_chunk_id, \
+               matched_page_start = EXCLUDED.matched_page_start, \
+               matched_page_end = EXCLUDED.matched_page_end"
+        )
+        .bind(&id_sectioned)
+        .bind(resource_id)
+        .bind(candidate.final_score as f32)
+        .bind(&candidate.node_id)
+        .execute(pool)
+        .await
+        .ok();
+
+        let id_whole = uuid::Uuid::new_v4().to_string();
+        let _ = sqlx::query(
+            "INSERT INTO mimir_skill_links \
+               (id, skill_id, resource_id, relevance_score) \
+             SELECT $1, u.id, $2, $3 \
+             FROM tree_nodes n \
+             JOIN universal_skills u ON u.concept_slug = n.concept_slug \
+             LEFT JOIN mimir_node_links mnl ON mnl.node_id = n.id AND mnl.resource_id = $2 \
+             WHERE n.id = $4 \
+               AND u.concept_slug IS NOT NULL \
+               AND (mnl.matched_section_title IS NULL OR mnl.id IS NULL) \
+             ON CONFLICT (skill_id, resource_id) \
+               WHERE matched_section_title IS NULL \
+             DO UPDATE SET \
+               relevance_score = EXCLUDED.relevance_score"
+        )
+        .bind(&id_whole)
+        .bind(resource_id)
+        .bind(candidate.final_score as f32)
+        .bind(&candidate.node_id)
         .execute(pool)
         .await
         .ok();

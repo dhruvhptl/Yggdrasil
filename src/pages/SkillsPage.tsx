@@ -5,9 +5,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import {
-  RefreshCw, Loader2, AlertTriangle, Sparkles, FileText, TreePine,
-  Briefcase, X, Wand2, GitMerge, Check, Search, Eye, Download, ChevronDown, ChevronRight,
-  PanelLeftClose, PanelLeftOpen, RotateCcw, TrendingUp, Zap, Route, BookOpen, ExternalLink,
+  RefreshCw, Loader2, AlertTriangle, Sparkles,
+  X, Wand2, GitMerge, Check, Search, Eye, Download, ChevronDown, ChevronRight,
+  PanelLeftClose, PanelLeftOpen, RotateCcw, TrendingUp, Zap, Route, BookOpen,
   Maximize2, MoreHorizontal,
 } from 'lucide-react';
 import type { UniversalSkill, SkillGap, SkillDependency, SkillAlias, SkillGraphSnapshot, GrowthTarget, PathNode, PrereqPath, LearningStep, LearningPath } from '../types';
@@ -789,54 +789,532 @@ function LevelDots({ level }: { level: number }) {
   );
 }
 
-// ─── Evidence Icon ────────────────────────────────────────────────────────────
+// ─── Skill Detail panel (right-side drawer) ──────────────────────────────────
 
-function EvidenceIcon({ type }: { type: string }) {
-  switch (type) {
-    case 'resume':        return <FileText  className="w-3 h-3 text-blue-400 flex-shrink-0" />;
-    case 'tree_quest':    return <TreePine  className="w-3 h-3 text-emerald-400 flex-shrink-0" />;
-    case 'work_resource': return <Briefcase className="w-3 h-3 text-violet-400 flex-shrink-0" />;
-    default:              return <Sparkles  className="w-3 h-3 text-slate-400 flex-shrink-0" />;
-  }
+interface SkillDetail {
+  skillId: string;
+  name: string;
+  displayName: string | null;
+  domainName: string | null;
+  origin: string;        // resume | work | job_gap | tree_quest
+  state: string;         // seed | adjacent
+  status: string;        // untouched | in_progress | practiced | mastered
+  jobDemandCount: number;
+  prereqs: Array<{ skillId: string; name: string }>;
+  unlocks: Array<{ skillId: string; name: string; jobDemandCount: number }>;
+  related: Array<{ skillId: string; name: string }>;
+  trees: Array<{ treeId: string; treeTitle: string }>;
+  projects: Array<{ projectId: string; name: string }>;
+  resources: Array<{
+    resourceId: string;
+    title: string;
+    url: string;
+    relevanceScore: number | null;
+    sectionTitle: string | null;
+    pageStart: number | null;
+    pageEnd: number | null;
+  }>;
+  notes: string | null;
 }
 
-// ─── Skill Detail Panel ───────────────────────────────────────────────────────
+const STATUS_CYCLE: Array<SkillDetail['status']> = ['untouched', 'in_progress', 'practiced', 'mastered'];
+const STATUS_LABEL: Record<string, string> = {
+  untouched: 'Untouched',
+  in_progress: 'In progress',
+  practiced: 'Practiced',
+  mastered: 'Mastered',
+};
+const STATUS_STYLE: Record<string, { bg: string; color: string; border: string }> = {
+  untouched:   { bg: 'rgba(148,163,184,0.10)', color: '#94a3b8', border: 'rgba(148,163,184,0.22)' },
+  in_progress: { bg: 'rgba(99,102,241,0.12)',  color: '#a5b4fc', border: 'rgba(99,102,241,0.28)' },
+  practiced:   { bg: 'rgba(245,158,11,0.12)',  color: '#fcd34d', border: 'rgba(245,158,11,0.28)' },
+  mastered:    { bg: 'rgba(16,185,129,0.14)',  color: '#6ee7b7', border: 'rgba(16,185,129,0.30)' },
+};
 
-function SkillPanel({
-  skill, gap, aliases, deps, skills, onClose, onSelectSkill,
+function isGapMode(origin: string): boolean {
+  return origin === 'job_gap' || origin === 'tree_quest';
+}
+
+function SkillDetailPanel({
+  skillId, onClose, onSelectSkill, onOpenGrowthPlan,
 }: {
-  skill: UniversalSkill | null;
-  gap: SkillGap | null;
-  aliases: SkillAlias[];
-  deps: SkillDependency[];
-  skills: UniversalSkill[];
+  skillId: string;
   onClose: () => void;
   onSelectSkill?: (name: string) => void;
+  onOpenGrowthPlan?: () => void;
 }) {
+  const [detail, setDetail] = useState<SkillDetail | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [statusSaving, setStatusSaving] = useState(false);
+  const [notesDraft, setNotesDraft] = useState<string>('');
+  const [notesSaving, setNotesSaving] = useState(false);
+  const [opening, setOpening] = useState(false);
+  const [openError, setOpenError] = useState<string | null>(null);
+
+  async function handleOpenTree() {
+    if (!detail || opening) return;
+    setOpening(true);
+    setOpenError(null);
+    const result = await openSkillTree(detail.skillId);
+    if (!result.ok) setOpenError(result.error);
+    setOpening(false);
+  }
   const [prereqPath, setPrereqPath] = useState<PrereqPath | null>(null);
-  const [prereqPathLoading, setPrereqPathLoading] = useState(false);
+  const [similar, setSimilar] = useState<Array<{ skillId: string; name: string; distance: number }> | null>(null);
+  const [similarLoading, setSimilarLoading] = useState(false);
 
+  // Fetch on skill change
   useEffect(() => {
-    if (!skill || skill.state === 'seed') { setPrereqPath(null); return; }
-    setPrereqPathLoading(true);
-    invoke<PrereqPath>('get_prereq_path', { skillId: skill.id })
-      .then(p => setPrereqPath(p))
-      .catch(() => setPrereqPath(null))
-      .finally(() => setPrereqPathLoading(false));
-  }, [skill?.id]);
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    setDetail(null);
+    setPrereqPath(null);
+    invoke<SkillDetail>('get_skill_detail', { skillId })
+      .then(d => {
+        if (cancelled) return;
+        setDetail(d);
+        setNotesDraft(d.notes ?? '');
+      })
+      .catch(e => {
+        if (cancelled) return;
+        setError(typeof e === 'string' ? e : 'Failed to load skill detail');
+      })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [skillId]);
 
-  if (!skill && !gap) return null;
+  // Gap mode also needs prereq path
+  useEffect(() => {
+    if (!detail || !isGapMode(detail.origin) || detail.state === 'seed') {
+      setPrereqPath(null);
+      return;
+    }
+    let cancelled = false;
+    invoke<PrereqPath>('get_prereq_path', { skillId: detail.skillId })
+      .then(p => { if (!cancelled) setPrereqPath(p); })
+      .catch(() => { if (!cancelled) setPrereqPath(null); });
+    return () => { cancelled = true; };
+  }, [detail?.skillId, detail?.origin, detail?.state]);
 
-  const skillAliases = skill ? aliases.filter(a => a.canonicalSkillId === skill.id) : [];
-  const skillById    = new Map(skills.map(s => [s.id, s]));
-  const prereqs = skill
-    ? deps.filter(d => d.targetSkillId === skill.id).map(d => skillById.get(d.sourceSkillId)).filter(Boolean) as UniversalSkill[]
-    : [];
-  const unlocks = skill
-    ? deps.filter(d => d.sourceSkillId === skill.id).map(d => skillById.get(d.targetSkillId)).filter(Boolean) as UniversalSkill[]
-    : [];
+  // Escape to close
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
 
-  const panelColor = gap && !skill ? GAP_COLOR : '#10b981';
+  // Similar skills — ANN over embeddings
+  useEffect(() => {
+    let cancelled = false;
+    setSimilarLoading(true);
+    setSimilar(null);
+    invoke<Array<{ skillId: string; name: string; distance: number }>>(
+      'get_similar_skills',
+      { skillId, limit: 8 },
+    )
+      .then(rows => { if (!cancelled) setSimilar(rows); })
+      .catch(e => { if (!cancelled) { console.error('get_similar_skills failed:', e); setSimilar([]); } })
+      .finally(() => { if (!cancelled) setSimilarLoading(false); });
+    return () => { cancelled = true; };
+  }, [skillId]);
+
+  async function handleStatusClick() {
+    if (!detail || statusSaving) return;
+    const next = STATUS_CYCLE[(STATUS_CYCLE.indexOf(detail.status) + 1) % STATUS_CYCLE.length];
+    setStatusSaving(true);
+    try {
+      await invoke('update_skill_status', { skillId: detail.skillId, status: next });
+      setDetail({ ...detail, status: next });
+    } catch (e) {
+      console.error('update_skill_status failed:', e);
+    } finally {
+      setStatusSaving(false);
+    }
+  }
+
+  async function handleNotesBlur() {
+    if (!detail || notesSaving) return;
+    if ((detail.notes ?? '') === notesDraft) return;
+    setNotesSaving(true);
+    try {
+      await invoke('update_skill_notes', { skillId: detail.skillId, notes: notesDraft });
+      setDetail({ ...detail, notes: notesDraft });
+    } catch (e) {
+      console.error('update_skill_notes failed:', e);
+    } finally {
+      setNotesSaving(false);
+    }
+  }
+
+  // Note: outside-click is handled by stopPropagation in the panel + a click
+  // handler on the canvas (existing pattern). Escape works via the listener above.
+
+  const baseColor = detail && isGapMode(detail.origin) ? GAP_COLOR : '#10b981';
+  const titleColor = detail && isGapMode(detail.origin) ? GAP_COLOR : '#f1f5f9';
+
+  return (
+    <div
+      style={{
+        position: 'absolute', top: 16, right: 16, zIndex: 50,
+        width: 320, maxHeight: 'calc(100% - 32px)',
+        background: 'rgba(4,8,20,0.94)',
+        backdropFilter: 'blur(16px)',
+        border: `1px solid ${baseColor}22`,
+        borderRadius: 16,
+        overflow: 'auto',
+        boxShadow: `0 12px 48px rgba(0,0,0,0.85), 0 0 0 1px ${baseColor}11`,
+      }}
+      onClick={e => e.stopPropagation()}
+    >
+      {/* Header */}
+      <div style={{ padding: '14px 16px 10px', borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 8 }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 15, fontWeight: 600, color: titleColor, marginBottom: 4, lineHeight: 1.3 }}>
+              {detail?.displayName || detail?.name || (loading ? 'Loading…' : 'Skill')}
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+              {detail?.domainName && (
+                <span style={{ fontSize: 9, padding: '1px 6px', borderRadius: 3, background: 'rgba(99,102,241,0.10)', color: '#818cf8', border: '1px solid rgba(99,102,241,0.18)' }}>
+                  {detail.domainName}
+                </span>
+              )}
+              {detail && !isGapMode(detail.origin) && (
+                <button
+                  onClick={handleStatusClick}
+                  disabled={statusSaving}
+                  title="Click to cycle status"
+                  style={{
+                    fontSize: 9, padding: '2px 7px', borderRadius: 4,
+                    background: STATUS_STYLE[detail.status]?.bg ?? 'rgba(148,163,184,0.10)',
+                    color: STATUS_STYLE[detail.status]?.color ?? '#94a3b8',
+                    border: `1px solid ${STATUS_STYLE[detail.status]?.border ?? 'rgba(148,163,184,0.22)'}`,
+                    cursor: statusSaving ? 'default' : 'pointer',
+                    display: 'inline-flex', alignItems: 'center', gap: 4,
+                  }}
+                >
+                  {statusSaving && <Loader2 size={9} className="animate-spin" />}
+                  {STATUS_LABEL[detail.status] ?? detail.status}
+                </button>
+              )}
+              {detail && isGapMode(detail.origin) && detail.jobDemandCount > 0 && (
+                <span style={{ fontSize: 10, color: '#78350f' }}>
+                  {detail.jobDemandCount} job{detail.jobDemandCount !== 1 ? 's' : ''} require this
+                </span>
+              )}
+            </div>
+          </div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: '#475569', cursor: 'pointer', flexShrink: 0, padding: 2 }}>
+            <X size={14} />
+          </button>
+        </div>
+      </div>
+
+      {/* Body */}
+      <div style={{ padding: '12px 16px' }}>
+        {loading && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: '#475569' }}>
+            <Loader2 size={11} className="animate-spin" />Loading…
+          </div>
+        )}
+        {error && !loading && (
+          <div style={{ fontSize: 11, color: '#fca5a5' }}>{error}</div>
+        )}
+
+        {detail && !loading && (
+          <>
+            {/* Gap mode — Distance section */}
+            {isGapMode(detail.origin) && detail.state !== 'seed' && (
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ fontSize: 9, fontWeight: 600, color: '#475569', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6 }}>Distance</div>
+                {prereqPath && prereqPath.isReachable ? (
+                  <>
+                    <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 6 }}>
+                      <span style={{ color: '#fcd34d', fontWeight: 600 }}>{prereqPath.path.length}</span> step{prereqPath.path.length !== 1 ? 's' : ''} from your seeds
+                    </div>
+                    <PrereqPathBreadcrumb path={prereqPath.path} onSelectSkill={onSelectSkill} />
+                  </>
+                ) : prereqPath && !prereqPath.isReachable ? (
+                  <div style={{ fontSize: 10, color: '#334155', fontStyle: 'italic' }}>
+                    No path from your seeds — run Infer Dependencies
+                  </div>
+                ) : (
+                  <div style={{ fontSize: 10, color: '#334155', fontStyle: 'italic' }}>Finding path…</div>
+                )}
+              </div>
+            )}
+
+            {/* Graph — prereqs + unlocks (both modes) */}
+            {(detail.prereqs.length > 0 || detail.unlocks.length > 0) && (
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ fontSize: 9, fontWeight: 600, color: '#475569', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6 }}>Graph</div>
+                {detail.prereqs.length > 0 && (
+                  <div style={{ marginBottom: 6 }}>
+                    <div style={{ fontSize: 9, color: '#475569', marginBottom: 2 }}>Prereqs</div>
+                    {detail.prereqs.map(p => (
+                      <div
+                        key={p.skillId}
+                        onClick={() => onSelectSkill?.(p.name)}
+                        style={{ fontSize: 11, color: '#94a3b8', padding: '2px 0', cursor: onSelectSkill ? 'pointer' : 'default', display: 'flex', alignItems: 'center', gap: 5 }}
+                      >
+                        <span style={{ color: '#475569' }}>←</span>
+                        {p.name}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {detail.unlocks.length > 0 && (
+                  <div>
+                    <div style={{ fontSize: 9, color: '#475569', marginBottom: 2 }}>Unlocks</div>
+                    {detail.unlocks.map(u => (
+                      <div
+                        key={u.skillId}
+                        onClick={() => onSelectSkill?.(u.name)}
+                        style={{ fontSize: 11, color: '#94a3b8', padding: '2px 0', cursor: onSelectSkill ? 'pointer' : 'default', display: 'flex', alignItems: 'center', gap: 5 }}
+                      >
+                        <span style={{ color: '#475569' }}>→</span>
+                        <span style={{ flex: 1 }}>{u.name}</span>
+                        {u.jobDemandCount > 0 && (
+                          <span style={{ fontSize: 8, padding: '0 4px', borderRadius: 3, background: 'rgba(99,102,241,0.10)', color: '#818cf8', border: '1px solid rgba(99,102,241,0.18)' }}>
+                            {u.jobDemandCount}
+                          </span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Related */}
+            {detail.related.length > 0 && (
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ fontSize: 9, fontWeight: 600, color: '#475569', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6 }}>Related</div>
+                <div style={{ fontSize: 11, color: '#94a3b8' }}>
+                  {detail.related.map(r => r.name).join(', ')}
+                </div>
+              </div>
+            )}
+
+            {/* Owned mode — Trees */}
+            {!isGapMode(detail.origin) && (
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ fontSize: 9, fontWeight: 600, color: '#475569', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6 }}>Trees</div>
+                {detail.trees.length === 0 ? (
+                  <>
+                    <button
+                      onClick={e => { e.stopPropagation(); handleOpenTree(); }}
+                      disabled={opening}
+                      title="Open existing tree or generate a graph-seeded tree"
+                      style={{
+                        display: 'inline-flex', alignItems: 'center', gap: 4,
+                        fontSize: 10, padding: '3px 8px', borderRadius: 4,
+                        background: opening ? 'rgba(255,255,255,0.05)' : 'rgba(16,185,129,0.10)',
+                        color: opening ? '#475569' : '#34d399',
+                        border: '1px solid ' + (opening ? 'rgba(255,255,255,0.08)' : 'rgba(16,185,129,0.2)'),
+                        cursor: opening ? 'default' : 'pointer',
+                      }}
+                    >
+                      {opening
+                        ? <><Loader2 size={9} className="animate-spin" />Opening…</>
+                        : <>Open tree →</>}
+                    </button>
+                    {openError && (
+                      <div style={{ fontSize: 9, color: '#fca5a5', marginTop: 4 }}>{openError}</div>
+                    )}
+                  </>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+                    {detail.trees.map(t => (
+                      <a
+                        key={t.treeId}
+                        href={`/trees?selected=${encodeURIComponent(t.treeId)}`}
+                        onClick={e => e.stopPropagation()}
+                        style={{ fontSize: 11, color: '#6ee7b7', textDecoration: 'none', padding: '3px 6px', borderRadius: 4, background: 'rgba(16,185,129,0.06)', border: '1px solid rgba(16,185,129,0.14)' }}
+                      >
+                        🌳 {t.treeTitle}
+                      </a>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Owned mode — Projects */}
+            {!isGapMode(detail.origin) && detail.projects.length > 0 && (
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ fontSize: 9, fontWeight: 600, color: '#475569', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6 }}>Projects</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+                  {detail.projects.map(p => (
+                    <a
+                      key={p.projectId}
+                      href={`/project/${p.projectId}`}
+                      onClick={e => e.stopPropagation()}
+                      style={{ fontSize: 11, color: '#a5b4fc', textDecoration: 'none', padding: '3px 6px', borderRadius: 4, background: 'rgba(99,102,241,0.06)', border: '1px solid rgba(99,102,241,0.14)' }}
+                    >
+                      📁 {p.name}
+                    </a>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Resources (both modes) — chapter-granular when section data exists */}
+            <div style={{ marginBottom: 14 }}>
+              <div style={{ fontSize: 9, fontWeight: 600, color: '#475569', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6 }}>Resources</div>
+              {detail.resources.length === 0 ? (
+                <div style={{ fontSize: 10, color: '#334155', fontStyle: 'italic' }}>No resources linked yet</div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+                  {detail.resources.map((r, idx) => {
+                    // Deep-link to PDF page when we have a page number; supported
+                    // by most browser PDF viewers via the #page= fragment.
+                    const href = r.pageStart && r.url ? `${r.url}#page=${r.pageStart}` : r.url;
+                    const pageLabel = r.pageStart
+                      ? (r.pageEnd && r.pageEnd !== r.pageStart
+                          ? `p.${r.pageStart}–${r.pageEnd}`
+                          : `p.${r.pageStart}`)
+                      : null;
+                    return (
+                      <a
+                        key={`${r.resourceId}:${r.sectionTitle ?? ''}:${idx}`}
+                        href={href}
+                        target="_blank"
+                        rel="noreferrer"
+                        onClick={e => e.stopPropagation()}
+                        title={r.url}
+                        style={{
+                          fontSize: 11, color: '#6ee7b7', textDecoration: 'none',
+                          padding: '3px 6px', borderRadius: 4,
+                          background: 'rgba(16,185,129,0.06)',
+                          border: '1px solid rgba(16,185,129,0.14)',
+                          display: 'flex', flexDirection: 'column', gap: 1,
+                          overflow: 'hidden',
+                        }}
+                      >
+                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          📖 {r.title || r.url}
+                        </span>
+                        {(r.sectionTitle || pageLabel) && (
+                          <span style={{
+                            fontSize: 9, color: '#475569', paddingLeft: 16,
+                            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                          }}>
+                            {r.sectionTitle && pageLabel
+                              ? `${r.sectionTitle} · ${pageLabel}`
+                              : r.sectionTitle ?? pageLabel}
+                          </span>
+                        )}
+                      </a>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* Owned mode — Notes */}
+            {!isGapMode(detail.origin) && (
+              <div style={{ marginBottom: 8 }}>
+                <div style={{ fontSize: 9, fontWeight: 600, color: '#475569', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
+                  Notes
+                  {notesSaving && <Loader2 size={9} className="animate-spin" />}
+                </div>
+                <textarea
+                  value={notesDraft}
+                  onChange={e => setNotesDraft(e.target.value)}
+                  onBlur={handleNotesBlur}
+                  placeholder="Add notes…"
+                  style={{
+                    width: '100%', minHeight: 60, resize: 'vertical',
+                    fontSize: 11, lineHeight: 1.5,
+                    background: 'rgba(255,255,255,0.03)',
+                    border: '1px solid rgba(255,255,255,0.06)',
+                    borderRadius: 6, padding: '6px 8px',
+                    color: '#cbd5e1', outline: 'none',
+                    fontFamily: 'inherit',
+                  }}
+                />
+              </div>
+            )}
+
+            {/* Similar skills — ANN cross-links (both modes) */}
+            {(similarLoading || (similar && similar.length > 0)) && (
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, color: '#cbd5e1', marginBottom: 6 }}>
+                  Similar skills
+                </div>
+                {similarLoading ? (
+                  <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                    {[0, 1, 2].map(i => (
+                      <span
+                        key={i}
+                        style={{
+                          display: 'inline-block',
+                          width: 60 + i * 14, height: 18,
+                          borderRadius: 4,
+                          background: 'rgba(255,255,255,0.04)',
+                          border: '1px solid rgba(255,255,255,0.06)',
+                        }}
+                      />
+                    ))}
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                    {similar!.map(s => (
+                      <button
+                        key={s.skillId}
+                        onClick={() => onSelectSkill?.(s.name)}
+                        title={`Distance ${s.distance.toFixed(2)} (cosine, 0=identical)`}
+                        style={{
+                          display: 'inline-flex', alignItems: 'center', gap: 5,
+                          fontSize: 10, padding: '2px 7px',
+                          borderRadius: 4,
+                          background: 'rgba(99,102,241,0.08)',
+                          color: '#a5b4fc',
+                          border: '1px solid rgba(99,102,241,0.18)',
+                          cursor: onSelectSkill ? 'pointer' : 'default',
+                        }}
+                      >
+                        <span>{s.name}</span>
+                        <span style={{ color: '#64748b', fontSize: 9 }}>
+                          {s.distance.toFixed(2)}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Gap mode — Start learning */}
+            {isGapMode(detail.origin) && onOpenGrowthPlan && (
+              <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px solid rgba(255,255,255,0.05)' }}>
+                <button
+                  onClick={onOpenGrowthPlan}
+                  style={{ width: '100%', padding: '6px 10px', borderRadius: 6, background: 'rgba(245,158,11,0.12)', color: '#fcd34d', border: '1px solid rgba(245,158,11,0.28)', cursor: 'pointer', fontSize: 11, fontWeight: 500 }}
+                >
+                  Start learning →
+                </button>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Gap-pseudo-node panel (for canvas `gap-<name>` orphans that have no
+// universal_skills row). Distinct from gap-mode of SkillDetailPanel which is
+// for real universal_skills rows with origin='job_gap'|'tree_quest'.
+function GapPseudoPanel({ gap, onClose }: { gap: SkillGap; onClose: () => void }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
 
   return (
     <div
@@ -845,115 +1323,28 @@ function SkillPanel({
         width: 300, maxHeight: 'calc(100% - 32px)',
         background: 'rgba(4,8,20,0.94)',
         backdropFilter: 'blur(16px)',
-        border: `1px solid ${panelColor}22`,
+        border: `1px solid ${GAP_COLOR}22`,
         borderRadius: 16,
         overflow: 'auto',
-        boxShadow: `0 12px 48px rgba(0,0,0,0.85), 0 0 0 1px ${panelColor}11`,
+        boxShadow: `0 12px 48px rgba(0,0,0,0.85), 0 0 0 1px ${GAP_COLOR}11`,
       }}
       onClick={e => e.stopPropagation()}
     >
       <div style={{ padding: '14px 16px 10px', borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
         <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 8 }}>
           <div>
-            <div style={{ fontSize: 14, fontWeight: 600, color: gap && !skill ? GAP_COLOR : '#f1f5f9', marginBottom: 2 }}>
-              {skill ? skill.name : gap!.skillName}
-            </div>
-            {skill?.domain && <div style={{ fontSize: 10, color: '#475569' }}>{skill.domain}</div>}
-            {gap && !skill && <div style={{ fontSize: 10, color: '#78350f' }}>Skill Gap — not yet mastered</div>}
+            <div style={{ fontSize: 14, fontWeight: 600, color: GAP_COLOR, marginBottom: 2 }}>{gap.skillName}</div>
+            <div style={{ fontSize: 10, color: '#78350f' }}>Skill Gap — not yet mastered</div>
           </div>
           <button onClick={onClose} style={{ background: 'none', border: 'none', color: '#475569', cursor: 'pointer', flexShrink: 0, padding: 2 }}>
             <X size={14} />
           </button>
         </div>
       </div>
-
-      <div style={{ padding: '10px 16px' }}>
-        {skill && (
-          <>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
-              <LevelDots level={skill.level} />
-              <span style={{ fontSize: 11, color: '#94a3b8' }}>Level {skill.level} — {LEVEL_LABELS[skill.level] || ''}</span>
-            </div>
-            {skill.evidence.length > 0 && (
-              <div style={{ marginBottom: 12 }}>
-                <div style={{ fontSize: 9, fontWeight: 600, color: '#475569', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6 }}>Evidence</div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                  {skill.evidence.map((e, i) => (
-                    <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 6, fontSize: 11, color: '#94a3b8' }}>
-                      <EvidenceIcon type={e.type} />
-                      <span>
-                        {e.type === 'resume' && (e.detail || 'Listed on resume')}
-                        {e.type === 'tree_quest' && (<><span style={{ color: '#34d399' }}>{e.projectName}</span>{' → '}{e.nodeTitle}{e.progress !== undefined && <span style={{ color: '#475569' }}> ({e.progress}%)</span>}</>)}
-                        {e.type === 'work_resource' && (<><span style={{ color: '#a78bfa' }}>{e.company}</span>{' — '}{e.resourceTitle}</>)}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-            {skillAliases.length > 0 && (
-              <div style={{ marginBottom: 12 }}>
-                <div style={{ fontSize: 9, fontWeight: 600, color: '#475569', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 4 }}>Also known as</div>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-                  {skillAliases.map(a => (
-                    <span key={a.id} style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, background: 'rgba(99,102,241,0.12)', color: '#818cf8', border: '1px solid rgba(99,102,241,0.2)' }}>{a.alias}</span>
-                  ))}
-                </div>
-              </div>
-            )}
-            {/* Path from seeds */}
-            {skill.state !== 'seed' && (
-              <div style={{ marginBottom: 12 }}>
-                <div style={{ fontSize: 9, fontWeight: 600, color: '#475569', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6 }}>Path from your skills</div>
-                {prereqPathLoading && (
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 10, color: '#334155' }}>
-                    <Loader2 className="w-3 h-3 animate-spin" />Finding path…
-                  </div>
-                )}
-                {!prereqPathLoading && prereqPath && prereqPath.isReachable && (
-                  <PrereqPathBreadcrumb path={prereqPath.path} onSelectSkill={onSelectSkill} />
-                )}
-                {!prereqPathLoading && prereqPath && !prereqPath.isReachable && (
-                  <div style={{ fontSize: 10, color: '#334155', fontStyle: 'italic' }}>
-                    Run Infer Dependencies to discover prerequisites
-                  </div>
-                )}
-                {!prereqPathLoading && !prereqPath && (
-                  <div style={{ fontSize: 10, color: '#334155', fontStyle: 'italic' }}>
-                    Run Infer Dependencies to discover prerequisites
-                  </div>
-                )}
-              </div>
-            )}
-            {skill.state === 'seed' && (
-              <div style={{ marginBottom: 12, padding: '6px 8px', borderRadius: 6, background: 'rgba(245,158,11,0.07)', border: '1px solid rgba(245,158,11,0.18)' }}>
-                <div style={{ fontSize: 10, color: '#f59e0b', display: 'flex', alignItems: 'center', gap: 5 }}>
-                  <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#f59e0b', flexShrink: 0, display: 'inline-block' }} />
-                  This is a baseline seed — start here
-                </div>
-              </div>
-            )}
-            {prereqs.length > 0 && (
-              <div style={{ marginBottom: 8 }}>
-                <div style={{ fontSize: 9, fontWeight: 600, color: '#475569', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 4 }}>Prerequisites</div>
-                {prereqs.map(s => <div key={s.id} style={{ fontSize: 11, color: '#64748b', padding: '2px 0' }}>← {s.name}</div>)}
-              </div>
-            )}
-            {unlocks.length > 0 && (
-              <div>
-                <div style={{ fontSize: 9, fontWeight: 600, color: '#475569', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 4 }}>Unlocks</div>
-                {unlocks.map(s => <div key={s.id} style={{ fontSize: 11, color: '#64748b', padding: '2px 0' }}>→ {s.name}</div>)}
-              </div>
-            )}
-          </>
-        )}
-        {gap && !skill && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 11, color: '#92400e' }}>
-            <div>Demanded by <span style={{ color: GAP_COLOR, fontWeight: 500 }}>{gap.demandCount}</span> job(s)</div>
-            <div>Frequency: <span style={{ color: GAP_COLOR, fontWeight: 500 }}>{(gap.frequency * 100).toFixed(0)}%</span></div>
-            <div>Demand score: <span style={{ color: GAP_COLOR, fontWeight: 500 }}>{gap.demandScore.toFixed(1)}</span></div>
-          </div>
-        )}
+      <div style={{ padding: '10px 16px', display: 'flex', flexDirection: 'column', gap: 6, fontSize: 11, color: '#92400e' }}>
+        <div>Demanded by <span style={{ color: GAP_COLOR, fontWeight: 500 }}>{gap.demandCount}</span> job(s)</div>
+        <div>Frequency: <span style={{ color: GAP_COLOR, fontWeight: 500 }}>{(gap.frequency * 100).toFixed(0)}%</span></div>
+        <div>Demand score: <span style={{ color: GAP_COLOR, fontWeight: 500 }}>{gap.demandScore.toFixed(1)}</span></div>
       </div>
     </div>
   );
@@ -1191,10 +1582,42 @@ function GrowthPlanPanel({
 
 const SEASONS = ['Fall 2024', 'Winter 2025', 'Spring 2025', 'Summer 2025', 'Fall 2025', 'Winter 2026', 'Spring 2026', 'Summer 2026'];
 
-function LearningStepRow({ step, onSelectSkill }: { step: LearningStep; onSelectSkill?: (name: string) => void }) {
+interface SkillInlineContext {
+  prereqsDone: Array<{ skillId: string; name: string }>;
+  unlocks: Array<{ skillId: string; name: string; jobDemandCount: number }>;
+  related: Array<{ skillId: string; name: string }>;
+  resources: Array<{ title: string; url: string }>;
+}
+
+function LearningStepRow({
+  step, onSelectSkill, getInline,
+}: {
+  step: LearningStep;
+  onSelectSkill?: (name: string) => void;
+  getInline: (skillId: string) => Promise<SkillInlineContext>;
+}) {
   const [expanded, setExpanded] = useState(false);
+  const [inline, setInline] = useState<SkillInlineContext | null>(null);
+  const [inlineLoading, setInlineLoading] = useState(false);
+  const [inlineError, setInlineError] = useState<string | null>(null);
   const topJobs = step.jobsNeedingThis.slice(0, 3);
   const extraJobs = step.jobsNeedingThis.length - topJobs.length;
+
+  async function handleToggle() {
+    if (expanded) { setExpanded(false); return; }
+    setExpanded(true);
+    if (inline !== null) return;
+    setInlineLoading(true);
+    setInlineError(null);
+    try {
+      const ctx = await getInline(step.skillId);
+      setInline(ctx);
+    } catch (e) {
+      setInlineError(typeof e === 'string' ? e : 'Failed to load context');
+    } finally {
+      setInlineLoading(false);
+    }
+  }
 
   const stateColor = step.skillState === 'seed' ? '#f59e0b'
     : step.skillState === 'gap' ? '#ef4444'
@@ -1211,7 +1634,7 @@ function LearningStepRow({ step, onSelectSkill }: { step: LearningStep; onSelect
       {/* Header row */}
       <div
         style={{ padding: '8px 10px', cursor: 'pointer', display: 'flex', alignItems: 'flex-start', gap: 8 }}
-        onClick={() => setExpanded(e => !e)}
+        onClick={handleToggle}
       >
         {/* Step number */}
         <div style={{
@@ -1276,24 +1699,107 @@ function LearningStepRow({ step, onSelectSkill }: { step: LearningStep; onSelect
           background: step.hasResources ? '#34d399' : '#1e3a2a',
           border: `1px solid ${step.hasResources ? '#34d399' : '#1e293b'}`,
         }} title={step.hasResources ? 'Resources available' : 'No resources yet'} />
+
+        {/* Expand chevron */}
+        <div style={{ flexShrink: 0, marginTop: 2, color: '#475569' }}>
+          {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+        </div>
       </div>
 
-      {/* Expanded rationale */}
+      {/* Expanded — rationale + inline context */}
       {expanded && (
-        <div style={{ padding: '0 10px 8px 40px' }}>
-          <div style={{ fontSize: 9, color: '#475569', lineHeight: 1.5 }}>{step.rationale}</div>
-          <a
-            href={`/?prefill=${encodeURIComponent(step.skillName)}`}
-            onClick={e => e.stopPropagation()}
-            style={{
-              display: 'inline-flex', alignItems: 'center', gap: 4, marginTop: 6,
-              fontSize: 9, padding: '2px 7px', borderRadius: 4,
-              background: 'rgba(16,185,129,0.12)', color: '#34d399',
-              border: '1px solid rgba(16,185,129,0.2)', textDecoration: 'none',
-            }}
-          >
-            <ExternalLink size={9} />Generate tree
-          </a>
+        <div style={{ padding: '0 10px 10px 40px' }}>
+          {step.rationale && (
+            <div style={{ fontSize: 9, color: '#475569', lineHeight: 1.5, marginBottom: 8 }}>{step.rationale}</div>
+          )}
+
+          {inlineLoading && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 10, color: '#475569' }}>
+              <Loader2 size={10} className="animate-spin" />Loading context…
+            </div>
+          )}
+
+          {inlineError && (
+            <div style={{ fontSize: 10, color: '#fca5a5' }}>{inlineError}</div>
+          )}
+
+          {!inlineLoading && !inlineError && inline && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <div style={{ fontSize: 10, lineHeight: 1.5 }}>
+                <span style={{ color: '#34d399', fontWeight: 600 }}>✓ Prereqs done</span>{' '}
+                <span style={{ color: '#94a3b8' }}>
+                  {inline.prereqsDone.length === 0
+                    ? <span style={{ color: '#475569', fontStyle: 'italic' }}>none yet</span>
+                    : inline.prereqsDone.map(p => p.name).join(', ')}
+                </span>
+              </div>
+
+              <div style={{ fontSize: 10, lineHeight: 1.5 }}>
+                <span style={{ color: '#818cf8', fontWeight: 600 }}>→ Unlocks</span>{' '}
+                {inline.unlocks.length === 0 ? (
+                  <span style={{ color: '#475569', fontStyle: 'italic' }}>none yet</span>
+                ) : (
+                  <span style={{ color: '#94a3b8' }}>
+                    {inline.unlocks.map((u, i) => (
+                      <span key={u.skillId}>
+                        {i > 0 && ', '}
+                        {u.name}
+                        {u.jobDemandCount > 0 && (
+                          <span style={{
+                            marginLeft: 4, fontSize: 8, padding: '0 4px', borderRadius: 3,
+                            background: 'rgba(99,102,241,0.08)', color: '#6366f1',
+                            border: '1px solid rgba(99,102,241,0.14)',
+                          }}>
+                            {u.jobDemandCount}
+                          </span>
+                        )}
+                      </span>
+                    ))}
+                  </span>
+                )}
+              </div>
+
+              <div style={{ fontSize: 10, lineHeight: 1.5 }}>
+                <span style={{ color: '#fbbf24', fontWeight: 600 }}>~ Related</span>{' '}
+                <span style={{ color: '#94a3b8' }}>
+                  {inline.related.length === 0
+                    ? <span style={{ color: '#475569', fontStyle: 'italic' }}>none found</span>
+                    : inline.related.map(r => r.name).join(', ')}
+                </span>
+              </div>
+
+              <div style={{ fontSize: 10, lineHeight: 1.5 }}>
+                <span style={{ color: '#34d399', fontWeight: 600 }}>📖 Resources</span>{' '}
+                {inline.resources.length === 0 ? (
+                  <span style={{ color: '#475569', fontStyle: 'italic' }}>No resources linked yet</span>
+                ) : (
+                  <span style={{ display: 'inline-flex', flexWrap: 'wrap', gap: 6 }}>
+                    {inline.resources.map((res, i) => (
+                      <a
+                        key={i}
+                        href={res.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        onClick={e => e.stopPropagation()}
+                        style={{
+                          color: '#6ee7b7', textDecoration: 'none',
+                          padding: '1px 6px', borderRadius: 4,
+                          background: 'rgba(16,185,129,0.08)',
+                          border: '1px solid rgba(16,185,129,0.18)',
+                          maxWidth: 220, overflow: 'hidden',
+                          textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                          display: 'inline-block',
+                        }}
+                        title={res.url}
+                      >
+                        {res.title || res.url}
+                      </a>
+                    ))}
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -1310,6 +1816,16 @@ function LearningPathPanel({
   season: string | null;
   onSeasonChange: (s: string | null) => void;
 }) {
+  // Inline-context cache shared across rows — keyed by skillId
+  const inlineCache = useRef<Map<string, SkillInlineContext>>(new Map());
+  const getInline = useCallback(async (skillId: string): Promise<SkillInlineContext> => {
+    const cached = inlineCache.current.get(skillId);
+    if (cached) return cached;
+    const ctx = await invoke<SkillInlineContext>('get_skill_inline_context', { skillId });
+    inlineCache.current.set(skillId, ctx);
+    return ctx;
+  }, []);
+
   return (
     <div
       style={{
@@ -1393,7 +1909,7 @@ function LearningPathPanel({
               Prerequisites always appear before dependents · sorted by job demand weight
             </div>
             {learningPath.steps.map(step => (
-              <LearningStepRow key={step.step} step={step} onSelectSkill={onSelectSkill} />
+              <LearningStepRow key={step.step} step={step} onSelectSkill={onSelectSkill} getInline={getInline} />
             ))}
           </>
         )}
@@ -1437,8 +1953,124 @@ function PrereqPathBreadcrumb({ path, onSelectSkill }: { path: PathNode[]; onSel
   );
 }
 
+// ─── GapPath types (Phase 2 skill graph) ──────────────────────────────────────
+
+interface GapSkillStep {
+  skillId: string;
+  skillName: string;
+  level: number;
+  state: string;       // "seed" | "adjacent" | "gap"
+  origin: string;
+  hasTree: boolean;
+  treeNodeId: string | null;
+  treeProjectId: string | null;
+}
+
+interface GapPath {
+  gapSkillId: string;
+  gapSkillName: string;
+  path: GapSkillStep[];
+  estimatedDepth: number;
+}
+
+function stateChipStyle(state: string): React.CSSProperties {
+  switch (state) {
+    case 'seed':
+      return { background: 'rgba(16,185,129,0.14)', color: '#6ee7b7', border: '1px solid rgba(16,185,129,0.28)' };
+    case 'gap':
+      return { background: 'rgba(245,158,11,0.14)', color: '#fcd34d', border: '1px solid rgba(245,158,11,0.28)' };
+    case 'adjacent':
+    default:
+      return { background: 'rgba(148,163,184,0.10)', color: '#94a3b8', border: '1px solid rgba(148,163,184,0.20)' };
+  }
+}
+
+function GapPathSteps({ steps }: { steps: GapSkillStep[] }) {
+  if (steps.length === 0) {
+    return (
+      <div style={{ fontSize: 10, color: '#64748b', fontStyle: 'italic', padding: '6px 0' }}>
+        No prerequisite path found — you may already have the foundations
+      </div>
+    );
+  }
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 6 }}>
+      {steps.map((s, idx) => (
+        <div
+          key={s.skillId}
+          style={{
+            display: 'flex', alignItems: 'center', gap: 6,
+            padding: '4px 6px',
+            borderRadius: 5,
+            background: idx === steps.length - 1 ? 'rgba(245,158,11,0.06)' : 'rgba(255,255,255,0.025)',
+            border: '1px solid ' + (idx === steps.length - 1 ? 'rgba(245,158,11,0.15)' : 'rgba(255,255,255,0.04)'),
+          }}
+        >
+          <span style={{ fontSize: 9, color: '#475569', minWidth: 14, textAlign: 'center' }}>{idx + 1}</span>
+          <span style={{ fontSize: 11, color: '#e2e8f0', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {s.skillName}
+          </span>
+          <span style={{ fontSize: 8, padding: '1px 5px', borderRadius: 3, background: 'rgba(255,255,255,0.05)', color: '#94a3b8', border: '1px solid rgba(255,255,255,0.08)', flexShrink: 0 }}>
+            L{s.level}
+          </span>
+          <span style={{ fontSize: 8, padding: '1px 5px', borderRadius: 3, ...stateChipStyle(s.state), flexShrink: 0 }}>
+            {s.state}
+          </span>
+          {s.hasTree && s.treeNodeId && (
+            <button
+              onClick={() => {
+                if (s.treeProjectId) {
+                  window.location.href = `/project/${s.treeProjectId}?node=${s.treeNodeId}`;
+                }
+              }}
+              title="Open tree node"
+              style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 11, padding: 0, lineHeight: 1, flexShrink: 0 }}
+            >
+              🌿
+            </button>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function GrowthTargetRow({ target, maxScore, onSelectSkill }: { target: GrowthTarget; maxScore: number; onSelectSkill?: (name: string) => void }) {
   const scorePct = Math.round((target.finalScore / maxScore) * 100);
+  const [expanded, setExpanded] = useState(false);
+  const [pathLoading, setPathLoading] = useState(false);
+  const [gapPath, setGapPath] = useState<GapPath | null>(null);
+  const [pathError, setPathError] = useState<string | null>(null);
+  const [opening, setOpening] = useState(false);
+  const [openError, setOpenError] = useState<string | null>(null);
+
+  async function handleOpenTree() {
+    if (opening) return;
+    setOpening(true);
+    setOpenError(null);
+    const result = await openSkillTree(target.skillId);
+    if (!result.ok) setOpenError(result.error);
+    setOpening(false);
+  }
+
+  async function handleTogglePath() {
+    if (expanded) {
+      setExpanded(false);
+      return;
+    }
+    setExpanded(true);
+    if (gapPath !== null) return;
+    setPathLoading(true);
+    setPathError(null);
+    try {
+      const result = await invoke<GapPath>('get_gap_path', { skillId: target.skillId });
+      setGapPath(result);
+    } catch (e) {
+      setPathError(typeof e === 'string' ? e : 'Failed to load path');
+    } finally {
+      setPathLoading(false);
+    }
+  }
 
   return (
     <div style={{ marginBottom: 10, padding: '8px 10px', borderRadius: 8, background: target.isReachable ? 'rgba(245,158,11,0.06)' : 'rgba(255,255,255,0.03)', border: '1px solid ' + (target.isReachable ? 'rgba(245,158,11,0.15)' : 'rgba(255,255,255,0.06)') }}>
@@ -1446,14 +2078,29 @@ function GrowthTargetRow({ target, maxScore, onSelectSkill }: { target: GrowthTa
         <div style={{ fontSize: 12, fontWeight: 600, color: target.isReachable ? '#fef3c7' : '#94a3b8', flex: 1 }}>
           {target.skillName}
         </div>
-        <a
-          href={`/?prefill=${encodeURIComponent(target.skillName)}`}
-          onClick={e => e.stopPropagation()}
-          style={{ fontSize: 9, padding: '2px 6px', borderRadius: 4, background: 'rgba(16,185,129,0.12)', color: '#34d399', border: '1px solid rgba(16,185,129,0.2)', textDecoration: 'none', flexShrink: 0, whiteSpace: 'nowrap' }}
+        <button
+          onClick={e => { e.stopPropagation(); handleOpenTree(); }}
+          disabled={opening}
+          style={{
+            fontSize: 9, padding: '2px 7px', borderRadius: 4,
+            background: opening ? 'rgba(255,255,255,0.05)' : 'rgba(16,185,129,0.12)',
+            color: opening ? '#475569' : '#34d399',
+            border: '1px solid ' + (opening ? 'rgba(255,255,255,0.08)' : 'rgba(16,185,129,0.2)'),
+            cursor: opening ? 'default' : 'pointer',
+            flexShrink: 0, whiteSpace: 'nowrap',
+            display: 'inline-flex', alignItems: 'center', gap: 4,
+          }}
+          title="Open existing tree or generate a new graph-seeded tree"
         >
-          Generate tree
-        </a>
+          {opening
+            ? <><Loader2 size={9} style={{ animation: 'spin 1s linear infinite' }} />Opening…</>
+            : <>Open tree →</>}
+        </button>
       </div>
+
+      {openError && (
+        <div style={{ fontSize: 9, color: '#fca5a5', marginBottom: 4 }}>{openError}</div>
+      )}
 
       {target.prereqPath.length > 0 && (
         <PrereqPathBreadcrumb path={target.prereqPath} onSelectSkill={onSelectSkill} />
@@ -1475,11 +2122,76 @@ function GrowthTargetRow({ target, maxScore, onSelectSkill }: { target: GrowthTa
       {target.rationale && (
         <div style={{ fontSize: 9, color: '#334155', marginTop: 4 }}>{target.rationale}</div>
       )}
+
+      <div style={{ marginTop: 6 }}>
+        <button
+          onClick={handleTogglePath}
+          disabled={pathLoading}
+          style={{
+            fontSize: 9, padding: '3px 7px', borderRadius: 4,
+            background: 'rgba(99,102,241,0.10)', color: '#a5b4fc',
+            border: '1px solid rgba(99,102,241,0.22)',
+            cursor: pathLoading ? 'default' : 'pointer',
+            display: 'inline-flex', alignItems: 'center', gap: 4,
+          }}
+        >
+          {pathLoading ? (
+            <><Loader2 size={9} style={{ animation: 'spin 1s linear infinite' }} />Loading…</>
+          ) : (
+            <>{expanded ? 'Hide path' : 'Show path →'}</>
+          )}
+        </button>
+      </div>
+
+      {expanded && !pathLoading && pathError && (
+        <div style={{ fontSize: 10, color: '#fca5a5', marginTop: 6 }}>{pathError}</div>
+      )}
+
+      {expanded && !pathLoading && !pathError && gapPath && (
+        <GapPathSteps steps={gapPath.path} />
+      )}
     </div>
   );
 }
 
 // ─── Easing ───────────────────────────────────────────────────────────────────
+
+// ─── Open-tree-for-skill (shared by GrowthPlanPanel + SkillDetailPanel) ──────
+// Returns { ok: true } after triggering navigation. Returns { ok: false, error }
+// if anything failed before navigation could start.
+const SKILLS_PROJECT_ID = '00000000-0000-0000-0000-000000000001';
+
+async function openSkillTree(skillId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  try {
+    const existing = await invoke<{ treeId: string; treeTitle: string } | null>(
+      'get_tree_for_skill',
+      { skillId },
+    );
+    if (existing) {
+      window.location.href = `/trees?selected=${encodeURIComponent(existing.treeId)}`;
+      return { ok: true };
+    }
+    const skillContext = await invoke<string>('get_skill_graph_context', { skillId });
+    const treeJson = await invoke<string>('generate_skill_tree', {
+      projectId: SKILLS_PROJECT_ID,
+      prdText: '',
+      skillContext,
+      skillId,
+    });
+    let newTreeId: string | null = null;
+    try {
+      const parsed = JSON.parse(treeJson);
+      if (parsed && typeof parsed.tree_id === 'string') newTreeId = parsed.tree_id;
+    } catch { /* fall through to error below */ }
+    if (!newTreeId) {
+      return { ok: false, error: 'Tree generated but no id returned' };
+    }
+    window.location.href = `/trees?selected=${encodeURIComponent(newTreeId)}`;
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: typeof e === 'string' ? e : 'Failed to open tree' };
+  }
+}
 
 function easeOutCubic(t: number) {
   return 1 - Math.pow(1 - t, 3);
@@ -1506,13 +2218,12 @@ export default function SkillsPage() {
   const [learningPath, setLearningPath] = useState<LearningPath | null>(null);
   const [learningPathLoading, setLearningPathLoading] = useState(false);
   const [learningPathSeason, setLearningPathSeason] = useState<string | null>(null);
-  const [showSyncDropdown, setShowSyncDropdown] = useState(false);
+  const [syncToast, setSyncToast] = useState<string | null>(null);
   const [showOverflowMenu, setShowOverflowMenu] = useState(false);
   const [inferring, setInferring] = useState(false);
   const [classifying, setClassifying] = useState(false);
   const [resetting, setResetting]     = useState(false);
   const [classifyToast, setClassifyToast] = useState<string | null>(null);
-  const [backfilling, setBackfilling] = useState(false);
   const [backfillToast, setBackfillToast] = useState<string | null>(null);
   const [syncingJobs, setSyncingJobs] = useState(false);
   const [autoMergeSuggestions, setAutoMergeSuggestions] = useState<SuggestedMerge[] | null>(null);
@@ -1537,6 +2248,11 @@ export default function SkillsPage() {
   const animFromRef    = useRef({ x: 0, y: 0, scale: 1 });
   const animToRef      = useRef({ x: 0, y: 0, scale: 1 });
   const animatingRef   = useRef(false);
+
+  // Zoom percentage label — updated from rAF loop to avoid per-frame React renders
+  const zoomLabelRef   = useRef<HTMLSpanElement>(null);
+  const ZOOM_MIN = 0.15;
+  const ZOOM_MAX = 6.0;
 
   const transform    = useRef({ x: 0, y: 0, scale: 1 });
   const isDragging   = useRef(false);
@@ -1782,6 +2498,9 @@ export default function SkillsPage() {
         if (t2 >= 1) animatingRef.current = false;
       }
       triggerRender();
+      if (zoomLabelRef.current) {
+        zoomLabelRef.current.textContent = Math.round(transform.current.scale * 100) + '%';
+      }
       rafId = requestAnimationFrame(tick);
     };
     rafId = requestAnimationFrame(tick);
@@ -1903,6 +2622,17 @@ export default function SkillsPage() {
     animatingRef.current = true;
   }
 
+  function zoomByFactor(factor: number) {
+    const t = transform.current;
+    const newScale = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, t.scale * factor));
+    // Zoom about canvas center so the user's framing stays put.
+    const cx = size.w / 2, cy = size.h / 2;
+    t.x = cx - (cx - t.x) * (newScale / t.scale);
+    t.y = cy - (cy - t.y) * (newScale / t.scale);
+    t.scale = newScale;
+    triggerRender();
+  }
+
   function handleFitAll() {
     if (placements.length === 0) return;
     const xs = placements.map(p => p.x), ys = placements.map(p => p.y);
@@ -1928,9 +2658,55 @@ export default function SkillsPage() {
 
   async function handleSync() {
     setSyncing(true);
-    try { await invoke('sync_all_skills'); await loadAll(); }
-    catch (e) { console.error('Sync failed:', e); }
-    finally { setSyncing(false); }
+    setSyncToast('Syncing skills…');
+    try {
+      await invoke('sync_all_skills');
+      await loadAll();
+    } catch (e) {
+      console.error('Sync failed:', e);
+      setSyncToast(`Sync failed: ${String(e)}`);
+      setTimeout(() => setSyncToast(null), 5000);
+      setSyncing(false);
+      return;
+    } finally {
+      setSyncing(false);
+    }
+
+    // Chain embed → infer → classify → reload as a background pipeline.
+    // Embed must run BEFORE infer: the ANN inferencer (infer_skill_deps_ann)
+    // needs `universal_skills.embedding` populated to compute neighborhoods.
+    // Classify can produce new domain names that influence embed text, so it
+    // tail-calls `backfill_skill_embeddings` to re-embed any newly classified
+    // skills automatically — no extra step needed here.
+    //
+    // Errors at each stage are surfaced in the toast but don't abort downstream.
+    (async () => {
+      setSyncToast('Embedding skills…');
+      try {
+        await invoke('backfill_skill_embeddings_cmd');
+      } catch (e) {
+        console.error('Embed failed:', e);
+      }
+
+      setSyncToast('Inferring dependencies…');
+      try {
+        await invoke('infer_skill_dependencies');
+      } catch (e) {
+        console.error('Infer deps failed:', e);
+      }
+
+      setSyncToast('Classifying domains…');
+      try {
+        const result = await invoke<{ total: number; classified: number; failed: number }>('classify_skill_domains');
+        setSyncToast(`Done — classified ${result.classified}/${result.total}`);
+      } catch (e) {
+        console.error('Classify domains failed:', e);
+        setSyncToast(`Done (classify error: ${String(e)})`);
+      }
+
+      await loadAll();
+      setTimeout(() => setSyncToast(null), 4000);
+    })();
   }
 
   async function handleAutoMergePreview() {
@@ -1961,23 +2737,50 @@ export default function SkillsPage() {
 
   async function handleSyncJobs() {
     setSyncingJobs(true);
-    try { await invoke('sync_skills_from_jobs'); await loadAll(); }
-    catch (e) { console.error('Job skill sync failed:', e); }
-    finally { setSyncingJobs(false); }
-  }
-
-  async function handleBackfillSlugs() {
-    setBackfilling(true);
+    setSyncToast('Syncing job skills…');
     try {
-      const matched = await invoke<number>('backfill_concept_slugs');
-      setBackfillToast(`Concept slugs backfilled — ${matched} skills matched`);
-      setTimeout(() => setBackfillToast(null), 4000);
+      await invoke('sync_skills_from_jobs');
       await loadAll();
     } catch (e) {
-      console.error('Backfill failed:', e);
+      console.error('Job skill sync failed:', e);
+      setSyncToast(`Job sync failed: ${String(e)}`);
+      setTimeout(() => setSyncToast(null), 5000);
+      setSyncingJobs(false);
+      return;
     } finally {
-      setBackfilling(false);
+      setSyncingJobs(false);
     }
+
+    // Mirror handleSync's pipeline so job-derived skills get the same
+    // embed → infer → classify treatment. Without the Embed step the ANN
+    // inferencer cannot see any of the newly-imported job_gap skills.
+    (async () => {
+      setSyncToast('Embedding skills…');
+      try {
+        await invoke('backfill_skill_embeddings_cmd');
+      } catch (e) {
+        console.error('Embed failed:', e);
+      }
+
+      setSyncToast('Inferring dependencies…');
+      try {
+        await invoke('infer_skill_dependencies');
+      } catch (e) {
+        console.error('Infer deps failed:', e);
+      }
+
+      setSyncToast('Classifying domains…');
+      try {
+        const result = await invoke<{ total: number; classified: number; failed: number }>('classify_skill_domains');
+        setSyncToast(`Done — classified ${result.classified}/${result.total}`);
+      } catch (e) {
+        console.error('Classify domains failed:', e);
+        setSyncToast(`Done (classify error: ${String(e)})`);
+      }
+
+      await loadAll();
+      setTimeout(() => setSyncToast(null), 4000);
+    })();
   }
 
   async function handleInferDeps() {
@@ -2126,35 +2929,56 @@ export default function SkillsPage() {
                           backdropFilter: 'blur(12px)',
                           padding: '6px 0',
                         }}>
-                          <div style={{ fontSize: 9, fontWeight: 600, color: '#334155', textTransform: 'uppercase', letterSpacing: '0.08em', padding: '4px 12px 6px' }}>Maintenance</div>
+                          <div style={{ fontSize: 9, fontWeight: 600, color: '#334155', textTransform: 'uppercase', letterSpacing: '0.08em', padding: '4px 12px 6px' }}>Sync</div>
 
-                          {/* Infer Dependencies */}
+                          {/* Sync Job Skills (jobs only) */}
+                          <button
+                            onClick={() => { setShowOverflowMenu(false); handleSyncJobs(); }}
+                            disabled={syncingJobs || syncing}
+                            style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 12px', background: 'none', border: 'none', cursor: (syncingJobs || syncing) ? 'default' : 'pointer', color: (syncingJobs || syncing) ? '#334155' : '#94a3b8', fontSize: 11 }}
+                          >
+                            <span style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                              {syncingJobs ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw style={{ width: 12, height: 12, color: '#fbbf24' }} />}
+                              {syncingJobs ? 'Syncing Jobs…' : 'Sync Job Skills'}
+                            </span>
+                            <span style={{ fontSize: 8, color: '#475569', whiteSpace: 'nowrap' }}>JD only</span>
+                          </button>
+
+                          <div style={{ margin: '4px 12px', borderTop: '1px solid rgba(255,255,255,0.06)' }} />
+
+                          <div style={{ fontSize: 9, fontWeight: 600, color: '#334155', textTransform: 'uppercase', letterSpacing: '0.08em', padding: '4px 12px 6px', opacity: 0.7 }}>Force re-run</div>
+
+                          {/* Infer Dependencies — auto-runs on Sync; manual escape hatch */}
                           {skills.length >= 2 && (
                             <button
                               onClick={() => { setShowOverflowMenu(false); handleInferDeps(); }}
                               disabled={inferring}
-                              style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 12px', background: 'none', border: 'none', cursor: inferring ? 'default' : 'pointer', color: inferring ? '#334155' : '#94a3b8', fontSize: 11 }}
+                              style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 12px', background: 'none', border: 'none', cursor: inferring ? 'default' : 'pointer', color: inferring ? '#334155' : '#64748b', fontSize: 11 }}
                             >
                               <span style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
                                 {inferring ? <Loader2 className="w-3 h-3 animate-spin" /> : <Wand2 style={{ width: 12, height: 12 }} />}
                                 {inferring ? 'Inferring…' : 'Infer Dependencies'}
                               </span>
-                              <span style={{ fontSize: 8, padding: '1px 5px', borderRadius: 3, background: 'rgba(99,102,241,0.10)', color: '#6366f1', border: '1px solid rgba(99,102,241,0.18)', whiteSpace: 'nowrap' }}>llama-3.3-70b · Groq</span>
+                              <span style={{ fontSize: 8, padding: '1px 5px', borderRadius: 3, background: 'rgba(99,102,241,0.08)', color: '#4f46e5', border: '1px solid rgba(99,102,241,0.14)', whiteSpace: 'nowrap' }}>llama-3.3-70b · Groq</span>
                             </button>
                           )}
 
-                          {/* Classify Domains */}
+                          {/* Classify Domains — auto-runs on Sync; manual escape hatch */}
                           <button
                             onClick={() => { setShowOverflowMenu(false); handleClassifyDomains(); }}
                             disabled={classifying || skills.length === 0}
-                            style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 12px', background: 'none', border: 'none', cursor: (classifying || skills.length === 0) ? 'default' : 'pointer', color: classifying ? '#334155' : '#94a3b8', fontSize: 11 }}
+                            style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 12px', background: 'none', border: 'none', cursor: (classifying || skills.length === 0) ? 'default' : 'pointer', color: classifying ? '#334155' : '#64748b', fontSize: 11 }}
                           >
                             <span style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
                               {classifying ? <Loader2 className="w-3 h-3 animate-spin" /> : <Sparkles style={{ width: 12, height: 12 }} />}
                               {classifying ? 'Classifying…' : 'Classify Domains'}
                             </span>
-                            <span style={{ fontSize: 8, padding: '1px 5px', borderRadius: 3, background: 'rgba(99,102,241,0.10)', color: '#6366f1', border: '1px solid rgba(99,102,241,0.18)', whiteSpace: 'nowrap' }}>scout-17b · Groq</span>
+                            <span style={{ fontSize: 8, padding: '1px 5px', borderRadius: 3, background: 'rgba(99,102,241,0.08)', color: '#4f46e5', border: '1px solid rgba(99,102,241,0.14)', whiteSpace: 'nowrap' }}>scout-17b · Groq</span>
                           </button>
+
+                          <div style={{ margin: '4px 12px', borderTop: '1px solid rgba(255,255,255,0.06)' }} />
+
+                          <div style={{ fontSize: 9, fontWeight: 600, color: '#334155', textTransform: 'uppercase', letterSpacing: '0.08em', padding: '4px 12px 6px' }}>Maintenance</div>
 
                           {/* Reset Domain Assignments */}
                           <button
@@ -2168,8 +2992,6 @@ export default function SkillsPage() {
                             {resetting ? <Loader2 className="w-3 h-3 animate-spin" /> : <RotateCcw style={{ width: 12, height: 12 }} />}
                             {resetting ? 'Resetting…' : 'Reset Domain Assignments'}
                           </button>
-
-                          <div style={{ margin: '4px 12px', borderTop: '1px solid rgba(255,255,255,0.06)' }} />
 
                           {/* Merge Skills */}
                           {skills.length >= 2 && (
@@ -2190,16 +3012,6 @@ export default function SkillsPage() {
                               <GitMerge style={{ width: 12, height: 12 }} />Auto-merge Duplicates
                             </button>
                           )}
-
-                          {/* Backfill Concept Slugs */}
-                          <button
-                            onClick={() => { setShowOverflowMenu(false); handleBackfillSlugs(); }}
-                            disabled={backfilling}
-                            style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 7, padding: '6px 12px', background: 'none', border: 'none', cursor: backfilling ? 'default' : 'pointer', color: backfilling ? '#334155' : '#94a3b8', fontSize: 11 }}
-                          >
-                            {backfilling ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw style={{ width: 12, height: 12 }} />}
-                            {backfilling ? 'Backfilling…' : 'Backfill Concept Slugs'}
-                          </button>
                         </div>
                       </>
                     )}
@@ -2210,67 +3022,21 @@ export default function SkillsPage() {
                 </div>
               </div>
 
-              {/* Sync ▾ dropdown */}
-              <div style={{ position: 'relative' }}>
-                <div className="flex w-full" style={{ borderRadius: 8, overflow: 'hidden', border: '1px solid rgba(16,185,129,0.25)' }}>
-                  <button
-                    onClick={handleSync}
-                    disabled={syncing || syncingJobs}
-                    className="flex-1 py-2 text-xs font-medium transition-colors flex items-center justify-center gap-2"
-                    style={{ background: (syncing || syncingJobs) ? 'rgba(255,255,255,0.04)' : 'rgba(16,185,129,0.18)', color: (syncing || syncingJobs) ? '#334155' : '#34d399', borderRight: '1px solid rgba(16,185,129,0.20)' }}
-                  >
-                    {syncing ? <><Loader2 className="w-3 h-3 animate-spin" />Syncing…</> : syncingJobs ? <><Loader2 className="w-3 h-3 animate-spin" />Syncing Jobs…</> : <><RefreshCw className="w-3 h-3" />Sync</>}
-                  </button>
-                  <button
-                    onClick={() => setShowSyncDropdown(v => !v)}
-                    disabled={syncing || syncingJobs}
-                    className="px-2.5 py-2 text-xs transition-colors flex items-center"
-                    style={{ background: (syncing || syncingJobs) ? 'rgba(255,255,255,0.04)' : 'rgba(16,185,129,0.18)', color: (syncing || syncingJobs) ? '#334155' : '#34d399' }}
-                    title="Sync options"
-                  >
-                    <ChevronDown className="w-3 h-3" />
-                  </button>
-                </div>
-                {showSyncDropdown && (
-                  <>
-                    <div style={{ position: 'fixed', inset: 0, zIndex: 98 }} onClick={() => setShowSyncDropdown(false)} />
-                    <div style={{
-                      position: 'absolute', top: '100%', left: 0, right: 0, zIndex: 99,
-                      marginTop: 4,
-                      background: 'rgba(4,8,20,0.97)',
-                      border: '1px solid rgba(255,255,255,0.09)',
-                      borderRadius: 8,
-                      boxShadow: '0 8px 24px rgba(0,0,0,0.7)',
-                      backdropFilter: 'blur(12px)',
-                      overflow: 'hidden',
-                    }}>
-                      <button
-                        onClick={() => { setShowSyncDropdown(false); handleSync(); }}
-                        disabled={syncing}
-                        style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: 'none', border: 'none', cursor: syncing ? 'default' : 'pointer', color: '#94a3b8', fontSize: 11, textAlign: 'left' }}
-                      >
-                        <RefreshCw style={{ width: 12, height: 12, color: '#34d399' }} />
-                        <div>
-                          <div style={{ color: '#d1fae5', fontWeight: 500 }}>Sync All Skills</div>
-                          <div style={{ fontSize: 9, color: '#475569', marginTop: 1 }}>Resume, trees, work, jobs</div>
-                        </div>
-                      </button>
-                      <div style={{ borderTop: '1px solid rgba(255,255,255,0.06)' }} />
-                      <button
-                        onClick={() => { setShowSyncDropdown(false); handleSyncJobs(); }}
-                        disabled={syncingJobs}
-                        style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: 'none', border: 'none', cursor: syncingJobs ? 'default' : 'pointer', color: '#94a3b8', fontSize: 11, textAlign: 'left' }}
-                      >
-                        <RefreshCw style={{ width: 12, height: 12, color: '#fbbf24' }} />
-                        <div>
-                          <div style={{ color: '#fef3c7', fontWeight: 500 }}>Sync Job Skills</div>
-                          <div style={{ fontSize: 9, color: '#475569', marginTop: 1 }}>Job applications only</div>
-                        </div>
-                      </button>
-                    </div>
-                  </>
-                )}
-              </div>
+              {/* Sync — single button. Chains infer + classify in the background. */}
+              <button
+                onClick={handleSync}
+                disabled={syncing || syncingJobs}
+                className="w-full py-2 text-xs font-medium transition-colors flex items-center justify-center gap-2"
+                style={{
+                  borderRadius: 8,
+                  border: '1px solid rgba(16,185,129,0.25)',
+                  background: (syncing || syncingJobs) ? 'rgba(255,255,255,0.04)' : 'rgba(16,185,129,0.18)',
+                  color: (syncing || syncingJobs) ? '#334155' : '#34d399',
+                }}
+                title="Sync, infer dependencies, classify domains"
+              >
+                {syncing ? <><Loader2 className="w-3 h-3 animate-spin" />Syncing…</> : <><RefreshCw className="w-3 h-3" />Sync</>}
+              </button>
 
               {/* Growth Plan + Learning Path */}
               <div className="flex gap-1.5 mt-1.5">
@@ -2462,6 +3228,21 @@ export default function SkillsPage() {
 
       {/* ── Canvas ─────────────────────────────────────────────────────────────── */}
       <div className="flex-1 relative overflow-hidden" ref={containerRef}>
+        {syncToast && (
+          <div style={{
+            position: 'absolute', top: 16, left: '50%', transform: 'translateX(-50%)',
+            background: 'rgba(15,15,25,0.92)', border: '1px solid rgba(16,185,129,0.35)',
+            borderRadius: 8, padding: '8px 16px', fontSize: 12, color: '#6ee7b7',
+            zIndex: 51, backdropFilter: 'blur(6px)', whiteSpace: 'nowrap',
+            boxShadow: '0 4px 24px rgba(0,0,0,0.5)',
+            display: 'flex', alignItems: 'center', gap: 6,
+          }}>
+            {syncing || syncToast.startsWith('Syncing') || syncToast.startsWith('Inferring') || syncToast.startsWith('Classifying')
+              ? <Loader2 size={12} className="animate-spin" />
+              : <RefreshCw size={12} />}
+            {syncToast}
+          </div>
+        )}
         {classifyToast && (
           <div style={{
             position: 'absolute', top: 16, left: '50%', transform: 'translateX(-50%)',
@@ -2501,22 +3282,71 @@ export default function SkillsPage() {
           onMouseLeave={() => { isDragging.current = false; dragMoved.current = false; setHoveredId(null); }}
         />
 
-        {/* Fit-all button */}
+        {/* Zoom controls */}
         {skills.length > 0 && (
-          <button
-            onClick={handleFitAll}
-            title="Fit all skills"
+          <div
             style={{
-              position: 'absolute', bottom: 24, right: 16, zIndex: 10,
-              width: 32, height: 32, borderRadius: '50%',
-              background: 'rgba(255,255,255,0.06)',
-              border: '1px solid rgba(255,255,255,0.10)',
-              color: '#475569', cursor: 'pointer',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              position: 'absolute', bottom: 16, right: 16, zIndex: 10,
+              display: 'flex', flexDirection: 'column', gap: 6,
             }}
           >
-            <Maximize2 size={14} />
-          </button>
+            <div
+              style={{
+                display: 'flex', flexDirection: 'column',
+                borderRadius: 8,
+                background: 'rgba(255,255,255,0.06)',
+                border: '1px solid rgba(255,255,255,0.10)',
+                overflow: 'hidden',
+              }}
+            >
+              <button
+                onClick={() => zoomByFactor(1.25)}
+                title="Zoom in"
+                style={{
+                  width: 36, height: 28,
+                  background: 'transparent', border: 'none',
+                  color: '#94a3b8', cursor: 'pointer',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  fontSize: 14, lineHeight: 1,
+                }}
+              >+</button>
+              <div
+                style={{
+                  width: 36, height: 22,
+                  borderTop: '1px solid rgba(255,255,255,0.06)',
+                  borderBottom: '1px solid rgba(255,255,255,0.06)',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  fontSize: 9, color: '#64748b',
+                }}
+              >
+                <span ref={zoomLabelRef}>100%</span>
+              </div>
+              <button
+                onClick={() => zoomByFactor(0.8)}
+                title="Zoom out"
+                style={{
+                  width: 36, height: 28,
+                  background: 'transparent', border: 'none',
+                  color: '#94a3b8', cursor: 'pointer',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  fontSize: 14, lineHeight: 1,
+                }}
+              >−</button>
+            </div>
+            <button
+              onClick={handleFitAll}
+              title="Fit all skills"
+              style={{
+                width: 36, height: 28, borderRadius: 8,
+                background: 'rgba(255,255,255,0.06)',
+                border: '1px solid rgba(255,255,255,0.10)',
+                color: '#94a3b8', cursor: 'pointer',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+              }}
+            >
+              <Maximize2 size={12} />
+            </button>
+          </div>
         )}
 
         {/* Empty state */}
@@ -2527,20 +3357,22 @@ export default function SkillsPage() {
           </div>
         )}
 
-        {/* Skill detail panel */}
-        {(selectedSkill || selectedGap) && (
-          <SkillPanel
-            skill={selectedSkill}
-            gap={selectedGap}
-            aliases={aliases}
-            deps={deps}
-            skills={skills}
+        {/* Skill detail panel — real universal_skills row */}
+        {selectedSkill && (
+          <SkillDetailPanel
+            skillId={selectedSkill.id}
             onClose={() => setSelectedId(null)}
             onSelectSkill={name => {
               const s = skills.find(sk => sk.name.toLowerCase() === name.toLowerCase());
               if (s) setSelectedId(s.id);
             }}
+            onOpenGrowthPlan={handleOpenGrowthPlan}
           />
+        )}
+
+        {/* Gap-pseudo panel for canvas `gap-<name>` orphans */}
+        {!selectedSkill && selectedGap && (
+          <GapPseudoPanel gap={selectedGap} onClose={() => setSelectedId(null)} />
         )}
 
         {/* Growth Plan panel */}

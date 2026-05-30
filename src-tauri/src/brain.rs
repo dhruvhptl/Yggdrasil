@@ -25,9 +25,40 @@ async fn generate_skill_tree_inner(
     client: &reqwest::Client,
     database: &Database,
 ) -> Result<String, String> {
+    generate_skill_tree_inner_with_context(
+        project_id, prd_text, None, None, mastered_concepts, app, client, database,
+    ).await
+}
+
+async fn generate_skill_tree_inner_with_context(
+    project_id: String,
+    prd_text: String,
+    skill_context: Option<String>,
+    skill_id: Option<String>,
+    mastered_concepts: &[String],
+    app: &tauri::AppHandle,
+    client: &reqwest::Client,
+    database: &Database,
+) -> Result<String, String> {
+    // If a skill-graph context block was provided, prepend it to the PRD so
+    // every downstream stage (concept graph extraction, profile, outline,
+    // expansion) sees the skill knowledge graph as primary context.
+    let prd_text = match skill_context.as_deref() {
+        Some(ctx) if !ctx.trim().is_empty() => {
+            if prd_text.trim().is_empty() {
+                format!("## Knowledge Graph Context\n\n{}\n", ctx.trim())
+            } else {
+                format!("## Knowledge Graph Context\n\n{}\n\n---\n\n{}", ctx.trim(), prd_text)
+            }
+        }
+        _ => prd_text,
+    };
+
     println!("\n=== Generate Skill Tree (PRD) ===");
     println!("Project ID: {}", project_id);
-    println!("PRD length: {} chars\n", prd_text.len());
+    println!("PRD length: {} chars (skill_context: {})\n",
+        prd_text.len(),
+        if skill_context.is_some() { "yes" } else { "no" });
 
     // Phase 1: Extract concept dependency graph
     // Keep sorted concepts alive for PRD profile + concept_slug population.
@@ -154,6 +185,21 @@ async fn generate_skill_tree_inner(
     let (tree_id, leaf_node_ids) = save_tree_to_database(&skill_tree, database, prd_sorted_concepts.as_deref()).await?;
     println!("💾 Saved to database with tree_id: {}", tree_id);
 
+    // Anchor skill-seeded trees in skill_trees (migration 043).
+    if let Some(ref sid) = skill_id {
+        if let Err(e) = sqlx::query(
+            "INSERT INTO skill_trees (skill_id, tree_id) VALUES ($1, $2) ON CONFLICT DO NOTHING"
+        )
+        .bind(sid)
+        .bind(&tree_id)
+        .execute(&database.pool)
+        .await {
+            println!("⚠️  skill_trees insert failed (non-fatal): {}", e);
+        } else {
+            println!("🔗 Linked skill {} → tree {}", sid, tree_id);
+        }
+    }
+
     auto_match_tree_nodes(&database.pool, client, &leaf_node_ids).await;
     crate::orchestrator::on_tree_generated(&database.pool, app, &tree_id, &skill_tree.project_id).await;
 
@@ -167,11 +213,15 @@ async fn generate_skill_tree_inner(
 pub async fn generate_skill_tree(
     project_id: String,
     prd_text: String,
+    skill_context: Option<String>,
+    skill_id: Option<String>,
     app: tauri::AppHandle,
     client: State<'_, reqwest::Client>,
     database: State<'_, Database>,
 ) -> Result<String, String> {
-    generate_skill_tree_inner(project_id, prd_text, &[], &app, &*client, &*database).await
+    generate_skill_tree_inner_with_context(
+        project_id, prd_text, skill_context, skill_id, &[], &app, &*client, &*database,
+    ).await
 }
 
 async fn analyze_repo_inner(
