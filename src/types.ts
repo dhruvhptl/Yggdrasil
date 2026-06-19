@@ -367,3 +367,13 @@ export interface ResourceStudyMap {
   totalUnlockedNodes: number;
   totalFrontierNodes: number;
 }
+
+export interface Proposal {
+  id: string;
+  type: 'merge_skills' | 'delete_skill' | 'rename_skill';
+  payload: Record<string, string>;
+  llmReasoning: string;
+  status: 'pending' | 'approved' | 'rejected';
+  createdAt: string;
+  reviewedAt: string | null;
+}

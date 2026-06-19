@@ -25,6 +25,8 @@ mod export_commands;
 mod daily_commands;
 mod read_models;
 mod orchestrator;
+#[allow(dead_code)]
+mod graph_audit;
 
 use database::Database;
 use tauri::Manager;
@@ -197,6 +199,11 @@ fn main() {
             orchestrator::enqueue_infer_deps,
             orchestrator::get_transcript_job_status,
             orchestrator::extract_skills_backfill,
+            graph_audit::run_graph_audit,
+            graph_audit::get_pending_proposals,
+            graph_audit::approve_proposal,
+            graph_audit::reject_proposal,
+            graph_audit::clear_all_proposals,
             brain::get_prompt_stats,
             brain::get_tree_concept_graph,
             brain::regenerate_tree,

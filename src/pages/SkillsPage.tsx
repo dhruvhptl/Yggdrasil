@@ -8,9 +8,9 @@ import {
   RefreshCw, Loader2, AlertTriangle, Sparkles,
   X, Wand2, GitMerge, Check, Search, Eye, Download, ChevronDown, ChevronRight,
   PanelLeftClose, PanelLeftOpen, RotateCcw, TrendingUp, Zap, Route, BookOpen,
-  Maximize2, MoreHorizontal,
+  Maximize2, MoreHorizontal, ShieldCheck, CheckCircle, XCircle, Trash2,
 } from 'lucide-react';
-import type { UniversalSkill, SkillGap, SkillDependency, SkillAlias, SkillGraphSnapshot, GrowthTarget, PathNode, PrereqPath, LearningStep, LearningPath } from '../types';
+import type { UniversalSkill, SkillGap, SkillDependency, SkillAlias, SkillGraphSnapshot, GrowthTarget, PathNode, PrereqPath, LearningStep, LearningPath, Proposal } from '../types';
 import { validateOrLog, SkillSchema } from '../lib/validators';
 import { z } from 'zod';
 
@@ -2197,6 +2197,276 @@ function easeOutCubic(t: number) {
   return 1 - Math.pow(1 - t, 3);
 }
 
+// ─── GraphAuditPanel ──────────────────────────────────────────────────────────
+
+const PROPOSAL_TYPE_LABELS: Record<string, string> = {
+  merge_skills: 'Merge',
+  delete_skill: 'Delete',
+  rename_skill: 'Rename',
+};
+const PROPOSAL_TYPE_COLORS: Record<string, string> = {
+  merge_skills: '#818cf8',
+  delete_skill: '#f87171',
+  rename_skill: '#f59e0b',
+};
+
+function ProposalRow({
+  proposal,
+  onApprove,
+  onReject,
+  busy,
+}: {
+  proposal: Proposal;
+  onApprove: () => void;
+  onReject: () => void;
+  busy: boolean;
+}) {
+  const color = PROPOSAL_TYPE_COLORS[proposal.type] ?? '#94a3b8';
+  const label = PROPOSAL_TYPE_LABELS[proposal.type] ?? proposal.type;
+
+  // Human-readable description of the action
+  let description = '';
+  if (proposal.type === 'merge_skills') {
+    const from = proposal.payload.merge_name || proposal.payload.merge_id;
+    const to = proposal.payload.keep_name || proposal.payload.keep_id;
+    description = `"${from}" → "${to}"`;
+  } else if (proposal.type === 'delete_skill') {
+    const name = proposal.payload.skill_name || proposal.payload.skill_id;
+    description = `"${name}"`;
+  } else if (proposal.type === 'rename_skill') {
+    const name = proposal.payload.skill_name || proposal.payload.skill_id;
+    description = `"${name}" → "${proposal.payload.new_name}"`;
+  }
+
+  return (
+    <div style={{
+      padding: '10px 14px',
+      borderBottom: '1px solid rgba(255,255,255,0.04)',
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 6,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <span style={{
+          fontSize: 9, fontWeight: 700, padding: '2px 6px', borderRadius: 4,
+          background: color + '1a', color, border: `1px solid ${color}33`,
+          textTransform: 'uppercase', letterSpacing: '0.06em', flexShrink: 0,
+        }}>
+          {label}
+        </span>
+        <span style={{ fontSize: 10, color: '#94a3b8', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {description}
+        </span>
+      </div>
+      <p style={{ fontSize: 10, color: '#475569', margin: 0, lineHeight: 1.5 }}>
+        {proposal.llmReasoning}
+      </p>
+      <div style={{ display: 'flex', gap: 6 }}>
+        <button
+          onClick={onApprove}
+          disabled={busy}
+          style={{
+            display: 'flex', alignItems: 'center', gap: 4, padding: '3px 10px',
+            borderRadius: 6, border: '1px solid rgba(52,211,153,0.3)',
+            background: busy ? 'rgba(255,255,255,0.04)' : 'rgba(52,211,153,0.12)',
+            color: busy ? '#334155' : '#34d399', fontSize: 10, cursor: busy ? 'default' : 'pointer',
+          }}
+        >
+          {busy ? <Loader2 style={{ width: 10, height: 10 }} className="animate-spin" /> : <CheckCircle style={{ width: 10, height: 10 }} />}
+          Approve
+        </button>
+        <button
+          onClick={onReject}
+          disabled={busy}
+          style={{
+            display: 'flex', alignItems: 'center', gap: 4, padding: '3px 10px',
+            borderRadius: 6, border: '1px solid rgba(248,113,113,0.2)',
+            background: 'none', color: busy ? '#334155' : '#f87171',
+            fontSize: 10, cursor: busy ? 'default' : 'pointer',
+          }}
+        >
+          <XCircle style={{ width: 10, height: 10 }} />
+          Reject
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function GraphAuditPanel({
+  onApprove,
+  onReject,
+  onClose,
+}: {
+  onApprove: (id: string) => void;
+  onReject: (id: string) => void;
+  onClose: () => void;
+}) {
+  const [proposals, setProposals] = useState<Proposal[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [applyingId, setApplyingId] = useState<string | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
+
+  async function fetchProposals() {
+    setLoading(true);
+    try {
+      const p = await invoke<Proposal[]>('get_pending_proposals');
+      setProposals(p);
+    } catch (e) { console.error('get_pending_proposals failed:', e); }
+    finally { setLoading(false); }
+  }
+
+  useEffect(() => { fetchProposals(); }, []);
+
+  async function handleRunAudit() {
+    setRunning(true);
+    setToast('Running graph audit…');
+    try {
+      const count = await invoke<number>('run_graph_audit');
+      setToast(`${count} proposal${count !== 1 ? 's' : ''} generated`);
+      setTimeout(() => setToast(null), 5000);
+      const p = await invoke<Proposal[]>('get_pending_proposals');
+      setProposals(p);
+    } catch (e) {
+      setToast(`Audit failed: ${e}`);
+      setTimeout(() => setToast(null), 6000);
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  async function handleApprove(id: string) {
+    setApplyingId(id);
+    try {
+      await invoke('approve_proposal', { proposalId: id });
+      setProposals(prev => prev.filter(p => p.id !== id));
+      onApprove(id);
+    } catch (e) { console.error('approve_proposal failed:', e); }
+    finally { setApplyingId(null); }
+  }
+
+  async function handleReject(id: string) {
+    setApplyingId(id);
+    try {
+      await invoke('reject_proposal', { proposalId: id });
+      setProposals(prev => prev.filter(p => p.id !== id));
+      onReject(id);
+    } catch (e) { console.error('reject_proposal failed:', e); }
+    finally { setApplyingId(null); }
+  }
+
+  // Group by type
+  const grouped = proposals.reduce<Record<string, Proposal[]>>((acc, p) => {
+    (acc[p.type] ??= []).push(p);
+    return acc;
+  }, {});
+
+  return (
+    <div style={{
+      position: 'absolute', top: 0, right: 0, bottom: 0,
+      width: 380, zIndex: 50,
+      background: 'rgba(2,4,16,0.97)',
+      borderLeft: '1px solid rgba(139,92,246,0.2)',
+      display: 'flex', flexDirection: 'column',
+      backdropFilter: 'blur(16px)',
+    }}>
+      {/* Header */}
+      <div style={{ padding: '14px 16px', borderBottom: '1px solid rgba(255,255,255,0.06)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <ShieldCheck style={{ width: 14, height: 14, color: '#a78bfa' }} />
+          <span style={{ fontSize: 12, fontWeight: 600, color: '#e2e8f0' }}>Graph Audit</span>
+          {proposals.length > 0 && (
+            <span style={{ fontSize: 9, padding: '1px 6px', borderRadius: 10, background: 'rgba(139,92,246,0.15)', color: '#a78bfa', border: '1px solid rgba(139,92,246,0.25)' }}>
+              {proposals.length} pending
+            </span>
+          )}
+        </div>
+        <button onClick={onClose} style={{ background: 'none', border: 'none', color: '#475569', cursor: 'pointer', padding: 2 }}>
+          <X style={{ width: 14, height: 14 }} />
+        </button>
+      </div>
+
+      {/* Run Audit + Clear All */}
+      <div style={{ padding: '10px 14px', borderBottom: '1px solid rgba(255,255,255,0.05)', flexShrink: 0 }}>
+        <div style={{ display: 'flex', gap: 6 }}>
+          <button
+            onClick={handleRunAudit}
+            disabled={running}
+            style={{
+              flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+              padding: '7px 12px', borderRadius: 8,
+              border: '1px solid rgba(139,92,246,0.3)',
+              background: running ? 'rgba(255,255,255,0.04)' : 'rgba(139,92,246,0.14)',
+              color: running ? '#334155' : '#a78bfa',
+              fontSize: 11, fontWeight: 600, cursor: running ? 'default' : 'pointer',
+            }}
+          >
+            {running ? <Loader2 style={{ width: 12, height: 12 }} className="animate-spin" /> : <ShieldCheck style={{ width: 12, height: 12 }} />}
+            {running ? 'Auditing…' : 'Run Audit'}
+          </button>
+          {proposals.length > 0 && (
+            <button
+              onClick={() => {
+                if (window.confirm(`Clear all ${proposals.length} pending proposal${proposals.length !== 1 ? 's' : ''}? This cannot be undone.`)) {
+                  invoke('clear_all_proposals').then(() => setProposals([]));
+                }
+              }}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 5,
+                padding: '7px 10px', borderRadius: 8,
+                border: '1px solid rgba(248,113,113,0.2)',
+                background: 'none', color: '#f87171',
+                fontSize: 11, fontWeight: 600, cursor: 'pointer', flexShrink: 0,
+              }}
+            >
+              <Trash2 style={{ width: 11, height: 11 }} />
+              Clear
+            </button>
+          )}
+        </div>
+        {toast && (
+          <p style={{ fontSize: 10, color: '#a78bfa', textAlign: 'center', marginTop: 6, marginBottom: 0 }}>{toast}</p>
+        )}
+      </div>
+
+      {/* Proposals list */}
+      <div style={{ flex: 1, overflowY: 'auto' }}>
+        {loading ? (
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 32 }}>
+            <Loader2 style={{ width: 18, height: 18, color: '#a78bfa' }} className="animate-spin" />
+          </div>
+        ) : proposals.length === 0 ? (
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: 40, gap: 10 }}>
+            <ShieldCheck style={{ width: 28, height: 28, color: '#1e293b' }} />
+            <p style={{ fontSize: 11, color: '#334155', textAlign: 'center', margin: 0 }}>No pending proposals</p>
+            <p style={{ fontSize: 10, color: '#1e293b', textAlign: 'center', margin: 0 }}>Run an audit to detect issues</p>
+          </div>
+        ) : (
+          <>
+            {Object.entries(grouped).map(([type, typeProposals]) => (
+              <div key={type}>
+                <div style={{ padding: '8px 14px 4px', fontSize: 9, fontWeight: 700, color: '#334155', textTransform: 'uppercase', letterSpacing: '0.08em', borderBottom: '1px solid rgba(255,255,255,0.03)' }}>
+                  {PROPOSAL_TYPE_LABELS[type] ?? type} · {typeProposals.length}
+                </div>
+                {typeProposals.map(p => (
+                  <ProposalRow
+                    key={p.id}
+                    proposal={p}
+                    onApprove={() => handleApprove(p.id)}
+                    onReject={() => handleReject(p.id)}
+                    busy={applyingId === p.id}
+                  />
+                ))}
+              </div>
+            ))}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ─── Main Page ────────────────────────────────────────────────────────────────
 
 export default function SkillsPage() {
@@ -2220,6 +2490,7 @@ export default function SkillsPage() {
   const [learningPathSeason, setLearningPathSeason] = useState<string | null>(null);
   const [syncToast, setSyncToast] = useState<string | null>(null);
   const [showOverflowMenu, setShowOverflowMenu] = useState(false);
+  const [showAuditPanel, setShowAuditPanel] = useState(false);
   const [inferring, setInferring] = useState(false);
   const [classifying, setClassifying] = useState(false);
   const [resetting, setResetting]     = useState(false);
@@ -2860,6 +3131,7 @@ export default function SkillsPage() {
     finally { setExpandingGraph(false); }
   }
 
+
   if (loading) {
     return (
       <div className="h-full flex items-center justify-center" style={{ background: '#01020a' }}>
@@ -3012,6 +3284,17 @@ export default function SkillsPage() {
                               <GitMerge style={{ width: 12, height: 12 }} />Auto-merge Duplicates
                             </button>
                           )}
+
+                          <div style={{ margin: '4px 12px', borderTop: '1px solid rgba(255,255,255,0.06)' }} />
+                          <div style={{ fontSize: 9, fontWeight: 600, color: '#334155', textTransform: 'uppercase', letterSpacing: '0.08em', padding: '4px 12px 6px' }}>Graph Health</div>
+
+                          {/* Graph Audit */}
+                          <button
+                            onClick={() => { setShowOverflowMenu(false); setShowAuditPanel(true); }}
+                            style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 7, padding: '6px 12px', background: 'none', border: 'none', cursor: 'pointer', color: '#94a3b8', fontSize: 11 }}
+                          >
+                            <ShieldCheck style={{ width: 12, height: 12 }} />Graph Audit
+                          </button>
                         </div>
                       </>
                     )}
@@ -3402,6 +3685,15 @@ export default function SkillsPage() {
               const skill = skills.find(s => s.name.toLowerCase() === name.toLowerCase());
               if (skill) setSelectedId(skill.id);
             }}
+          />
+        )}
+
+        {/* Graph Audit panel */}
+        {showAuditPanel && (
+          <GraphAuditPanel
+            onApprove={loadAll}
+            onReject={() => {}}
+            onClose={() => setShowAuditPanel(false)}
           />
         )}
       </div>
