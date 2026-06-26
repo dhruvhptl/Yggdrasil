@@ -15,6 +15,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use uuid::Uuid;
+use chrono;
 
 use tauri::AppHandle;
 use crate::job_commands::do_extract_skills;
@@ -240,6 +241,48 @@ async fn create_job_handler(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct CreateLibraryBody {
+    url: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CreateLibraryResponse {
+    id: String,
+    title: String,
+    #[serde(rename = "type")]
+    resource_type: String,
+    already_existed: bool,
+}
+
+#[derive(Deserialize)]
+struct LibraryQuery {
+    q: Option<String>,
+    limit: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct LibraryEntry {
+    id: String,
+    title: String,
+    url: String,
+    #[serde(rename = "type")]
+    resource_type: String,
+    tags: Vec<String>,
+    user_notes: Option<String>,
+    created_at: String,
+}
+
+#[derive(Deserialize)]
+struct UpdateLibraryBody {
+    note: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct UpdateJobBody {
     status: String,
     #[serde(default)]
@@ -356,6 +399,258 @@ async fn health_handler() -> impl IntoResponse {
     (StatusCode::OK, Json(serde_json::json!({ "status": "ok" })))
 }
 
+fn infer_resource_type(url: &str) -> &'static str {
+    if url.contains("youtube.com") || url.contains("youtu.be") {
+        "video"
+    } else if url.contains("arxiv.org") || url.to_lowercase().ends_with(".pdf") {
+        "paper"
+    } else if url.contains("github.com") {
+        "repo"
+    } else {
+        "webpage"
+    }
+}
+
+fn extract_hostname(url: &str) -> String {
+    url.split("//")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or(url)
+        .trim_start_matches("www.")
+        .to_string()
+}
+
+async fn fetch_page_title(client: &reqwest::Client, url: &str) -> String {
+    use scraper::{Html, Selector};
+    match client
+        .get(url)
+        .header("User-Agent", "Yggdrasil/1.0")
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(html) = resp.text().await {
+                let doc = Html::parse_document(&html);
+                if let Some(el) = Selector::parse("title")
+                    .ok()
+                    .and_then(|s| doc.select(&s).next())
+                {
+                    let t = el.text().collect::<String>().trim().to_string();
+                    if !t.is_empty() {
+                        return t;
+                    }
+                }
+            }
+            extract_hostname(url)
+        }
+        _ => extract_hostname(url),
+    }
+}
+
+async fn create_library_handler(
+    AxState(state): AxState<ExtState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateLibraryBody>,
+) -> impl IntoResponse {
+    if !check_auth(&headers, &state.api_key) {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "Unauthorized" }))).into_response();
+    }
+
+    let url = body.url.trim().to_string();
+    if url.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "url is required" }))).into_response();
+    }
+
+    // Dedup check
+    let existing = sqlx::query("SELECT id, title, type FROM mimir_resources WHERE url = $1 LIMIT 1")
+        .bind(&url)
+        .fetch_optional(&state.pool)
+        .await;
+
+    if let Ok(Some(row)) = existing {
+        let id: String = row.try_get("id").unwrap_or_default();
+        let title: String = row.try_get("title").unwrap_or_default();
+        let resource_type: String = row.try_get::<String, _>("type").unwrap_or_else(|_| "webpage".to_string());
+        return (StatusCode::OK, Json(serde_json::json!({
+            "id": id,
+            "title": title,
+            "type": resource_type,
+            "alreadyExisted": true,
+        }))).into_response();
+    }
+
+    let resource_type = infer_resource_type(&url);
+    let id = Uuid::new_v4().to_string();
+
+    let title = match body.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => t.to_string(),
+        None => fetch_page_title(&state.client, &url).await,
+    };
+
+    let user_notes = body.note.as_deref().map(str::trim).filter(|n| !n.is_empty()).map(|n| n.to_string());
+
+    if let Err(e) = sqlx::query(
+        "INSERT INTO mimir_resources (id, title, url, type, status, user_notes) VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(&id)
+    .bind(&title)
+    .bind(&url)
+    .bind(resource_type)
+    .bind("read")
+    .bind(&user_notes)
+    .execute(&state.pool)
+    .await
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))).into_response();
+    }
+
+    // Fire background pipeline — response returns immediately
+    let pool_bg = state.pool.clone();
+    let client_bg = state.client.clone();
+    let app_bg = state.app.clone();
+    let queue_bg = state.queue.clone();
+    let id_bg = id.clone();
+    let url_bg = url.clone();
+
+    tokio::spawn(async move {
+        use crate::mimir_ingest::{fetch_url_content_pub, store_chunks_and_embeddings};
+        match fetch_url_content_pub(&client_bg, &url_bg, false).await {
+            Ok(fetch_result) if fetch_result.text.len() >= 50 => {
+                match pool_bg.begin().await {
+                    Ok(mut tx) => {
+                        match store_chunks_and_embeddings(&mut tx, &client_bg, &id_bg, &fetch_result.text).await {
+                            Ok(_) => {
+                                if let Err(e) = tx.commit().await {
+                                    eprintln!("[library/ingest] commit failed for {}: {}", id_bg, e);
+                                    return;
+                                }
+                            }
+                            Err(e) => eprintln!("[library/ingest] chunk/embed failed for {}: {}", id_bg, e),
+                        }
+                    }
+                    Err(e) => eprintln!("[library/ingest] begin tx failed for {}: {}", id_bg, e),
+                }
+            }
+            Ok(_) => eprintln!("[library/ingest] text too short, skipping chunks for {}", id_bg),
+            Err(e) => eprintln!("[library/ingest] fetch failed for {}: {}", id_bg, e),
+        }
+        crate::orchestrator::on_resource_ingested_async(&pool_bg, &app_bg, &client_bg, &id_bg, &queue_bg).await;
+    });
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "id": id,
+        "title": title,
+        "type": resource_type,
+        "alreadyExisted": false,
+    }))).into_response()
+}
+
+async fn list_library_handler(
+    AxState(state): AxState<ExtState>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<LibraryQuery>,
+) -> impl IntoResponse {
+    if !check_auth(&headers, &state.api_key) {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "Unauthorized" }))).into_response();
+    }
+
+    let limit = params.limit.unwrap_or(50).min(200);
+
+    let rows = match &params.q {
+        Some(q) if !q.trim().is_empty() => {
+            let pattern = format!("%{}%", q.trim());
+            sqlx::query(
+                "SELECT id, title, url, type, tags, user_notes, created_at \
+                 FROM mimir_resources \
+                 WHERE url IS NOT NULL \
+                   AND (title ILIKE $1 OR url ILIKE $1 OR $2 = ANY(tags)) \
+                 ORDER BY created_at DESC \
+                 LIMIT $3",
+            )
+            .bind(&pattern)
+            .bind(q.trim())
+            .bind(limit)
+            .fetch_all(&state.pool)
+            .await
+        }
+        _ => {
+            sqlx::query(
+                "SELECT id, title, url, type, tags, user_notes, created_at \
+                 FROM mimir_resources \
+                 WHERE url IS NOT NULL \
+                 ORDER BY created_at DESC \
+                 LIMIT $1",
+            )
+            .bind(limit)
+            .fetch_all(&state.pool)
+            .await
+        }
+    };
+
+    let rows = match rows {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))).into_response(),
+    };
+
+    let resources: Vec<LibraryEntry> = rows
+        .iter()
+        .filter_map(|row| {
+            let id: String = row.try_get("id").ok()?;
+            let title: String = row.try_get("title").ok()?;
+            let url: String = row.try_get("url").ok()?;
+            let resource_type: String = row.try_get::<String, _>("type").unwrap_or_else(|_| "webpage".to_string());
+            let tags: Vec<String> = row.try_get::<Vec<String>, _>("tags").unwrap_or_default();
+            let user_notes: Option<String> = row.try_get("user_notes").ok().flatten();
+            let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at").ok()?;
+            Some(LibraryEntry {
+                id,
+                title,
+                url,
+                resource_type,
+                tags,
+                user_notes,
+                created_at: created_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    (StatusCode::OK, Json(serde_json::json!({ "resources": resources }))).into_response()
+}
+
+async fn update_library_handler(
+    AxState(state): AxState<ExtState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateLibraryBody>,
+) -> impl IntoResponse {
+    if !check_auth(&headers, &state.api_key) {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "Unauthorized" }))).into_response();
+    }
+
+    let result = sqlx::query(
+        "UPDATE mimir_resources SET user_notes = $1, updated_at = NOW() WHERE id = $2",
+    )
+    .bind(body.note.as_deref())
+    .bind(&id)
+    .execute(&state.pool)
+    .await;
+
+    match result {
+        Ok(r) if r.rows_affected() == 0 => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "resource not found" })),
+        ).into_response(),
+        Ok(_) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ).into_response(),
+    }
+}
+
 pub async fn start(pool: PgPool, client: reqwest::Client, api_key: String, app: AppHandle, queue: JobQueue) {
     let state = ExtState { pool, client, api_key, app, queue };
 
@@ -377,6 +672,9 @@ pub async fn start(pool: PgPool, client: reqwest::Client, api_key: String, app: 
         .route("/api/jobs/meta", get(meta_handler))
         .route("/api/jobs/:id", patch(update_job_handler))
         .route("/api/health", get(health_handler))
+        .route("/api/library", post(create_library_handler))
+        .route("/api/library", get(list_library_handler))
+        .route("/api/library/:id", patch(update_library_handler))
         .layer(cors)
         .with_state(state);
 
