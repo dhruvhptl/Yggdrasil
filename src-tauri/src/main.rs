@@ -27,6 +27,7 @@ mod read_models;
 mod orchestrator;
 #[allow(dead_code)]
 mod graph_audit;
+mod ext_server;
 
 use database::Database;
 use tauri::Manager;
@@ -67,8 +68,15 @@ fn main() {
                 let pool = database.pool.clone();
                 app_handle.manage(database);
                 let http_client = reqwest::Client::new();
-                let queue = orchestrator::start_worker(pool, app_handle.clone(), http_client.clone());
-                app_handle.manage(http_client);
+                let queue = orchestrator::start_worker(pool.clone(), app_handle.clone(), http_client.clone());
+                app_handle.manage(http_client.clone());
+
+                let ext_key = std::env::var("YGG_EXT_KEY")
+                    .unwrap_or_else(|_| "ygg-local-dev".to_string());
+                let ext_queue = queue.clone();
+                let ext_app = app_handle.clone();
+                tokio::spawn(ext_server::start(pool, http_client, ext_key, ext_app, ext_queue));
+
                 app_handle.manage(queue);
             });
             Ok(())

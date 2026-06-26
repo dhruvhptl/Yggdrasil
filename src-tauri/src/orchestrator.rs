@@ -29,6 +29,7 @@ pub(crate) enum OrchestratorJob {
 
 // ─── JobQueue (managed Tauri state) ──────────────────────────────────────────
 
+#[derive(Clone)]
 pub struct JobQueue {
     sender: mpsc::Sender<OrchestratorJob>,
 }
