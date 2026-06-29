@@ -381,10 +381,17 @@ pub async fn backfill_node_embeddings(
         return Ok(0);
     }
 
-    println!("🔖 backfill_node_embeddings: {} nodes to embed", rows.len());
+    let total = rows.len();
+    println!("🔖 backfill_node_embeddings: {} nodes to embed", total);
     let mut count = 0usize;
+    let mut failed = 0usize;
 
-    for row in &rows {
+    for (i, row) in rows.iter().enumerate() {
+        // 100 ms between calls to stay under OpenRouter rate limits
+        if i > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
         let node_id: String = match row.try_get("id") { Ok(v) => v, Err(_) => continue };
         let title: String = row.try_get("title").unwrap_or_default();
         if title.is_empty() { continue; }
@@ -401,11 +408,14 @@ pub async fn backfill_node_embeddings(
                 .await;
                 count += 1;
             }
-            Err(e) => println!("⚠️  backfill_node_embeddings: embed failed for {}: {}", node_id, e),
+            Err(e) => {
+                failed += 1;
+                println!("⚠️  backfill_node_embeddings: embed failed for {}: {}", node_id, e);
+            }
         }
     }
 
-    println!("✅ backfill_node_embeddings: embedded {} nodes", count);
+    println!("✅ backfill_node_embeddings: {}/{} embedded, {} failed", count, total, failed);
     Ok(count)
 }
 

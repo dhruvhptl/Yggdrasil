@@ -189,6 +189,7 @@ pub(crate) async fn extract_concept_graph(
         &user_prompt,
         4096,
         true,
+        0.7,
     )
     .await
     .map_err(|e| {
@@ -393,6 +394,7 @@ pub(crate) async fn build_repo_profile(
         &user_prompt,
         2048,
         true,
+        0.7,
     )
     .await
     .map_err(|e| {
@@ -494,6 +496,7 @@ pub(crate) async fn build_prd_profile(
         &user_prompt,
         1024,
         true,
+        0.7,
     )
     .await
     .map_err(|e| {
@@ -1127,6 +1130,7 @@ async fn expand_skill_checkpoints(
         &user_prompt,
         expansion_tokens,
         json_mode,
+        0.7,
     )
     .await
     .map_err(|e| {
@@ -1184,6 +1188,7 @@ pub(crate) async fn generate_tree_two_stage(
         outline_user_prompt,
         3000,
         json_mode,
+        0.7,
     )
     .await
     .map_err(|e| {

@@ -318,6 +318,10 @@ pub async fn on_tree_generated(
         println!("⚠️  [orch] sync_concept_slugs_inner failed: {}", e);
     }
 
+    if let Err(e) = crate::skill_commands::backfill_concept_slugs_by_embedding_inner(pool).await {
+        println!("⚠️  [orch] backfill_concept_slugs_by_embedding_inner failed: {}", e);
+    }
+
     let _ = app.emit("ygg-tree-generated", serde_json::json!({
         "treeId": tree_id,
         "projectId": project_id,
@@ -914,12 +918,14 @@ async fn extract_skills_from_resource_inner(
         skill_id: String,
         name: String,
         slug: String,
+        avg_dist: f64,
     }
     let candidates: Vec<SkillCandidate> = ann_rows.iter().filter_map(|r| {
         Some(SkillCandidate {
             skill_id: r.try_get("skill_id").ok()?,
             name: r.try_get("name").ok()?,
             slug: r.try_get("concept_slug").ok()?,
+            avg_dist: r.try_get("avg_dist").unwrap_or(1.0),
         })
     }).collect();
 
@@ -965,7 +971,7 @@ async fn extract_skills_from_resource_inner(
     let (content, latency_ms) = crate::llm_client::call_llm(
         client, base_url, &api_key, model,
         system_prompt, &user_prompt,
-        500, false,
+        1000, false, 0.0,
     ).await.unwrap_or_else(|e| {
         println!("⚠️  [skill-extract] LLM call failed: {}", e);
         (String::new(), t_start.elapsed().as_millis() as i64)
@@ -1016,7 +1022,7 @@ async fn extract_skills_from_resource_inner(
         let res = sqlx::query(
             "INSERT INTO mimir_skill_links \
                (id, skill_id, resource_id, relevance_score, source, confidence) \
-             VALUES ($1, $2, $3, 0.0, 'llm_extraction', 0.9) \
+             VALUES ($1, $2, $3, $4, 'llm_extraction', 0.9) \
              ON CONFLICT (skill_id, resource_id) \
                WHERE matched_section_title IS NULL \
              DO UPDATE SET \
@@ -1025,11 +1031,15 @@ async fn extract_skills_from_resource_inner(
                              ELSE 'llm_extraction' END, \
                confidence = CASE WHEN mimir_skill_links.source = 'manual' \
                                  THEN mimir_skill_links.confidence \
-                                 ELSE 0.9 END"
+                                 ELSE 0.9 END, \
+               relevance_score = CASE WHEN mimir_skill_links.source = 'manual' \
+                                      THEN mimir_skill_links.relevance_score \
+                                      ELSE EXCLUDED.relevance_score END"
         )
         .bind(&row_id)
         .bind(&skill.skill_id)
         .bind(resource_id)
+        .bind(skill.avg_dist as f32)
         .execute(pool)
         .await;
 
@@ -1375,24 +1385,73 @@ async fn run_match_resource_to_nodes(pool: &PgPool, app: &AppHandle, client: &re
         (t, None)
     };
 
-    // Get resource embedding from its first chunk
+    // Get resource embedding: section-diverse sample of up to 5 chunks, averaged + L2-normalized.
     let embed_result: Result<Vec<f32>, String> = async {
-        let chunk_row = sqlx::query(
-            "SELECT mc.content FROM mimir_chunks mc WHERE mc.resource_id = $1 LIMIT 1"
+        // Prefer one chunk per distinct section; fall back to first 5 by index.
+        let sectioned = sqlx::query(
+            "SELECT DISTINCT ON (mc.section_title) mc.content \
+             FROM mimir_chunks mc \
+             WHERE mc.resource_id = $1 AND mc.section_title IS NOT NULL \
+             ORDER BY mc.section_title, mc.chunk_index ASC \
+             LIMIT 5"
         )
         .bind(resource_id)
-        .fetch_optional(pool)
+        .fetch_all(pool)
         .await
         .map_err(|e| e.to_string())?;
 
-        let content = match chunk_row {
-            Some(r) => r.try_get::<String, _>("content").unwrap_or_default(),
-            None => return Err("no chunks".to_string()),
+        let chunk_rows = if sectioned.is_empty() {
+            sqlx::query(
+                "SELECT mc.content FROM mimir_chunks mc \
+                 WHERE mc.resource_id = $1 \
+                 ORDER BY mc.chunk_index ASC \
+                 LIMIT 5"
+            )
+            .bind(resource_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?
+        } else {
+            sectioned
         };
-        if content.is_empty() {
-            return Err("empty content".to_string());
+
+        if chunk_rows.is_empty() {
+            return Err("no chunks".to_string());
         }
-        crate::mimir_ingest::get_embedding(client, &content).await
+
+        // Embed each chunk individually, collect successes.
+        let mut embeddings: Vec<Vec<f32>> = Vec::new();
+        for row in &chunk_rows {
+            let content: String = row.try_get("content").unwrap_or_default();
+            if content.is_empty() { continue; }
+            match crate::mimir_ingest::get_embedding(client, &content).await {
+                Ok(e) => embeddings.push(e),
+                Err(e) => println!("⚠️  [job/match-resource] chunk embed failed: {}", e),
+            }
+        }
+
+        if embeddings.is_empty() {
+            return Err("all chunk embeds failed".to_string());
+        }
+
+        let dims = embeddings[0].len();
+        let n = embeddings.len() as f32;
+
+        // Element-wise average.
+        let mut avg = vec![0.0f32; dims];
+        for emb in &embeddings {
+            for (a, v) in avg.iter_mut().zip(emb.iter()) {
+                *a += v / n;
+            }
+        }
+
+        // L2-normalize.
+        let mag = avg.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if mag > 0.0 {
+            for v in avg.iter_mut() { *v /= mag; }
+        }
+
+        Ok(avg)
     }.await;
 
     let embedding = match embed_result {

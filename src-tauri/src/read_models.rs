@@ -1328,7 +1328,7 @@ pub async fn get_growth_recommendations(
             (job_frequency * 0.4)
                 + (is_required_ratio as f32 * 0.2)
                 + (1.0 / (prereq_distance + 1) as f32 * 0.3)
-                + (if has_resources { 0.1 } else { 0.0 })
+                + (if has_resources { 0.2 } else { 0.0 })
         } else {
             job_frequency
         };
@@ -1628,7 +1628,7 @@ pub async fn compute_learning_path(
         let score = (c.weighted_demand / max_demand * 0.5)
             + (1.0 / path_cost * 0.3)
             + (prereq_ratio * 0.1)
-            + (if c.has_resources { 0.1 } else { 0.0 });
+            + (if c.has_resources { 0.2 } else { 0.0 });
         ScoredCandidate { inner: c, score, prereqs_seeded }
     }).collect();
 

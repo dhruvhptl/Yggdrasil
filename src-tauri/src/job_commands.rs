@@ -101,7 +101,7 @@ fn row_to_job(r: &sqlx::postgres::PgRow) -> Result<JobApplication, String> {
 
 // Internal: call Groq and parse skill extraction response.
 // Returns (required_skills, nicetohave_skills).
-async fn do_extract_skills(
+pub(crate) async fn do_extract_skills(
     client: &reqwest::Client,
     job_id: &str,
     jd_text: &str,

@@ -378,15 +378,16 @@ pub(crate) async fn call_llm(
     user_prompt: &str,
     max_tokens: u32,
     json_mode: bool,
+    temperature: f64,
 ) -> Result<(String, i64), String> {
-    println!("📡 call_llm: model={} max_tokens={} json_mode={} url={}", model, max_tokens, json_mode, base_url);
+    println!("📡 call_llm: model={} max_tokens={} json_mode={} temp={} url={}", model, max_tokens, json_mode, temperature, base_url);
     let mut request_body = json!({
         "model": model,
         "messages": [
             { "role": "system", "content": system_prompt },
             { "role": "user",   "content": user_prompt }
         ],
-        "temperature": 0.7,
+        "temperature": temperature,
         "max_tokens": max_tokens,
     });
     if json_mode {

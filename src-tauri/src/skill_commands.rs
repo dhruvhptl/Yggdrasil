@@ -600,6 +600,7 @@ pub async fn sync_all_skills(
     let r4 = sync_jobs_inner(&database.pool).await?;
 
     sync_concept_slugs_inner(&database.pool).await?;
+    backfill_concept_slugs_by_embedding_inner(&database.pool).await?;
     recalculate_levels_inner(&database.pool).await?;
     expand_seed_neighbors(&database.pool).await?;
 
@@ -624,7 +625,16 @@ pub async fn sync_skills_from_jobs(
 pub async fn backfill_concept_slugs(
     database: State<'_, Database>,
 ) -> Result<usize, String> {
-    sync_concept_slugs_inner(&database.pool).await
+    let string_matched = sync_concept_slugs_inner(&database.pool).await?;
+    let emb_matched = backfill_concept_slugs_by_embedding_inner(&database.pool).await?;
+    Ok(string_matched + emb_matched)
+}
+
+#[tauri::command]
+pub async fn backfill_concept_slugs_by_embedding(
+    database: State<'_, Database>,
+) -> Result<usize, String> {
+    backfill_concept_slugs_by_embedding_inner(&database.pool).await
 }
 
 #[tauri::command]
@@ -2733,4 +2743,46 @@ pub async fn sync_concept_slugs_inner(pool: &PgPool) -> Result<usize, String> {
 
     println!("[graph] concept_slug backfill: {}/{} skills matched", updated, total);
     Ok(updated)
+}
+
+/// ANN-based fallback: for leaf nodes where concept_slug IS NULL but title_embedding exists,
+/// find the nearest universal_skill by embedding distance and copy its concept_slug onto the node.
+/// Only writes when the best distance is < 0.35. Uses a single LATERAL join query (no N+1).
+pub async fn backfill_concept_slugs_by_embedding_inner(pool: &PgPool) -> Result<usize, String> {
+    let result = sqlx::query(
+        "UPDATE tree_nodes tn
+         SET concept_slug = matched.concept_slug
+         FROM (
+             SELECT DISTINCT ON (tn2.id)
+                 tn2.id AS node_id,
+                 us.concept_slug
+             FROM tree_nodes tn2
+             CROSS JOIN LATERAL (
+                 SELECT concept_slug
+                 FROM universal_skills
+                 WHERE embedding IS NOT NULL
+                   AND concept_slug IS NOT NULL
+                 ORDER BY embedding <=> tn2.title_embedding
+                 LIMIT 1
+             ) us
+             WHERE tn2.type = 'leaf'
+               AND tn2.concept_slug IS NULL
+               AND tn2.title_embedding IS NOT NULL
+               AND (
+                   SELECT embedding <=> tn2.title_embedding
+                   FROM universal_skills
+                   WHERE embedding IS NOT NULL
+                   ORDER BY embedding <=> tn2.title_embedding
+                   LIMIT 1
+               ) < 0.65
+         ) matched
+         WHERE tn.id = matched.node_id"
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("backfill_concept_slugs_by_embedding failed: {}", e))?;
+
+    let matched = result.rows_affected() as usize;
+    println!("[graph] concept_slug ANN backfill: {} nodes matched", matched);
+    Ok(matched)
 }

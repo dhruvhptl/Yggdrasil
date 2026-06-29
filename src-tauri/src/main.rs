@@ -184,6 +184,7 @@ fn main() {
             skill_commands::reset_skill_domains,
             skill_commands::expand_skill_graph,
             skill_commands::backfill_concept_slugs,
+            skill_commands::backfill_concept_slugs_by_embedding,
             read_models::get_active_tree_for_project,
             read_models::get_node_chat_context,
             read_models::get_project_tree_summary,

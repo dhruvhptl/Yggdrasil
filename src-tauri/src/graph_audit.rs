@@ -131,7 +131,7 @@ pub async fn run_graph_audit(
     let (content, latency_ms) = crate::llm_client::call_llm(
         client, base_url, &api_key, model,
         system_prompt, &user_prompt,
-        2000, false,
+        2000, false, 0.7,
     ).await.unwrap_or_else(|e| {
         println!("⚠️  [audit] LLM call failed: {}", e);
         (String::new(), t_start.elapsed().as_millis() as i64)
@@ -407,12 +407,14 @@ pub async fn clear_all_proposals(
 // ─── apply_merge (internal) ───────────────────────────────────────────────────
 
 async fn apply_merge(pool: &PgPool, keep_id: &str, merge_id: &str) -> Result<(), String> {
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+
     // Look up concept_slug for the merge target before deleting it
     let merge_slug: Option<String> = sqlx::query(
         "SELECT concept_slug FROM universal_skills WHERE id = $1"
     )
     .bind(merge_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| e.to_string())?
     .and_then(|r| r.try_get("concept_slug").ok());
@@ -421,7 +423,7 @@ async fn apply_merge(pool: &PgPool, keep_id: &str, merge_id: &str) -> Result<(),
         "SELECT concept_slug FROM universal_skills WHERE id = $1"
     )
     .bind(keep_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| e.to_string())?
     .and_then(|r| r.try_get("concept_slug").ok());
@@ -435,7 +437,7 @@ async fn apply_merge(pool: &PgPool, keep_id: &str, merge_id: &str) -> Result<(),
     )
     .bind(merge_id)
     .bind(keep_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -444,7 +446,7 @@ async fn apply_merge(pool: &PgPool, keep_id: &str, merge_id: &str) -> Result<(),
     )
     .bind(keep_id)
     .bind(merge_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -457,7 +459,7 @@ async fn apply_merge(pool: &PgPool, keep_id: &str, merge_id: &str) -> Result<(),
     )
     .bind(keep_id)
     .bind(merge_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -465,7 +467,7 @@ async fn apply_merge(pool: &PgPool, keep_id: &str, merge_id: &str) -> Result<(),
         "DELETE FROM skill_dependencies WHERE source_skill_id = $1"
     )
     .bind(merge_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -477,7 +479,7 @@ async fn apply_merge(pool: &PgPool, keep_id: &str, merge_id: &str) -> Result<(),
     )
     .bind(keep_id)
     .bind(merge_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -485,7 +487,7 @@ async fn apply_merge(pool: &PgPool, keep_id: &str, merge_id: &str) -> Result<(),
         "DELETE FROM skill_dependencies WHERE target_skill_id = $1"
     )
     .bind(merge_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -493,7 +495,7 @@ async fn apply_merge(pool: &PgPool, keep_id: &str, merge_id: &str) -> Result<(),
     sqlx::query(
         "DELETE FROM skill_dependencies WHERE source_skill_id = target_skill_id"
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -504,7 +506,7 @@ async fn apply_merge(pool: &PgPool, keep_id: &str, merge_id: &str) -> Result<(),
         )
         .bind(ks)
         .bind(ms)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
     }
@@ -512,10 +514,11 @@ async fn apply_merge(pool: &PgPool, keep_id: &str, merge_id: &str) -> Result<(),
     // Delete the merged skill (FK cascades handle skill_evidence, skill_aliases etc.)
     sqlx::query("DELETE FROM universal_skills WHERE id = $1")
         .bind(merge_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
 
+    tx.commit().await.map_err(|e| e.to_string())?;
     println!("🔀 [audit/approve] merged {} → {}", merge_id, keep_id);
     Ok(())
 }
