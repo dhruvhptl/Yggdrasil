@@ -29,6 +29,7 @@ mod orchestrator;
 mod graph_audit;
 mod ext_server;
 mod concept_graph;
+mod hound_client;
 mod mimir_memory;
 mod mimir_agent;
 
