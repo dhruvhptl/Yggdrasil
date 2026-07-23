@@ -6,6 +6,7 @@
 // Default: Groq LLaMA 3.3-70b. Swap via MIMIR_AGENT_{MODEL,BASE_URL,API_KEY}.
 
 use serde_json::json;
+use sqlx::Row;
 
 // ─── Provider config ─────────────────────────────────────────────────────────
 
@@ -185,6 +186,184 @@ pub(crate) async fn call_agent_llm(
     parse_agent_response(&parsed)
 }
 
+// ─── Tool execution ──────────────────────────────────────────────────────────
+
+pub(crate) struct ToolCtx<'a> {
+    pub pool: &'a sqlx::PgPool,
+    pub client: &'a reqwest::Client,
+    pub groq_api_key: &'a str,
+    pub tree_id: Option<String>,
+    pub node_id: Option<String>,
+    pub node_title: Option<String>,
+    pub node_description: Option<String>,
+    pub message: String,
+}
+
+#[derive(Default)]
+pub(crate) struct AgentTurnState {
+    pub sources: Vec<crate::mimir::MimirChatSource>,
+    pub stats: crate::mimir_retrieval::RetrievalStats,
+    pub tool_calls_made: u32,
+}
+
+/// Drop duplicate sources across multiple search_mimir calls in one turn.
+/// Key: (title, section_title, page_start). First occurrence wins (pre-matched
+/// chunks arrive first with score 1.0).
+pub(crate) fn dedup_sources(
+    sources: Vec<crate::mimir::MimirChatSource>,
+) -> Vec<crate::mimir::MimirChatSource> {
+    let mut seen: std::collections::HashSet<(String, String, i32)> = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(sources.len());
+    for s in sources {
+        let key = (
+            s.title.clone(),
+            s.section_title.clone().unwrap_or_default(),
+            s.page_start.unwrap_or(-1),
+        );
+        if seen.insert(key) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// Execute one tool call. Errors are returned as Err — the loop converts them
+/// into observations so the model can recover.
+pub(crate) async fn execute_tool(
+    name: &str,
+    args: &serde_json::Value,
+    ctx: &ToolCtx<'_>,
+    state: &mut AgentTurnState,
+) -> Result<String, String> {
+    match name {
+        "search_mimir" => {
+            let query = args["query"].as_str().unwrap_or(&ctx.message).to_string();
+            let r = crate::mimir_retrieval::run_retrieval(
+                ctx.pool,
+                ctx.client,
+                ctx.groq_api_key,
+                &query,
+                ctx.node_id.as_deref(),
+                ctx.node_title.as_deref(),
+                ctx.node_description.as_deref(),
+            )
+            .await?;
+            state.stats.merge(&r.stats);
+            state.sources.extend(r.sources);
+            if r.context_blocks.trim().is_empty() {
+                Ok("No relevant passages found in the library for this query. Answer from your own knowledge.".to_string())
+            } else {
+                // Cap the observation so one search can't blow the context window.
+                Ok(r.context_blocks.chars().take(8000).collect())
+            }
+        }
+        "get_facts" => {
+            let mem = crate::mimir_memory::get_memory_context(ctx.pool, ctx.tree_id.as_deref()).await?;
+            let filter = args["fact_key"].as_str();
+            let mut items: Vec<serde_json::Value> = Vec::new();
+            for f in mem.facts.iter().chain(mem.user_facts.iter()) {
+                if let Some(k) = filter {
+                    if f.fact_key != k { continue; }
+                }
+                items.push(json!({
+                    "factKey": f.fact_key,
+                    "value": f.fact_value,
+                    "confidence": f.confidence,
+                    "source": f.source,
+                    "entityId": f.entity_id,
+                }));
+                if items.len() >= 30 { break; }
+            }
+            if items.is_empty() {
+                Ok("No stored facts yet.".to_string())
+            } else {
+                serde_json::to_string(&items).map_err(|e| e.to_string())
+            }
+        }
+        "set_fact" => {
+            let raw_key = args["fact_key"].as_str().unwrap_or("").trim().to_lowercase();
+            let fact_key = raw_key.replace(' ', "_");
+            if fact_key.is_empty() {
+                return Err("set_fact requires a non-empty fact_key".to_string());
+            }
+            let fact_value = if args["fact_value"].is_null() {
+                return Err("set_fact requires fact_value".to_string());
+            } else {
+                args["fact_value"].clone()
+            };
+            let confidence = args["confidence"].as_f64().unwrap_or(0.7);
+            let entity_id = args["entity_id"].as_str();
+            let scope = if ctx.tree_id.is_some() { "tree" } else { "user" };
+            let id = crate::mimir_memory::set_memory_fact(
+                ctx.pool,
+                scope,
+                ctx.tree_id.as_deref(),
+                None,
+                &fact_key,
+                entity_id,
+                fact_value,
+                confidence,
+                "agent_extraction",
+            )
+            .await?;
+            Ok(format!("Saved fact '{}' (id {}).", fact_key, id))
+        }
+        "read_tree" => {
+            let Some(tid) = ctx.tree_id.as_deref() else {
+                return Ok("No learning tree is active in this conversation.".to_string());
+            };
+            let rows = sqlx::query(
+                "SELECT ph.title AS phase, br.title AS skill, lf.title AS checkpoint, \
+                        COALESCE(lf.progress, 0)::int AS progress, COALESCE(lf.is_locked, false) AS is_locked \
+                 FROM tree_nodes ph \
+                 LEFT JOIN tree_nodes br ON br.parent_id = ph.id AND br.tree_id = ph.tree_id AND br.type = 'branch' \
+                 LEFT JOIN tree_nodes lf ON lf.parent_id = br.id AND lf.tree_id = ph.tree_id AND lf.type = 'leaf' \
+                 WHERE ph.tree_id = $1 AND ph.type = 'trunk' \
+                 ORDER BY ph.order_index ASC, br.order_index ASC, lf.order_index ASC"
+            )
+            .bind(tid)
+            .fetch_all(ctx.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+            if rows.is_empty() {
+                return Ok("The tree has no phases yet.".to_string());
+            }
+            let mut out = String::new();
+            let mut last_phase = String::new();
+            let mut last_skill = String::new();
+            for row in &rows {
+                let phase: String = row.try_get("phase").unwrap_or_default();
+                let skill: Option<String> = row.try_get("skill").ok().flatten();
+                let checkpoint: Option<String> = row.try_get("checkpoint").ok().flatten();
+                let progress: i32 = row.try_get("progress").unwrap_or(0);
+                let is_locked: bool = row.try_get("is_locked").unwrap_or(false);
+                if phase != last_phase {
+                    out.push_str(&format!("Phase: {}\n", phase));
+                    last_phase = phase;
+                    last_skill.clear();
+                }
+                if let Some(s) = skill {
+                    if s != last_skill {
+                        out.push_str(&format!("  Skill: {}\n", s));
+                        last_skill = s;
+                    }
+                }
+                if let Some(c) = checkpoint {
+                    let status = if progress >= 100 { "done" } else if is_locked { "locked" } else { "open" };
+                    out.push_str(&format!("    [{}] {} ({}%)\n", status, c, progress));
+                }
+                if out.len() > 6000 {
+                    out.push_str("... (truncated)\n");
+                    break;
+                }
+            }
+            Ok(out)
+        }
+        other => Err(format!("unknown tool '{}'", other)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,5 +441,30 @@ mod tests {
             AgentStep::ToolCalls(calls) => assert_eq!(calls[0].arguments, json!({})),
             _ => panic!("expected ToolCalls"),
         }
+    }
+
+    fn src(title: &str, section: Option<&str>, page: Option<i32>, score: f32) -> crate::mimir::MimirChatSource {
+        crate::mimir::MimirChatSource {
+            title: title.to_string(),
+            url: None,
+            chunk: String::new(),
+            score,
+            section_title: section.map(|s| s.to_string()),
+            page_start: page,
+            page_end: page,
+        }
+    }
+
+    #[test]
+    fn dedup_sources_keeps_first_occurrence() {
+        let sources = vec![
+            src("Paper A", Some("Intro"), Some(1), 1.0),
+            src("Paper A", Some("Intro"), Some(1), 0.6),  // duplicate — dropped
+            src("Paper A", Some("Methods"), Some(4), 0.8), // different section — kept
+            src("Blog B", None, None, 0.7),
+        ];
+        let out = dedup_sources(sources);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].score, 1.0); // first occurrence wins
     }
 }
