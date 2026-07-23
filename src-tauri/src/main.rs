@@ -28,6 +28,7 @@ mod orchestrator;
 #[allow(dead_code)]
 mod graph_audit;
 mod ext_server;
+mod mimir_memory;
 
 use database::Database;
 use tauri::Manager;
@@ -111,6 +112,9 @@ fn main() {
             mimir_manage::link_resource_to_node,
             mimir_ingest::extract_pdf_text,
             mimir_retrieval::mimir_chat,
+            mimir_memory::get_memory_context_cmd,
+            mimir_memory::set_memory_fact_cmd,
+            mimir_memory::delete_memory_fact_cmd,
             mimir_manage::discover_links,
             mimir_manage::fetch_playlist,
             mimir_ingest::rescrape_resource,
