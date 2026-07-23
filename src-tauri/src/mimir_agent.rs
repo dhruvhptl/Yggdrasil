@@ -364,6 +364,103 @@ pub(crate) async fn execute_tool(
     }
 }
 
+// ─── The agent loop ──────────────────────────────────────────────────────────
+
+pub(crate) struct AgentTurnResult {
+    pub answer: String,
+    pub sources: Vec<crate::mimir::MimirChatSource>,
+    pub stats: crate::mimir_retrieval::RetrievalStats,
+    pub tool_calls_made: u32,
+}
+
+const MAX_TOOL_CALLS: u32 = 6;
+const MAX_ITERATIONS: u32 = 8;
+
+/// Think → act → observe loop. Tool errors become observations; hard failures
+/// return Err so the caller can fall back to classic synthesis.
+pub(crate) async fn run_agent_turn(
+    cfg: &AgentModelConfig,
+    ctx: &ToolCtx<'_>,
+    system_prompt: &str,
+    history: &[serde_json::Value],
+    user_message: &str,
+    pool_for_log: sqlx::PgPool,
+) -> Result<AgentTurnResult, String> {
+    let mut messages: Vec<serde_json::Value> =
+        vec![json!({ "role": "system", "content": system_prompt })];
+    messages.extend_from_slice(history);
+    messages.push(json!({ "role": "user", "content": user_message }));
+
+    let tools = tool_schemas();
+    let mut state = AgentTurnState::default();
+    let t0 = std::time::Instant::now();
+
+    for _iteration in 0..MAX_ITERATIONS {
+        let force_answer = state.tool_calls_made >= MAX_TOOL_CALLS;
+        let (step, assistant_msg) =
+            call_agent_llm(ctx.client, cfg, &messages, &tools, force_answer).await?;
+
+        match step {
+            AgentStep::Answer(content) => {
+                if content.trim().is_empty() {
+                    return Err("agent returned an empty answer".to_string());
+                }
+                crate::brain::log_prompt_call(
+                    pool_for_log,
+                    "mimir_agent_turn",
+                    &cfg.model,
+                    "mimir_agent_v1",
+                    t0.elapsed().as_millis() as i64,
+                    true,
+                    None,
+                    Some(json!({ "tool_calls_made": state.tool_calls_made })),
+                );
+                return Ok(AgentTurnResult {
+                    answer: content,
+                    sources: dedup_sources(state.sources),
+                    stats: state.stats,
+                    tool_calls_made: state.tool_calls_made,
+                });
+            }
+            AgentStep::ToolCalls(calls) => {
+                messages.push(assistant_msg);
+                for call in calls {
+                    if state.tool_calls_made >= MAX_TOOL_CALLS {
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "content": "Tool budget exhausted — answer now with what you already have."
+                        }));
+                        continue;
+                    }
+                    state.tool_calls_made += 1;
+                    println!("🛠  [agent] tool call {}/{}: {}", state.tool_calls_made, MAX_TOOL_CALLS, call.name);
+                    let observation = match execute_tool(&call.name, &call.arguments, ctx, &mut state).await {
+                        Ok(o) => o,
+                        Err(e) => format!("Tool error: {}", e),
+                    };
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": observation
+                    }));
+                }
+            }
+        }
+    }
+    crate::brain::log_prompt_call(
+        pool_for_log,
+        "mimir_agent_turn",
+        &cfg.model,
+        "mimir_agent_v1",
+        t0.elapsed().as_millis() as i64,
+        false,
+        Some("max iterations without answer".to_string()),
+        None,
+    );
+    Err("agent loop exceeded max iterations without an answer".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

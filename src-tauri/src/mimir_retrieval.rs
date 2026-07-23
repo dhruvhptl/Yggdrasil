@@ -997,27 +997,50 @@ pub async fn mimir_chat(
         }
     }
 
-    // 1-4. Retrieval pipeline (extracted — see run_retrieval)
-    let retrieval = run_retrieval(
-        &database.pool,
-        &*client,
-        &api_key,
-        &message,
-        node_id.as_deref(),
-        node_title.as_deref(),
-        node_description.as_deref(),
-    )
-    .await?;
-    let sources = retrieval.sources;
-    let context_blocks = retrieval.context_blocks;
-    let prereq_skill_names = retrieval.prereq_skill_names;
-    let prematch_chunks_used = retrieval.stats.prematch_chunks_used;
-    let graph_chunks_used = retrieval.stats.graph_chunks_used;
-    let candidates_before_rerank = retrieval.stats.candidates_before_rerank;
-    let candidates_after_rerank = retrieval.stats.candidates_after_rerank;
-    let rerank_fallback_used = retrieval.stats.rerank_fallback_used;
-    let lexical_candidates_count = retrieval.stats.lexical_candidates;
-    let hybrid_merged_count = retrieval.stats.hybrid_merged;
+    // 7. Load session history (if tree_id + node_id both present) — moved up:
+    // no dependency on retrieval, and the agent path needs history before it runs.
+    let session_id_opt: Option<String> = match (&tree_id, &node_id) {
+        (Some(tid), Some(nid)) => {
+            let new_session_id = uuid::Uuid::new_v4().to_string();
+            let row = sqlx::query(
+                "INSERT INTO mimir_chat_sessions (id, tree_id, node_id) \
+                 VALUES ($1, $2, $3) \
+                 ON CONFLICT (tree_id, node_id) DO UPDATE SET updated_at = NOW() \
+                 RETURNING id"
+            )
+            .bind(&new_session_id)
+            .bind(tid)
+            .bind(nid)
+            .fetch_one(&database.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            Some(row.try_get("id").map_err(|e| e.to_string())?)
+        }
+        _ => None,
+    };
+
+    let mut history_messages: Vec<serde_json::Value> = Vec::new();
+    if let Some(ref sid) = session_id_opt {
+        let hist_rows = sqlx::query(
+            "SELECT role, content FROM mimir_chat_messages \
+             WHERE session_id = $1 \
+             ORDER BY created_at ASC \
+             LIMIT 20"
+        )
+        .bind(sid)
+        .fetch_all(&database.pool)
+        .await
+        .unwrap_or_default();
+
+        for row in &hist_rows {
+            let role: String = row.try_get("role").unwrap_or_default();
+            let content: String = row.try_get("content").unwrap_or_default();
+            history_messages.push(json!({ "role": role, "content": content }));
+        }
+        if !hist_rows.is_empty() {
+            println!("  ↳ loaded {} prior messages for session {}", hist_rows.len(), sid);
+        }
+    }
 
     // 5. Rich tree context block — phase breakdown + progress
     let mut tree_block = String::new();
@@ -1101,119 +1124,164 @@ pub async fn mimir_chat(
         }
     }
 
-    // 6. Build system prompt (extracted — see build_system_prompt)
-    let system_prompt = build_system_prompt(&PromptInputs {
+    // 6a. Agent-path system prompt: classic prompt minus retrieval context,
+    //     plus memory recall seed and tool guidance.
+    let memory_block = match tree_id.as_deref() {
+        Some(tid) => crate::mimir_memory::get_memory_context(&database.pool, Some(tid))
+            .await
+            .map(|ctx| crate::mimir_memory::format_memory_block(&ctx, 12))
+            .unwrap_or_default(),
+        None => String::new(),
+    };
+
+    let mut agent_system_prompt = build_system_prompt(&PromptInputs {
         node_title: node_title.as_deref(),
         node_description: node_description.as_deref(),
         skill_name: skill_name.as_deref(),
         phase_name: phase_name.as_deref(),
-        prereq_skill_names: &prereq_skill_names,
+        prereq_skill_names: &[],
         tree_block: &tree_block,
-        context_blocks: &context_blocks,
+        context_blocks: "",
         project_name: project_name.as_deref(),
         tree_id_present: tree_id.is_some(),
     });
+    agent_system_prompt.push_str(&memory_block);
+    agent_system_prompt.push_str(
+        "\n\nYou have tools: search_mimir (the user's personal library — call it before answering any \
+         substantive knowledge question), get_facts / set_fact (long-term memory about the user — use \
+         set_fact when the user states a durable preference, goal, or background), and read_tree (their \
+         learning tree). Cite sources returned by search_mimir the same way as before."
+    );
 
-    // 7. Load session history (if tree_id + node_id both present)
-    let session_id_opt: Option<String> = match (&tree_id, &node_id) {
-        (Some(tid), Some(nid)) => {
-            let new_session_id = uuid::Uuid::new_v4().to_string();
-            let row = sqlx::query(
-                "INSERT INTO mimir_chat_sessions (id, tree_id, node_id) \
-                 VALUES ($1, $2, $3) \
-                 ON CONFLICT (tree_id, node_id) DO UPDATE SET updated_at = NOW() \
-                 RETURNING id"
-            )
-            .bind(&new_session_id)
-            .bind(tid)
-            .bind(nid)
-            .fetch_one(&database.pool)
-            .await
-            .map_err(|e| e.to_string())?;
-            Some(row.try_get("id").map_err(|e| e.to_string())?)
-        }
-        _ => None,
+    // 6b. Run the agent; fall back to classic one-shot synthesis on any failure.
+    let agent_enabled = std::env::var("MIMIR_AGENT_ENABLED")
+        .map(|v| v != "false")
+        .unwrap_or(true);
+
+    let history_slice: Vec<serde_json::Value> = {
+        let start = history_messages.len().saturating_sub(20);
+        history_messages[start..].to_vec()
     };
 
-    let mut history_messages: Vec<serde_json::Value> = Vec::new();
-    if let Some(ref sid) = session_id_opt {
-        let hist_rows = sqlx::query(
-            "SELECT role, content FROM mimir_chat_messages \
-             WHERE session_id = $1 \
-             ORDER BY created_at ASC \
-             LIMIT 20"
-        )
-        .bind(sid)
-        .fetch_all(&database.pool)
-        .await
-        .unwrap_or_default();
-
-        for row in &hist_rows {
-            let role: String = row.try_get("role").unwrap_or_default();
-            let content: String = row.try_get("content").unwrap_or_default();
-            history_messages.push(json!({ "role": role, "content": content }));
-        }
-        if !hist_rows.is_empty() {
-            println!("  ↳ loaded {} prior messages for session {}", hist_rows.len(), sid);
+    let mut agent_outcome: Option<crate::mimir_agent::AgentTurnResult> = None;
+    if agent_enabled {
+        match crate::mimir_agent::AgentModelConfig::from_env() {
+            Ok(agent_cfg) => {
+                let tool_ctx = crate::mimir_agent::ToolCtx {
+                    pool: &database.pool,
+                    client: &*client,
+                    groq_api_key: &api_key,
+                    tree_id: tree_id.clone(),
+                    node_id: node_id.clone(),
+                    node_title: node_title.clone(),
+                    node_description: node_description.clone(),
+                    message: message.clone(),
+                };
+                match crate::mimir_agent::run_agent_turn(
+                    &agent_cfg,
+                    &tool_ctx,
+                    &agent_system_prompt,
+                    &history_slice,
+                    &message,
+                    database.pool.clone(),
+                )
+                .await
+                {
+                    Ok(r) => agent_outcome = Some(r),
+                    Err(e) => println!("⚠️  [agent] loop failed — falling back to classic synthesis: {}", e),
+                }
+            }
+            Err(e) => println!("⚠️  [agent] config unavailable — classic path: {}", e),
         }
     }
 
-    // Build full messages array: system + history (last 20) + current user turn
-    let mut groq_messages = vec![json!({ "role": "system", "content": system_prompt })];
-    // Take last 20 history messages to stay within token budget
-    let history_start = history_messages.len().saturating_sub(20);
-    groq_messages.extend_from_slice(&history_messages[history_start..]);
-    groq_messages.push(json!({ "role": "user", "content": message }));
+    // 6c. Resolve answer + sources + stats from whichever path ran.
+    let (answer, sources, stats) = match agent_outcome {
+        Some(r) => (r.answer, r.sources, r.stats),
+        None => {
+            // Classic path: eager retrieval → full prompt → one-shot synthesis.
+            let retrieval = run_retrieval(
+                &database.pool,
+                &*client,
+                &api_key,
+                &message,
+                node_id.as_deref(),
+                node_title.as_deref(),
+                node_description.as_deref(),
+            )
+            .await?;
+            let classic_prompt = build_system_prompt(&PromptInputs {
+                node_title: node_title.as_deref(),
+                node_description: node_description.as_deref(),
+                skill_name: skill_name.as_deref(),
+                phase_name: phase_name.as_deref(),
+                prereq_skill_names: &retrieval.prereq_skill_names,
+                tree_block: &tree_block,
+                context_blocks: &retrieval.context_blocks,
+                project_name: project_name.as_deref(),
+                tree_id_present: tree_id.is_some(),
+            });
 
-    // 8. Call Groq for synthesis
-    let chat_t0 = std::time::Instant::now();
-    let groq_resp = client
-        .post(GROQ_API_URL)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&json!({
-            "model": "llama-3.3-70b-versatile",
-            "messages": groq_messages,
-            "temperature": 0.4,
-            "max_tokens": 2048
-        }))
-        .timeout(std::time::Duration::from_secs(60))
-        .send()
-        .await
-        .map_err(|e| {
+            // Build full messages array: system + history (last 20) + current user turn
+            let mut groq_messages = vec![json!({ "role": "system", "content": classic_prompt })];
+            // Take last 20 history messages to stay within token budget
+            let history_start = history_messages.len().saturating_sub(20);
+            groq_messages.extend_from_slice(&history_messages[history_start..]);
+            groq_messages.push(json!({ "role": "user", "content": message }));
+
+            // 8. Call Groq for synthesis
+            let chat_t0 = std::time::Instant::now();
+            let groq_resp = client
+                .post(GROQ_API_URL)
+                .header("Authorization", format!("Bearer {}", api_key))
+                .header("Content-Type", "application/json")
+                .json(&json!({
+                    "model": "llama-3.3-70b-versatile",
+                    "messages": groq_messages,
+                    "temperature": 0.4,
+                    "max_tokens": 2048
+                }))
+                .timeout(std::time::Duration::from_secs(60))
+                .send()
+                .await
+                .map_err(|e| {
+                    crate::brain::log_prompt_call(
+                        database.pool.clone(), "mimir_chat", "llama-3.3-70b-versatile", "mimir_chat_v2",
+                        0, false, Some(e.to_string()),
+                        Some(json!({ "node_id": node_id, "tree_id": tree_id })),
+                    );
+                    format!("Groq API error: {}", e)
+                })?;
+
+            if !groq_resp.status().is_success() {
+                let err_text = groq_resp.text().await.unwrap_or_default();
+                crate::brain::log_prompt_call(
+                    database.pool.clone(), "mimir_chat", "llama-3.3-70b-versatile", "mimir_chat_v2",
+                    chat_t0.elapsed().as_millis() as i64, false, Some(err_text.clone()),
+                    Some(json!({ "node_id": node_id, "tree_id": tree_id })),
+                );
+                return Err(format!("Groq API error: {}", err_text));
+            }
+
+            let groq_data: serde_json::Value = groq_resp.json().await.map_err(|e| e.to_string())?;
+            let answer = groq_data["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or("No response from AI.")
+                .to_string();
+            let chat_latency_ms = chat_t0.elapsed().as_millis() as i64;
             crate::brain::log_prompt_call(
                 database.pool.clone(), "mimir_chat", "llama-3.3-70b-versatile", "mimir_chat_v2",
-                0, false, Some(e.to_string()),
-                Some(json!({ "node_id": node_id, "tree_id": tree_id })),
+                chat_latency_ms, true, None,
+                Some(json!({
+                    "node_id": node_id,
+                    "tree_id": tree_id,
+                    "candidates_used": retrieval.stats.candidates_after_rerank,
+                })),
             );
-            format!("Groq API error: {}", e)
-        })?;
 
-    if !groq_resp.status().is_success() {
-        let err_text = groq_resp.text().await.unwrap_or_default();
-        crate::brain::log_prompt_call(
-            database.pool.clone(), "mimir_chat", "llama-3.3-70b-versatile", "mimir_chat_v2",
-            chat_t0.elapsed().as_millis() as i64, false, Some(err_text.clone()),
-            Some(json!({ "node_id": node_id, "tree_id": tree_id })),
-        );
-        return Err(format!("Groq API error: {}", err_text));
-    }
-
-    let groq_data: serde_json::Value = groq_resp.json().await.map_err(|e| e.to_string())?;
-    let answer = groq_data["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or("No response from AI.")
-        .to_string();
-    let chat_latency_ms = chat_t0.elapsed().as_millis() as i64;
-    crate::brain::log_prompt_call(
-        database.pool.clone(), "mimir_chat", "llama-3.3-70b-versatile", "mimir_chat_v2",
-        chat_latency_ms, true, None,
-        Some(json!({
-            "node_id": node_id,
-            "tree_id": tree_id,
-            "candidates_used": candidates_after_rerank,
-        })),
-    );
+            (answer, retrieval.sources, retrieval.stats)
+        }
+    };
 
     // 9. Persist user + assistant messages
     if let Some(ref sid) = session_id_opt {
@@ -1349,13 +1417,13 @@ pub async fn mimir_chat(
         let log_tree_id = tree_id.clone();
         let log_top_k = cfg.top_k as i32;
         let log_threshold = cfg.threshold;
-        let log_prematch = prematch_chunks_used;
-        let log_before = candidates_before_rerank;
-        let log_after = candidates_after_rerank;
-        let log_fallback = rerank_fallback_used;
-        let log_lexical = lexical_candidates_count;
-        let log_hybrid = hybrid_merged_count;
-        let log_graph = graph_chunks_used;
+        let log_prematch = stats.prematch_chunks_used;
+        let log_before = stats.candidates_before_rerank;
+        let log_after = stats.candidates_after_rerank;
+        let log_fallback = stats.rerank_fallback_used;
+        let log_lexical = stats.lexical_candidates;
+        let log_hybrid = stats.hybrid_merged;
+        let log_graph = stats.graph_chunks_used;
         let log_sources = serde_json::to_value(
             sources.iter().map(|s| json!({
                 "title": s.title,
