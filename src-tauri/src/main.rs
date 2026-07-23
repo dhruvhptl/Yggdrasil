@@ -29,6 +29,7 @@ mod orchestrator;
 mod graph_audit;
 mod ext_server;
 mod mimir_memory;
+mod mimir_agent;
 
 use database::Database;
 use tauri::Manager;
