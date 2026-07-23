@@ -8,7 +8,7 @@ use crate::constants::GROQ_API_URL;
 use crate::database::Database;
 use crate::mimir::{
     MimirResource, MimirChatSource, MimirChatResponse, StoredChatMessage,
-    RetrievalStats, TopQueriedNode, Suggestion,
+    TopQueriedNode, Suggestion,
 };
 use crate::mimir_ingest::{get_embedding, vector_str};
 
@@ -361,58 +361,63 @@ pub async fn match_node_to_resources(
     match_node_impl(&database.pool, &*client, &node_id).await
 }
 
-// ─── Chat (RAG) ─────────────────────────────────────────────────────────────
+// ─── Extracted retrieval pipeline ────────────────────────────────────────────
+// Pure extraction of mimir_chat's retrieval sections so the agent loop can
+// call retrieval as a tool and the fallback path can rebuild the classic
+// prompt. NO behavior changes vs. the inline versions.
 
-#[tauri::command]
-pub async fn mimir_chat(
-    message: String,
-    page: String,
-    tree_id: Option<String>,
-    node_id: Option<String>,
-    node_title: Option<String>,
-    project_name: Option<String>,
-    tree_name: Option<String>,
-    client: tauri::State<'_, reqwest::Client>,
-    database: State<'_, Database>,
-) -> Result<MimirChatResponse, String> {
-    let api_key = crate::mimir::groq_api_key()?;
-    let _ = page; // available for future per-page behavior
+#[derive(Debug, Default, Clone)]
+pub(crate) struct RetrievalStats {
+    pub prematch_chunks_used: i32,
+    pub graph_chunks_used: i32,
+    pub candidates_before_rerank: i32,
+    pub candidates_after_rerank: i32,
+    pub rerank_fallback_used: bool,
+    pub lexical_candidates: i32,
+    pub hybrid_merged: i32,
+}
+
+impl RetrievalStats {
+    pub(crate) fn merge(&mut self, other: &RetrievalStats) {
+        self.prematch_chunks_used += other.prematch_chunks_used;
+        self.graph_chunks_used += other.graph_chunks_used;
+        self.candidates_before_rerank += other.candidates_before_rerank;
+        self.candidates_after_rerank += other.candidates_after_rerank;
+        self.rerank_fallback_used = self.rerank_fallback_used || other.rerank_fallback_used;
+        self.lexical_candidates += other.lexical_candidates;
+        self.hybrid_merged += other.hybrid_merged;
+    }
+}
+
+pub(crate) struct RetrievalResult {
+    pub sources: Vec<crate::mimir::MimirChatSource>,
+    pub context_blocks: String,
+    pub prereq_skill_names: Vec<String>,
+    pub stats: RetrievalStats,
+}
+
+pub(crate) async fn run_retrieval(
+    pool: &sqlx::PgPool,
+    client: &reqwest::Client,
+    api_key: &str,
+    message: &str,
+    node_id: Option<&str>,
+    node_title: Option<&str>,
+    node_description: Option<&str>,
+) -> Result<RetrievalResult, String> {
     let cfg = RetrievalConfig::from_env();
 
-    // 0. Fetch richer node context (description, skill name, phase name) when node_id is present
-    let mut node_description: Option<String> = None;
-    let mut skill_name: Option<String> = None;
-    let mut phase_name: Option<String> = None;
-    if let Some(ref nid) = node_id {
-        let ctx_row = sqlx::query(
-            "SELECT lf.description, br.title AS skill, ph.title AS phase \
-             FROM tree_nodes lf \
-             LEFT JOIN tree_nodes br ON br.id = lf.parent_id AND br.tree_id = lf.tree_id \
-             LEFT JOIN tree_nodes ph ON ph.id = br.parent_id AND ph.tree_id = lf.tree_id \
-             WHERE lf.id = $1"
-        )
-        .bind(nid)
-        .fetch_optional(&database.pool)
-        .await
-        .unwrap_or(None);
-        if let Some(row) = ctx_row {
-            node_description = row.try_get::<String, _>("description").ok().filter(|s| !s.is_empty());
-            skill_name = row.try_get::<String, _>("skill").ok().filter(|s| !s.is_empty());
-            phase_name = row.try_get::<String, _>("phase").ok().filter(|s| !s.is_empty());
-        }
-    }
-
     // 1. Embed the query (expand with node context)
-    let query_text = match &node_title {
+    let query_text = match node_title {
         Some(nt) if !nt.is_empty() => format!("{} [context: {}]", message, nt),
-        _ => message.clone(),
+        _ => message.to_string(),
     };
-    let embedding = get_embedding(&*client, &query_text).await?;
+    let embedding = get_embedding(client, &query_text).await?;
     let vec_str = vector_str(&embedding);
 
     // 2. Check for any embeddings
     let count_row = sqlx::query("SELECT COUNT(*) AS n FROM mimir_embeddings")
-        .fetch_one(&database.pool)
+        .fetch_one(pool)
         .await
         .map_err(|e| e.to_string())?;
     let emb_count: i64 = count_row.try_get("n").unwrap_or(0);
@@ -426,7 +431,7 @@ pub async fn mimir_chat(
 
     // 3a. Checkpoint pre-matched chunks — always included regardless of cosine threshold
     if cfg.prematch_boost {
-    if let Some(ref nid) = node_id {
+    if let Some(nid) = node_id {
         let pre_rows = sqlx::query(
             "SELECT mc.content, mc.section_title, mc.page_start, mc.page_end, \
                     mr.title, mr.url \
@@ -438,7 +443,7 @@ pub async fn mimir_chat(
              LIMIT 3"
         )
         .bind(nid)
-        .fetch_all(&database.pool)
+        .fetch_all(pool)
         .await
         .unwrap_or_default();
 
@@ -486,7 +491,7 @@ pub async fn mimir_chat(
     } // end prematch_boost
 
     // 3b. Knowledge graph traversal — prerequisite context (best-effort, non-fatal)
-    if let Some(ref nid) = node_id {
+    if let Some(nid) = node_id {
         let graph_result: Result<(), String> = async {
             // Find the universal_skill matched to this node via concept_slug
             let skill_row = sqlx::query(
@@ -497,7 +502,7 @@ pub async fn mimir_chat(
                  LIMIT 1"
             )
             .bind(nid)
-            .fetch_optional(&database.pool)
+            .fetch_optional(pool)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -507,12 +512,12 @@ pub async fn mimir_chat(
                     let name = r.try_get::<String, _>("name").map_err(|e| e.to_string())?;
                     let slug = r.try_get::<String, _>("concept_slug").unwrap_or_default();
                     println!("[graphrag] node={} concept_slug={} skill_match=found (skill={})",
-                        node_title.as_deref().unwrap_or(nid), slug, name);
+                        node_title.unwrap_or(nid), slug, name);
                     (id, name)
                 },
                 None => {
                     println!("[graphrag] node={} concept_slug=none skill_match=not found",
-                        node_title.as_deref().unwrap_or(nid));
+                        node_title.unwrap_or(nid));
                     return Ok(()); // no skill matched to this node
                 },
             };
@@ -527,7 +532,7 @@ pub async fn mimir_chat(
                  LIMIT 5"
             )
             .bind(&skill_id)
-            .fetch_all(&database.pool)
+            .fetch_all(pool)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -560,7 +565,7 @@ pub async fn mimir_chat(
                      LIMIT 1"
                 )
                 .bind(&prereq_id)
-                .fetch_optional(&database.pool)
+                .fetch_optional(pool)
                 .await
                 .map_err(|e| e.to_string())?;
 
@@ -642,7 +647,7 @@ pub async fn mimir_chat(
         .bind(&vec_str)
         .bind(cfg.threshold)
         .bind(cfg.top_k)
-        .fetch_all(&database.pool)
+        .fetch_all(pool)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -669,9 +674,9 @@ pub async fn mimir_chat(
              ORDER BY lexical_score DESC \
              LIMIT $2"
         )
-        .bind(&message)
+        .bind(message)
         .bind(cfg.lexical_top_k)
-        .fetch_all(&database.pool)
+        .fetch_all(pool)
         .await
         .unwrap_or_default(); // lexical failure is non-fatal
 
@@ -708,7 +713,7 @@ pub async fn mimir_chat(
                 .join("\n");
 
             let rerank_t0 = std::time::Instant::now();
-            let mastery_hint = match node_description.as_deref() {
+            let mastery_hint = match node_description {
                 Some(d) if !d.is_empty() => format!("\nIf relevant, also consider relevance to mastery goal: '{}'", d),
                 _ => String::new(),
             };
@@ -780,7 +785,7 @@ pub async fn mimir_chat(
                 }
             };
             crate::brain::log_prompt_call(
-                database.pool.clone(), "mimir_rerank", "llama-3.1-8b-instant", "mimir_rerank_v1",
+                pool.clone(), "mimir_rerank", "llama-3.1-8b-instant", "mimir_rerank_v1",
                 rerank_t0.elapsed().as_millis() as i64, !rerank_fallback_used, None, None,
             );
             ranked_inner
@@ -829,6 +834,190 @@ pub async fn mimir_chat(
             ));
         }
     }
+
+    Ok(RetrievalResult {
+        sources,
+        context_blocks,
+        prereq_skill_names,
+        stats: RetrievalStats {
+            prematch_chunks_used,
+            graph_chunks_used,
+            candidates_before_rerank,
+            candidates_after_rerank,
+            rerank_fallback_used,
+            lexical_candidates: lexical_candidates_count,
+            hybrid_merged: hybrid_merged_count,
+        },
+    })
+}
+
+pub(crate) struct PromptInputs<'a> {
+    pub node_title: Option<&'a str>,
+    pub node_description: Option<&'a str>,
+    pub skill_name: Option<&'a str>,
+    pub phase_name: Option<&'a str>,
+    pub prereq_skill_names: &'a [String],
+    pub tree_block: &'a str,
+    pub context_blocks: &'a str,
+    pub project_name: Option<&'a str>,
+    pub tree_id_present: bool,
+}
+
+pub(crate) fn build_system_prompt(inp: &PromptInputs) -> String {
+    let mut system_prompt = String::from(
+        "You are Mimir, a personal learning tutor embedded in Yggdrasil. \
+         You have deep knowledge across all domains and access to the user's personal resource library.\n\n\
+         Your personality:\n\
+         - Conversational and direct — answer the question first, explain second\n\
+         - Socratic when appropriate — ask a clarifying question if the query is ambiguous\n\
+         - Encouraging but honest — never validate misunderstandings\n\
+         - Concise — no unnecessary preamble, no 'Great question!', no summaries of what you're about to say\n\
+         - Use analogies and examples naturally — don't just define terms\n\n\
+         How to use the provided context:\n\
+         - The context excerpts are from the user's personal library — use them as background knowledge to inform your answer\n\
+         - Never describe, summarize, or reference the excerpts directly — just use their content to answer better\n\
+         - If the excerpts aren't relevant to the question, ignore them entirely and answer from your own knowledge\n\
+         - Only cite sources when they were genuinely useful: append 'Sources: [title · section · page]' at the very end, nothing else\n\
+         - Never say 'based on the provided context' or 'according to chunk [N]'"
+    );
+
+    let node_is_active = inp.node_title.map(|t| !t.is_empty()).unwrap_or(false);
+
+    // Checkpoint tutor block — only when a specific node is active
+    if node_is_active {
+        let nt = inp.node_title.unwrap_or("");
+        let mastery = inp.node_description.unwrap_or(nt);
+        let skill_label = inp.skill_name.unwrap_or("this skill");
+        let phase_label = inp.phase_name.unwrap_or("this phase");
+        let prereq_line = if !inp.prereq_skill_names.is_empty() {
+            format!(
+                "\nPrerequisite concepts the user should already know: {}\n",
+                inp.prereq_skill_names.join(", ")
+            )
+        } else {
+            String::new()
+        };
+
+        // Condensed progress line for node context (tree_block is appended after)
+        let progress_line = if !inp.tree_block.is_empty() {
+            // Extract first line of tree_block which is "\n\nThe user is working on: X\nTree: Y\nOverall progress: Z%"
+            // We'll include the compact version inline in the tutor block
+            let pname = inp.project_name.unwrap_or("their project");
+            let overall_hint: &str = inp.tree_block.lines()
+                .find(|l| l.starts_with("Overall progress:"))
+                .unwrap_or("");
+            if overall_hint.is_empty() {
+                format!("Project: {pname}\n", pname = pname)
+            } else {
+                format!("Project: {pname} — {progress}\n", pname = pname, progress = overall_hint)
+            }
+        } else {
+            String::new()
+        };
+
+        system_prompt = format!(
+            "{progress}You are tutoring the user on this specific checkpoint:\n\
+             Checkpoint: {nt}\n\
+             Mastery goal: {mastery}\n\
+             Part of: {skill_label} → {phase_label}{prereq_line}\n\n\
+             Teach toward this mastery goal. Ask clarifying questions to gauge understanding. \
+             When the user clearly demonstrates they understand the concept, suggest marking the checkpoint as reached.\n\n\
+             {base}",
+            progress = progress_line,
+            nt = nt,
+            mastery = mastery,
+            skill_label = skill_label,
+            phase_label = phase_label,
+            prereq_line = prereq_line,
+            base = system_prompt,
+        );
+    } else if inp.tree_id_present && !inp.tree_block.is_empty() {
+        // Tree-only context: user is on the tree but hasn't selected a checkpoint
+        let pname = inp.project_name.unwrap_or("their project");
+        let tree_intro = format!(
+            "The user is viewing their learning tree for '{pname}' but hasn't selected a specific checkpoint. \
+             Use the tree context below to guide the conversation. \
+             Be specific to their actual tree content — reference phases and progress they can see. \
+             Ask what they need help with, or offer to explain any phase or skill from the tree.\n\n",
+            pname = pname,
+        );
+        system_prompt = format!("{}{}", tree_intro, system_prompt);
+    }
+
+    if !inp.tree_block.is_empty() {
+        system_prompt.push_str(inp.tree_block);
+    }
+
+    if !inp.context_blocks.is_empty() {
+        system_prompt.push_str("\n\nContext:\n");
+        system_prompt.push_str(inp.context_blocks);
+    }
+
+    system_prompt
+}
+
+// ─── Chat (RAG) ─────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn mimir_chat(
+    message: String,
+    page: String,
+    tree_id: Option<String>,
+    node_id: Option<String>,
+    node_title: Option<String>,
+    project_name: Option<String>,
+    tree_name: Option<String>,
+    client: tauri::State<'_, reqwest::Client>,
+    database: State<'_, Database>,
+) -> Result<MimirChatResponse, String> {
+    let api_key = crate::mimir::groq_api_key()?;
+    let _ = page; // available for future per-page behavior
+    let cfg = RetrievalConfig::from_env();
+
+    // 0. Fetch richer node context (description, skill name, phase name) when node_id is present
+    let mut node_description: Option<String> = None;
+    let mut skill_name: Option<String> = None;
+    let mut phase_name: Option<String> = None;
+    if let Some(ref nid) = node_id {
+        let ctx_row = sqlx::query(
+            "SELECT lf.description, br.title AS skill, ph.title AS phase \
+             FROM tree_nodes lf \
+             LEFT JOIN tree_nodes br ON br.id = lf.parent_id AND br.tree_id = lf.tree_id \
+             LEFT JOIN tree_nodes ph ON ph.id = br.parent_id AND ph.tree_id = lf.tree_id \
+             WHERE lf.id = $1"
+        )
+        .bind(nid)
+        .fetch_optional(&database.pool)
+        .await
+        .unwrap_or(None);
+        if let Some(row) = ctx_row {
+            node_description = row.try_get::<String, _>("description").ok().filter(|s| !s.is_empty());
+            skill_name = row.try_get::<String, _>("skill").ok().filter(|s| !s.is_empty());
+            phase_name = row.try_get::<String, _>("phase").ok().filter(|s| !s.is_empty());
+        }
+    }
+
+    // 1-4. Retrieval pipeline (extracted — see run_retrieval)
+    let retrieval = run_retrieval(
+        &database.pool,
+        &*client,
+        &api_key,
+        &message,
+        node_id.as_deref(),
+        node_title.as_deref(),
+        node_description.as_deref(),
+    )
+    .await?;
+    let sources = retrieval.sources;
+    let context_blocks = retrieval.context_blocks;
+    let prereq_skill_names = retrieval.prereq_skill_names;
+    let prematch_chunks_used = retrieval.stats.prematch_chunks_used;
+    let graph_chunks_used = retrieval.stats.graph_chunks_used;
+    let candidates_before_rerank = retrieval.stats.candidates_before_rerank;
+    let candidates_after_rerank = retrieval.stats.candidates_after_rerank;
+    let rerank_fallback_used = retrieval.stats.rerank_fallback_used;
+    let lexical_candidates_count = retrieval.stats.lexical_candidates;
+    let hybrid_merged_count = retrieval.stats.hybrid_merged;
 
     // 5. Rich tree context block — phase breakdown + progress
     let mut tree_block = String::new();
@@ -912,95 +1101,18 @@ pub async fn mimir_chat(
         }
     }
 
-    // 6. Build system prompt
-    let mut system_prompt = String::from(
-        "You are Mimir, a personal learning tutor embedded in Yggdrasil. \
-         You have deep knowledge across all domains and access to the user's personal resource library.\n\n\
-         Your personality:\n\
-         - Conversational and direct — answer the question first, explain second\n\
-         - Socratic when appropriate — ask a clarifying question if the query is ambiguous\n\
-         - Encouraging but honest — never validate misunderstandings\n\
-         - Concise — no unnecessary preamble, no 'Great question!', no summaries of what you're about to say\n\
-         - Use analogies and examples naturally — don't just define terms\n\n\
-         How to use the provided context:\n\
-         - The context excerpts are from the user's personal library — use them as background knowledge to inform your answer\n\
-         - Never describe, summarize, or reference the excerpts directly — just use their content to answer better\n\
-         - If the excerpts aren't relevant to the question, ignore them entirely and answer from your own knowledge\n\
-         - Only cite sources when they were genuinely useful: append 'Sources: [title · section · page]' at the very end, nothing else\n\
-         - Never say 'based on the provided context' or 'according to chunk [N]'"
-    );
-
-    let node_is_active = node_title.as_deref().map(|t| !t.is_empty()).unwrap_or(false);
-
-    // Checkpoint tutor block — only when a specific node is active
-    if node_is_active {
-        let nt = node_title.as_deref().unwrap_or("");
-        let mastery = node_description.as_deref().unwrap_or(nt);
-        let skill_label = skill_name.as_deref().unwrap_or("this skill");
-        let phase_label = phase_name.as_deref().unwrap_or("this phase");
-        let prereq_line = if !prereq_skill_names.is_empty() {
-            format!(
-                "\nPrerequisite concepts the user should already know: {}\n",
-                prereq_skill_names.join(", ")
-            )
-        } else {
-            String::new()
-        };
-
-        // Condensed progress line for node context (tree_block is appended after)
-        let progress_line = if !tree_block.is_empty() {
-            // Extract first line of tree_block which is "\n\nThe user is working on: X\nTree: Y\nOverall progress: Z%"
-            // We'll include the compact version inline in the tutor block
-            let pname = project_name.as_deref().unwrap_or("their project");
-            let overall_hint: &str = tree_block.lines()
-                .find(|l| l.starts_with("Overall progress:"))
-                .unwrap_or("");
-            if overall_hint.is_empty() {
-                format!("Project: {pname}\n", pname = pname)
-            } else {
-                format!("Project: {pname} — {progress}\n", pname = pname, progress = overall_hint)
-            }
-        } else {
-            String::new()
-        };
-
-        system_prompt = format!(
-            "{progress}You are tutoring the user on this specific checkpoint:\n\
-             Checkpoint: {nt}\n\
-             Mastery goal: {mastery}\n\
-             Part of: {skill_label} → {phase_label}{prereq_line}\n\n\
-             Teach toward this mastery goal. Ask clarifying questions to gauge understanding. \
-             When the user clearly demonstrates they understand the concept, suggest marking the checkpoint as reached.\n\n\
-             {base}",
-            progress = progress_line,
-            nt = nt,
-            mastery = mastery,
-            skill_label = skill_label,
-            phase_label = phase_label,
-            prereq_line = prereq_line,
-            base = system_prompt,
-        );
-    } else if tree_id.is_some() && !tree_block.is_empty() {
-        // Tree-only context: user is on the tree but hasn't selected a checkpoint
-        let pname = project_name.as_deref().unwrap_or("their project");
-        let tree_intro = format!(
-            "The user is viewing their learning tree for '{pname}' but hasn't selected a specific checkpoint. \
-             Use the tree context below to guide the conversation. \
-             Be specific to their actual tree content — reference phases and progress they can see. \
-             Ask what they need help with, or offer to explain any phase or skill from the tree.\n\n",
-            pname = pname,
-        );
-        system_prompt = format!("{}{}", tree_intro, system_prompt);
-    }
-
-    if !tree_block.is_empty() {
-        system_prompt.push_str(&tree_block);
-    }
-
-    if !context_blocks.is_empty() {
-        system_prompt.push_str("\n\nContext:\n");
-        system_prompt.push_str(&context_blocks);
-    }
+    // 6. Build system prompt (extracted — see build_system_prompt)
+    let system_prompt = build_system_prompt(&PromptInputs {
+        node_title: node_title.as_deref(),
+        node_description: node_description.as_deref(),
+        skill_name: skill_name.as_deref(),
+        phase_name: phase_name.as_deref(),
+        prereq_skill_names: &prereq_skill_names,
+        tree_block: &tree_block,
+        context_blocks: &context_blocks,
+        project_name: project_name.as_deref(),
+        tree_id_present: tree_id.is_some(),
+    });
 
     // 7. Load session history (if tree_id + node_id both present)
     let session_id_opt: Option<String> = match (&tree_id, &node_id) {
@@ -1401,7 +1513,7 @@ pub async fn rematch_all_nodes(
 #[tauri::command]
 pub async fn get_retrieval_stats(
     database: State<'_, Database>,
-) -> Result<RetrievalStats, String> {
+) -> Result<crate::mimir::RetrievalStats, String> {
     let agg_row = sqlx::query(
         "SELECT \
            COUNT(*) AS total_queries, \
@@ -1441,7 +1553,7 @@ pub async fn get_retrieval_stats(
         })
         .collect();
 
-    Ok(RetrievalStats {
+    Ok(crate::mimir::RetrievalStats {
         total_queries,
         avg_candidates_before_rerank: (avg_before * 100.0).round() / 100.0,
         avg_candidates_after_rerank: (avg_after * 100.0).round() / 100.0,
