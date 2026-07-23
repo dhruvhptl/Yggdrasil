@@ -108,14 +108,15 @@ expression index via `ON CONFLICT (scope, COALESCE(tree_id,''), COALESCE(project
 
 ```sql
 CREATE TABLE IF NOT EXISTS mimir_memory_shortterm (
-    id            TEXT PRIMARY KEY,
-    session_id    TEXT NOT NULL REFERENCES mimir_chat_sessions(id) ON DELETE CASCADE,
-    summary       TEXT NOT NULL,
-    key_topics    TEXT[] NOT NULL DEFAULT '{}',
+    id              TEXT PRIMARY KEY,
+    session_id      TEXT NOT NULL REFERENCES mimir_chat_sessions(id) ON DELETE CASCADE,
+    summary         TEXT NOT NULL,
+    key_topics      TEXT[] NOT NULL DEFAULT '{}',
     covered_through TIMESTAMPTZ,        -- created_at of the last message included (incremental marker)
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(session_id)                  -- one rolling summary row per session
 );
-CREATE INDEX IF NOT EXISTS idx_memory_shortterm_session ON mimir_memory_shortterm(session_id);
 CREATE INDEX IF NOT EXISTS idx_memory_shortterm_topics  ON mimir_memory_shortterm USING GIN(key_topics);
 ```
 
@@ -189,11 +190,13 @@ New `OrchestratorJob` variants in `orchestrator.rs`; logic in `mimir_memory.rs`.
 
 ```rust
 OrchestratorJob::ConsolidateSession { session_id: String }
-OrchestratorJob::ExtractLongtermFacts { session_id: String }
+// note: extraction is chained *inside* this job's handler (consolidate → extract, sequential),
+// not a second enqueued variant — the worker loop holds no sender to re-enqueue with, and the
+// chain is strictly sequential anyway.
 ```
 
 - **Trigger:** after an agent turn is persisted, if the session's message count crossed a ~20
-  multiple, enqueue `ConsolidateSession`. On completion it chains `ExtractLongtermFacts`.
+  multiple, enqueue `ConsolidateSession`. Its handler runs consolidation, then fact extraction.
   No cron — it rides the existing tokio mpsc job queue (cap 64).
 - **`consolidate_session` (incremental):** each session has **one rolling summary row** in
   `mimir_memory_shortterm` (not one row per pass). Read only messages with
