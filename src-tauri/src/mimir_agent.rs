@@ -291,6 +291,12 @@ pub(crate) async fn execute_tool(
             } else {
                 args["fact_value"].clone()
             };
+            let fact_value = match fact_value {
+                serde_json::Value::String(s) if s.chars().count() > 500 => {
+                    serde_json::Value::String(s.chars().take(500).collect())
+                }
+                v => v,
+            };
             let confidence = args["confidence"].as_f64().unwrap_or(0.7);
             let entity_id = args["entity_id"].as_str().filter(|s| !s.is_empty());
             let scope = if ctx.tree_id.is_some() { "tree" } else { "user" };

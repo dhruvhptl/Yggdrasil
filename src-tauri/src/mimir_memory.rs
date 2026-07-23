@@ -109,6 +109,14 @@ pub(crate) async fn set_memory_fact(
     confidence: f64,
     source: &str,
 ) -> Result<String, String> {
+    // Normalize empty strings to None — '' would alias with NULL in the
+    // COALESCE unique index and read back inconsistently.
+    let tree_id = tree_id.filter(|s| !s.is_empty());
+    let project_id = project_id.filter(|s| !s.is_empty());
+    let entity_id = entity_id.filter(|s| !s.is_empty());
+    if scope == "tree" && tree_id.is_none() {
+        return Err("scope 'tree' requires a non-empty tree_id".into());
+    }
     if fact_key.trim().is_empty() {
         return Err("fact_key must not be empty".into());
     }
