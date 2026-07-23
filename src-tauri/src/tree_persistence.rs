@@ -46,6 +46,18 @@ pub(crate) async fn save_tree_to_database(
 
     println!("📦 Created tree: {}", tree_id);
 
+    // Phase 1 dual-write: also persist the concept graph as first-class rows.
+    // Best-effort — the JSONB blob above remains the safety net.
+    if let Some(concepts) = sorted_concepts {
+        if !concepts.is_empty() {
+            if let Err(e) =
+                crate::concept_graph::create_concept_graph_from_concepts(&database.pool, &tree_id, concepts).await
+            {
+                println!("⚠️  [graph] dual-write failed for tree {}: {}", tree_id, e);
+            }
+        }
+    }
+
     let mut node_ids: Vec<(String, Option<String>)> = Vec::new();
     let mut leaf_node_ids: Vec<String> = Vec::new();
     let mut order_counter: i32 = 0;
