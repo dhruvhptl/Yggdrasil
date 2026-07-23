@@ -75,6 +75,8 @@ fn main() {
                 let http_client = reqwest::Client::new();
                 let queue = orchestrator::start_worker(pool.clone(), app_handle.clone(), http_client.clone());
                 app_handle.manage(http_client.clone());
+                let hound_status = hound_client::check_health(&http_client).await;
+                app_handle.manage(hound_status);
 
                 let ext_key = std::env::var("YGG_EXT_KEY")
                     .unwrap_or_else(|_| "ygg-local-dev".to_string());

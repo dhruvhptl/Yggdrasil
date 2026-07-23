@@ -969,6 +969,7 @@ pub async fn mimir_chat(
     tree_name: Option<String>,
     client: tauri::State<'_, reqwest::Client>,
     queue: State<'_, crate::orchestrator::JobQueue>,
+    hound: State<'_, crate::hound_client::HoundStatus>,
     database: State<'_, Database>,
 ) -> Result<MimirChatResponse, String> {
     let api_key = crate::mimir::groq_api_key()?;
@@ -1170,6 +1171,10 @@ pub async fn mimir_chat(
     if agent_enabled {
         match crate::mimir_agent::AgentModelConfig::from_env() {
             Ok(agent_cfg) => {
+                let hound_base_url = match hound.inner() {
+                    crate::hound_client::HoundStatus::Available { base_url } => Some(base_url.clone()),
+                    crate::hound_client::HoundStatus::Unavailable => None,
+                };
                 let tool_ctx = crate::mimir_agent::ToolCtx {
                     pool: &database.pool,
                     client: &*client,
@@ -1179,7 +1184,7 @@ pub async fn mimir_chat(
                     node_title: node_title.clone(),
                     node_description: node_description.clone(),
                     message: message.clone(),
-                    hound_base_url: None,
+                    hound_base_url: hound_base_url.clone(),
                 };
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(120),
