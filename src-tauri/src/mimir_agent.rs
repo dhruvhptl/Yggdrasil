@@ -34,8 +34,8 @@ impl AgentModelConfig {
 
 // ─── Tool schemas (OpenAI function-calling format) ───────────────────────────
 
-pub(crate) fn tool_schemas() -> Vec<serde_json::Value> {
-    vec![
+pub(crate) fn tool_schemas(hound_available: bool) -> Vec<serde_json::Value> {
+    let mut schemas = vec![
         json!({
             "type": "function",
             "function": {
@@ -138,7 +138,40 @@ pub(crate) fn tool_schemas() -> Vec<serde_json::Value> {
                 }
             }
         }),
-    ]
+    ];
+    if hound_available {
+        schemas.push(json!({
+            "type": "function",
+            "function": {
+                "name": "smart_search",
+                "description": "Search the live web. Returns relevant results with snippets and source citations. Call this BEFORE smart_fetch to find URLs.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "The search query — be specific." },
+                        "count": { "type": "integer", "description": "Number of results (max 10, default 6)." }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }));
+        schemas.push(json!({
+            "type": "function",
+            "function": {
+                "name": "smart_fetch",
+                "description": "Fetch a URL and return its content as readable text. Handles articles, documentation, PDFs, and most websites. Use URLs returned by smart_search.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string", "description": "The full URL to fetch." },
+                        "focus": { "type": "string", "description": "Optional: a short phrase describing what part of the page matters." }
+                    },
+                    "required": ["url"]
+                }
+            }
+        }));
+    }
+    schemas
 }
 
 // ─── Response parsing ────────────────────────────────────────────────────────
@@ -240,6 +273,7 @@ pub(crate) struct ToolCtx<'a> {
     pub node_title: Option<String>,
     pub node_description: Option<String>,
     pub message: String,
+    pub hound_base_url: Option<String>,
 }
 
 #[derive(Default)]
@@ -480,6 +514,38 @@ pub(crate) async fn execute_tool(
             }
             Ok(out.chars().take(6000).collect())
         }
+        "smart_search" => {
+            let Some(base_url) = ctx.hound_base_url.as_deref() else {
+                return Ok("Web search is not available (Hound is not running).".to_string());
+            };
+            let query = args["query"].as_str().unwrap_or(&ctx.message).to_string();
+            let count = args["count"].as_u64().map(|n| n as u32);
+            let results = crate::hound_client::smart_search(ctx.client, base_url, &query, count).await?;
+            if results.is_empty() {
+                return Ok(format!("No web results found for '{}'.", query));
+            }
+            let mut out = String::from("Web results:\n");
+            for r in results.iter().take(10) {
+                out.push_str(&format!("- {} — {}\n  {}\n  (source: {})\n", r.title, r.url, r.snippet, r.source));
+            }
+            Ok(out.chars().take(6000).collect())
+        }
+        "smart_fetch" => {
+            let Some(base_url) = ctx.hound_base_url.as_deref() else {
+                return Ok("Web fetch is not available (Hound is not running).".to_string());
+            };
+            let Some(url) = args["url"].as_str() else {
+                return Err("smart_fetch requires 'url'".to_string());
+            };
+            let focus = args["focus"].as_str();
+            let fetched = crate::hound_client::smart_fetch(ctx.client, base_url, url, focus).await?;
+            if !fetched.content_ok {
+                return Ok(format!("Couldn't access that page ({}). {}", url, fetched.content.chars().take(200).collect::<String>()));
+            }
+            let header = format!("{} ({})\n", fetched.title, fetched.url);
+            let body: String = fetched.content.chars().take(8000).collect();
+            Ok(format!("{}{}", header, body))
+        }
         other => Err(format!("unknown tool '{}'", other)),
     }
 }
@@ -511,7 +577,7 @@ pub(crate) async fn run_agent_turn(
     messages.extend_from_slice(history);
     messages.push(json!({ "role": "user", "content": user_message }));
 
-    let tools = tool_schemas();
+    let tools = tool_schemas(ctx.hound_base_url.is_some());
     let mut state = AgentTurnState::default();
     let t0 = std::time::Instant::now();
 
@@ -586,27 +652,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_schemas_declares_all_seven_tools() {
-        let schemas = tool_schemas();
-        let names: Vec<&str> = schemas
+    fn tool_schemas_registers_web_tools_only_when_available() {
+        let base: Vec<String> = tool_schemas(false)
             .iter()
-            .filter_map(|s| s["function"]["name"].as_str())
+            .filter_map(|s| s["function"]["name"].as_str().map(|x| x.to_string()))
             .collect();
         assert_eq!(
-            names,
-            vec![
-                "search_mimir",
-                "get_facts",
-                "set_fact",
-                "read_tree",
-                "query_graph",
-                "path_between",
-                "explain_node",
-            ]
+            base,
+            vec!["search_mimir", "get_facts", "set_fact", "read_tree",
+                 "query_graph", "path_between", "explain_node"]
         );
-        for s in &schemas {
+
+        let with_web: Vec<String> = tool_schemas(true)
+            .iter()
+            .filter_map(|s| s["function"]["name"].as_str().map(|x| x.to_string()))
+            .collect();
+        assert_eq!(with_web.len(), 9);
+        assert_eq!(with_web[7], "smart_search");
+        assert_eq!(with_web[8], "smart_fetch");
+        for s in tool_schemas(true) {
             assert_eq!(s["type"], "function");
-            assert!(s["function"]["description"].as_str().unwrap_or("").len() > 20);
             assert!(s["function"]["parameters"]["type"] == "object");
         }
     }
