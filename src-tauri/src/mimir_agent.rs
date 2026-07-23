@@ -292,7 +292,7 @@ pub(crate) async fn execute_tool(
                 args["fact_value"].clone()
             };
             let confidence = args["confidence"].as_f64().unwrap_or(0.7);
-            let entity_id = args["entity_id"].as_str();
+            let entity_id = args["entity_id"].as_str().filter(|s| !s.is_empty());
             let scope = if ctx.tree_id.is_some() { "tree" } else { "user" };
             let id = crate::mimir_memory::set_memory_fact(
                 ctx.pool,
