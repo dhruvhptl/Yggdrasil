@@ -18,9 +18,6 @@ impl Database {
         sqlx::migrate!("./migrations").run(&pool).await?;
         println!("✅ Connected to Postgres and ran migrations");
 
-        // Phase 1: one-shot backfill of concept graphs from legacy JSONB blobs.
-        let _ = crate::concept_graph::backfill_concept_graphs(&pool).await;
-
         Ok(Database { pool })
     }
 

@@ -137,13 +137,14 @@ pub(crate) async fn create_concept_graph_from_concepts(
     for (concept_id, title, description) in &derived.nodes {
         let node_id = uuid::Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO concept_graph_nodes (id, graph_id, title, description) \
-             VALUES ($1, $2, $3, $4)",
+            "INSERT INTO concept_graph_nodes (id, graph_id, title, description, concept_id) \
+             VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(&node_id)
         .bind(&graph_id)
         .bind(title)
         .bind(description)
+        .bind(concept_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
@@ -155,7 +156,7 @@ pub(crate) async fn create_concept_graph_from_concepts(
             continue;
         };
         let edge_id = uuid::Uuid::new_v4().to_string();
-        let _ = sqlx::query(
+        sqlx::query(
             "INSERT INTO concept_graph_edges \
                (id, graph_id, source_node_id, target_node_id, relationship, confidence) \
              VALUES ($1, $2, $3, $4, $5, $6) \
@@ -168,7 +169,8 @@ pub(crate) async fn create_concept_graph_from_concepts(
         .bind(*rel)
         .bind(*conf)
         .execute(&mut *tx)
-        .await;
+        .await
+        .map_err(|e| e.to_string())?;
     }
 
     tx.commit().await.map_err(|e| e.to_string())?;
@@ -478,7 +480,7 @@ async fn edges_with_nodes(
 
 pub(crate) async fn explain_node(pool: &PgPool, node_id: &str) -> Result<NodeDetail, String> {
     let node_row = sqlx::query(
-        "SELECT n.id, n.title, n.description, g.tree_id \
+        "SELECT n.id, n.title, n.description, n.concept_id, g.tree_id \
          FROM concept_graph_nodes n JOIN concept_graphs g ON g.id = n.graph_id \
          WHERE n.id = $1",
     )
@@ -494,22 +496,25 @@ pub(crate) async fn explain_node(pool: &PgPool, node_id: &str) -> Result<NodeDet
         description: node_row.try_get("description").unwrap_or_default(),
     };
     let tree_id: String = node_row.try_get("tree_id").unwrap_or_default();
+    let concept_id: Option<String> = node_row.try_get("concept_id").ok().flatten();
 
     let prerequisites = edges_with_nodes(pool, node_id, true, &["prerequisite"]).await;
     let dependents = edges_with_nodes(pool, node_id, false, &["prerequisite"]).await;
     let references = edges_with_nodes(pool, node_id, false, &["references", "implements"]).await;
 
-    // Resource bridge: concept title -> tree_nodes in the same tree -> mimir_node_links.
+    // Resource bridge: concept id (fallback title) -> tree_nodes in the same tree -> mimir_node_links.
     let res_rows = sqlx::query(
         "SELECT DISTINCT mr.id AS rid, mr.title AS rtitle, mr.url AS rurl \
          FROM tree_nodes tn \
          JOIN mimir_node_links mnl ON mnl.node_id = tn.id \
          JOIN mimir_resources mr ON mr.id = mnl.resource_id \
-         WHERE tn.tree_id = $1 AND LOWER(tn.title) = LOWER($2) \
+         WHERE tn.tree_id = $1 \
+           AND (($3::text IS NOT NULL AND tn.concept_slug = $3) OR LOWER(tn.title) = LOWER($2)) \
          ORDER BY mr.title LIMIT 10",
     )
     .bind(&tree_id)
     .bind(&node.title)
+    .bind(&concept_id)
     .fetch_all(pool)
     .await
     .unwrap_or_default();
@@ -577,7 +582,10 @@ pub(crate) async fn backfill_concept_graphs(pool: &PgPool) -> usize {
         // The blob is a flat array of Concept. Tolerate malformed/old shapes.
         let concepts: Vec<Concept> = match serde_json::from_value(blob) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(e) => {
+                println!("⚠️  [graph] backfill skip tree {}: blob parse failed: {}", tree_id, e);
+                continue;
+            }
         };
         if concepts.is_empty() {
             continue;

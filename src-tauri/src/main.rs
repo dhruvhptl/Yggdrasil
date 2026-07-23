@@ -69,6 +69,7 @@ fn main() {
                     .await
                     .expect("Failed to initialize database");
                 let pool = database.pool.clone();
+                let backfill_pool = pool.clone();
                 app_handle.manage(database);
                 let http_client = reqwest::Client::new();
                 let queue = orchestrator::start_worker(pool.clone(), app_handle.clone(), http_client.clone());
@@ -81,6 +82,12 @@ fn main() {
                 tokio::spawn(ext_server::start(pool, http_client, ext_key, ext_app, ext_queue));
 
                 app_handle.manage(queue);
+
+                // Phase 1: backfill concept graphs from legacy JSONB blobs off the
+                // startup path (best-effort; never blocks app launch).
+                tokio::spawn(async move {
+                    let _ = crate::concept_graph::backfill_concept_graphs(&backfill_pool).await;
+                });
             });
             Ok(())
         })
