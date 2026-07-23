@@ -175,6 +175,130 @@ pub(crate) async fn create_concept_graph_from_concepts(
     Ok(graph_id)
 }
 
+// ─── query_graph ─────────────────────────────────────────────────────────────
+
+const STOPWORDS: &[&str] = &[
+    "the", "a", "an", "of", "to", "and", "or", "is", "are", "in", "on", "for",
+    "how", "does", "do", "what", "with", "between", "relate",
+];
+
+pub(crate) fn tokenize(query: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in query.split(|c: char| !c.is_alphanumeric()) {
+        let w = raw.to_lowercase();
+        if w.len() < 2 || STOPWORDS.contains(&w.as_str()) {
+            continue;
+        }
+        if !out.contains(&w) {
+            out.push(w);
+        }
+    }
+    out
+}
+
+/// exact title = query → 1.0; any token substring in title → 0.8;
+/// any token substring in description → 0.4; else 0.0.
+pub(crate) fn score_node(title: &str, description: &str, query_lc: &str, tokens: &[String]) -> f64 {
+    let tl = title.to_lowercase();
+    if tl == query_lc {
+        return 1.0;
+    }
+    let dl = description.to_lowercase();
+    let mut best = 0.0f64;
+    for tok in tokens {
+        if tl.contains(tok.as_str()) {
+            best = best.max(0.8);
+        } else if dl.contains(tok.as_str()) {
+            best = best.max(0.4);
+        }
+    }
+    best
+}
+
+pub(crate) async fn graph_id_for_tree(
+    pool: &PgPool,
+    tree_id: &str,
+) -> Result<Option<String>, String> {
+    let row = sqlx::query("SELECT id FROM concept_graphs WHERE tree_id = $1 ORDER BY created_at DESC LIMIT 1")
+        .bind(tree_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(row.and_then(|r| r.try_get::<String, _>("id").ok()))
+}
+
+/// Keyword search over the tree's concept graph. Embedding fallback is dormant
+/// (Phase 1 leaves node embeddings NULL). Empty subgraph when nothing matches.
+pub(crate) async fn query_graph(
+    pool: &PgPool,
+    tree_id: &str,
+    query: &str,
+) -> Result<ConceptSubgraph, String> {
+    let Some(graph_id) = graph_id_for_tree(pool, tree_id).await? else {
+        return Ok(ConceptSubgraph::default());
+    };
+    let tokens = tokenize(query);
+    let query_lc = query.trim().to_lowercase();
+
+    let rows = sqlx::query("SELECT id, title, description FROM concept_graph_nodes WHERE graph_id = $1")
+        .bind(&graph_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut scored: Vec<(f64, ConceptNode)> = Vec::new();
+    for r in &rows {
+        let id: String = r.try_get("id").unwrap_or_default();
+        let title: String = r.try_get("title").unwrap_or_default();
+        let description: String = r.try_get("description").unwrap_or_default();
+        let s = score_node(&title, &description, &query_lc, &tokens);
+        if s >= 0.4 {
+            scored.push((s, ConceptNode { id, title, description }));
+        }
+    }
+    if scored.is_empty() {
+        // Embedding fallback would go here once nodes are embedded (dormant).
+        return Ok(ConceptSubgraph { nodes: vec![], edges: vec![], match_method: "keyword".into() });
+    }
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(30);
+    let nodes: Vec<ConceptNode> = scored.into_iter().map(|(_, n)| n).collect();
+    let node_ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
+
+    let edge_rows = sqlx::query(
+        "SELECT source_node_id, target_node_id, relationship, confidence \
+         FROM concept_graph_edges \
+         WHERE graph_id = $1 AND (source_node_id = ANY($2) OR target_node_id = ANY($2)) \
+         LIMIT 100",
+    )
+    .bind(&graph_id)
+    .bind(&node_ids)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let edges: Vec<ConceptEdge> = edge_rows
+        .iter()
+        .map(|r| ConceptEdge {
+            source_node_id: r.try_get("source_node_id").unwrap_or_default(),
+            target_node_id: r.try_get("target_node_id").unwrap_or_default(),
+            relationship: r.try_get("relationship").unwrap_or_default(),
+            confidence: r.try_get("confidence").unwrap_or_default(),
+        })
+        .collect();
+
+    Ok(ConceptSubgraph { nodes, edges, match_method: "keyword".into() })
+}
+
+#[tauri::command]
+pub async fn query_graph_cmd(
+    tree_id: String,
+    query: String,
+    database: State<'_, Database>,
+) -> Result<ConceptSubgraph, String> {
+    query_graph(&database.pool, &tree_id, &query).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +347,25 @@ mod tests {
     fn derive_graph_empty_input() {
         let g = derive_graph(&[]);
         assert!(g.nodes.is_empty() && g.edges.is_empty());
+    }
+
+    #[test]
+    fn tokenize_lowercases_splits_and_drops_stopwords() {
+        let t = tokenize("How does RRF connect to Hybrid-Search?");
+        assert!(t.contains(&"rrf".to_string()));
+        assert!(t.contains(&"connect".to_string()));
+        assert!(t.contains(&"hybrid".to_string()));
+        assert!(t.contains(&"search".to_string()));
+        assert!(!t.contains(&"how".to_string()));   // stopword
+        assert!(!t.contains(&"to".to_string()));    // stopword
+    }
+
+    #[test]
+    fn score_node_ranks_exact_over_title_over_desc() {
+        let toks = tokenize("sharding");
+        assert_eq!(score_node("Sharding", "irrelevant", "sharding", &toks), 1.0);
+        assert_eq!(score_node("Database Sharding", "irrelevant", "sharding", &toks), 0.8);
+        assert_eq!(score_node("Replication", "uses sharding internally", "sharding", &toks), 0.4);
+        assert_eq!(score_node("Replication", "nothing here", "sharding", &toks), 0.0);
     }
 }

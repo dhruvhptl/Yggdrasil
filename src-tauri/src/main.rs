@@ -118,6 +118,7 @@ fn main() {
             mimir_memory::set_memory_fact_cmd,
             mimir_memory::delete_memory_fact_cmd,
             mimir_memory::consolidate_session_cmd,
+            concept_graph::query_graph_cmd,
             mimir_manage::discover_links,
             mimir_manage::fetch_playlist,
             mimir_ingest::rescrape_resource,
