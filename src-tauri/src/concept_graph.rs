@@ -299,6 +299,247 @@ pub async fn query_graph_cmd(
     query_graph(&database.pool, &tree_id, &query).await
 }
 
+// ─── path_between ────────────────────────────────────────────────────────────
+
+use std::collections::VecDeque;
+
+/// Pure BFS over an adjacency map. Returns the ordered node keys from source to
+/// target inclusive, or empty if unreachable. source == target → [source].
+pub(crate) fn bfs_path(
+    adj: &HashMap<String, Vec<String>>,
+    source: &str,
+    target: &str,
+) -> Vec<String> {
+    if source == target {
+        return vec![source.to_string()];
+    }
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut prev: HashMap<String, String> = HashMap::new();
+    let mut q: VecDeque<String> = VecDeque::new();
+    visited.insert(source.to_string());
+    q.push_back(source.to_string());
+    while let Some(cur) = q.pop_front() {
+        if let Some(neighbors) = adj.get(&cur) {
+            for n in neighbors {
+                if visited.insert(n.clone()) {
+                    prev.insert(n.clone(), cur.clone());
+                    if n == target {
+                        let mut path = vec![target.to_string()];
+                        let mut c = target.to_string();
+                        while let Some(p) = prev.get(&c) {
+                            path.push(p.clone());
+                            c = p.clone();
+                        }
+                        path.reverse();
+                        return path;
+                    }
+                    q.push_back(n.clone());
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+pub(crate) async fn resolve_node_by_title(
+    pool: &PgPool,
+    tree_id: &str,
+    title: &str,
+) -> Result<Option<String>, String> {
+    let Some(graph_id) = graph_id_for_tree(pool, tree_id).await? else {
+        return Ok(None);
+    };
+    // exact (case-insensitive) first, then substring
+    let row = sqlx::query(
+        "SELECT id FROM concept_graph_nodes \
+         WHERE graph_id = $1 AND LOWER(title) = LOWER($2) LIMIT 1",
+    )
+    .bind(&graph_id)
+    .bind(title)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if let Some(r) = row {
+        return Ok(r.try_get::<String, _>("id").ok());
+    }
+    let row2 = sqlx::query(
+        "SELECT id FROM concept_graph_nodes \
+         WHERE graph_id = $1 AND title ILIKE '%' || $2 || '%' LIMIT 1",
+    )
+    .bind(&graph_id)
+    .bind(title)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(row2.and_then(|r| r.try_get::<String, _>("id").ok()))
+}
+
+pub(crate) async fn path_between(
+    pool: &PgPool,
+    tree_id: &str,
+    source_title: &str,
+    target_title: &str,
+) -> Result<Vec<PathNode>, String> {
+    let Some(graph_id) = graph_id_for_tree(pool, tree_id).await? else {
+        return Ok(vec![]);
+    };
+    // node id -> title, and prerequisite adjacency (source -> target)
+    let node_rows = sqlx::query("SELECT id, title FROM concept_graph_nodes WHERE graph_id = $1")
+        .bind(&graph_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut title_of: HashMap<String, String> = HashMap::new();
+    let mut id_of_title: HashMap<String, String> = HashMap::new();
+    for r in &node_rows {
+        let id: String = r.try_get("id").unwrap_or_default();
+        let title: String = r.try_get("title").unwrap_or_default();
+        id_of_title.insert(title.to_lowercase(), id.clone());
+        title_of.insert(id, title);
+    }
+    let (Some(src), Some(tgt)) = (
+        id_of_title.get(&source_title.to_lowercase()).cloned(),
+        id_of_title.get(&target_title.to_lowercase()).cloned(),
+    ) else {
+        return Ok(vec![]);
+    };
+
+    let edge_rows = sqlx::query(
+        "SELECT source_node_id, target_node_id FROM concept_graph_edges \
+         WHERE graph_id = $1 AND relationship = 'prerequisite'",
+    )
+    .bind(&graph_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+    for r in &edge_rows {
+        let s: String = r.try_get("source_node_id").unwrap_or_default();
+        let t: String = r.try_get("target_node_id").unwrap_or_default();
+        adj.entry(s).or_default().push(t);
+    }
+
+    let path_ids = bfs_path(&adj, &src, &tgt);
+    if path_ids.len() > 20 {
+        return Ok(vec![]); // guard; graphs are small so this is defensive
+    }
+    let last = path_ids.len().saturating_sub(1);
+    let out = path_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| PathNode {
+            title: title_of.get(id).cloned().unwrap_or_default(),
+            depth: i as i32,
+            is_source: i == 0,
+            is_target: i == last && !path_ids.is_empty(),
+        })
+        .collect();
+    Ok(out)
+}
+
+// ─── explain_node ────────────────────────────────────────────────────────────
+
+async fn edges_with_nodes(
+    pool: &PgPool,
+    node_id: &str,
+    incoming: bool,
+    rels: &[&str],
+) -> Vec<EdgeWithNode> {
+    // incoming: edges where target = node_id, join the SOURCE node.
+    // outgoing: edges where source = node_id, join the TARGET node.
+    let sql = if incoming {
+        "SELECT e.relationship, e.confidence, n.id AS nid, n.title AS ntitle \
+         FROM concept_graph_edges e JOIN concept_graph_nodes n ON n.id = e.source_node_id \
+         WHERE e.target_node_id = $1 AND e.relationship = ANY($2)"
+    } else {
+        "SELECT e.relationship, e.confidence, n.id AS nid, n.title AS ntitle \
+         FROM concept_graph_edges e JOIN concept_graph_nodes n ON n.id = e.target_node_id \
+         WHERE e.source_node_id = $1 AND e.relationship = ANY($2)"
+    };
+    let rels_vec: Vec<String> = rels.iter().map(|s| s.to_string()).collect();
+    let rows = sqlx::query(sql)
+        .bind(node_id)
+        .bind(&rels_vec)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+    rows.iter()
+        .map(|r| EdgeWithNode {
+            node_id: r.try_get("nid").unwrap_or_default(),
+            title: r.try_get("ntitle").unwrap_or_default(),
+            relationship: r.try_get("relationship").unwrap_or_default(),
+            confidence: r.try_get("confidence").unwrap_or_default(),
+        })
+        .collect()
+}
+
+pub(crate) async fn explain_node(pool: &PgPool, node_id: &str) -> Result<NodeDetail, String> {
+    let node_row = sqlx::query(
+        "SELECT n.id, n.title, n.description, g.tree_id \
+         FROM concept_graph_nodes n JOIN concept_graphs g ON g.id = n.graph_id \
+         WHERE n.id = $1",
+    )
+    .bind(node_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "concept node not found".to_string())?;
+
+    let node = ConceptNode {
+        id: node_row.try_get("id").unwrap_or_default(),
+        title: node_row.try_get("title").unwrap_or_default(),
+        description: node_row.try_get("description").unwrap_or_default(),
+    };
+    let tree_id: String = node_row.try_get("tree_id").unwrap_or_default();
+
+    let prerequisites = edges_with_nodes(pool, node_id, true, &["prerequisite"]).await;
+    let dependents = edges_with_nodes(pool, node_id, false, &["prerequisite"]).await;
+    let references = edges_with_nodes(pool, node_id, false, &["references", "implements"]).await;
+
+    // Resource bridge: concept title -> tree_nodes in the same tree -> mimir_node_links.
+    let res_rows = sqlx::query(
+        "SELECT DISTINCT mr.id AS rid, mr.title AS rtitle, mr.url AS rurl \
+         FROM tree_nodes tn \
+         JOIN mimir_node_links mnl ON mnl.node_id = tn.id \
+         JOIN mimir_resources mr ON mr.id = mnl.resource_id \
+         WHERE tn.tree_id = $1 AND LOWER(tn.title) = LOWER($2) \
+         ORDER BY mr.title LIMIT 10",
+    )
+    .bind(&tree_id)
+    .bind(&node.title)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let resources: Vec<LinkedResource> = res_rows
+        .iter()
+        .map(|r| LinkedResource {
+            resource_id: r.try_get("rid").unwrap_or_default(),
+            title: r.try_get("rtitle").unwrap_or_default(),
+            url: r.try_get("rurl").ok(),
+        })
+        .collect();
+
+    Ok(NodeDetail { node, prerequisites, dependents, references, resources })
+}
+
+#[tauri::command]
+pub async fn path_between_cmd(
+    tree_id: String,
+    source: String,
+    target: String,
+    database: State<'_, Database>,
+) -> Result<Vec<PathNode>, String> {
+    path_between(&database.pool, &tree_id, &source, &target).await
+}
+
+#[tauri::command]
+pub async fn explain_node_cmd(
+    node_id: String,
+    database: State<'_, Database>,
+) -> Result<NodeDetail, String> {
+    explain_node(&database.pool, &node_id).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,5 +608,28 @@ mod tests {
         assert_eq!(score_node("Database Sharding", "irrelevant", "sharding", &toks), 0.8);
         assert_eq!(score_node("Replication", "uses sharding internally", "sharding", &toks), 0.4);
         assert_eq!(score_node("Replication", "nothing here", "sharding", &toks), 0.0);
+    }
+
+    fn adj(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, Vec<String>> {
+        let mut m: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        for (s, t) in pairs {
+            m.entry(s.to_string()).or_default().push(t.to_string());
+        }
+        m
+    }
+
+    #[test]
+    fn bfs_path_finds_shortest_chain() {
+        let a = adj(&[("a", "b"), ("b", "c"), ("a", "d"), ("d", "c")]);
+        assert_eq!(bfs_path(&a, "a", "c").len(), 3); // a -> (b|d) -> c
+        assert_eq!(bfs_path(&a, "a", "c")[0], "a");
+        assert_eq!(bfs_path(&a, "a", "c")[2], "c");
+    }
+
+    #[test]
+    fn bfs_path_no_path_is_empty_and_self_is_singleton() {
+        let a = adj(&[("a", "b")]);
+        assert!(bfs_path(&a, "b", "a").is_empty());
+        assert_eq!(bfs_path(&a, "a", "a"), vec!["a".to_string()]);
     }
 }

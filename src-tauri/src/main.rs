@@ -119,6 +119,8 @@ fn main() {
             mimir_memory::delete_memory_fact_cmd,
             mimir_memory::consolidate_session_cmd,
             concept_graph::query_graph_cmd,
+            concept_graph::path_between_cmd,
+            concept_graph::explain_node_cmd,
             mimir_manage::discover_links,
             mimir_manage::fetch_playlist,
             mimir_ingest::rescrape_resource,
