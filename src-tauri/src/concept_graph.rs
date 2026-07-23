@@ -125,10 +125,11 @@ pub(crate) async fn create_concept_graph_from_concepts(
 
     let derived = derive_graph(concepts);
     let graph_id = uuid::Uuid::new_v4().to_string();
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
     sqlx::query("INSERT INTO concept_graphs (id, tree_id) VALUES ($1, $2)")
         .bind(&graph_id)
         .bind(tree_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -143,7 +144,7 @@ pub(crate) async fn create_concept_graph_from_concepts(
         .bind(&graph_id)
         .bind(title)
         .bind(description)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
         id_map.insert(concept_id.clone(), node_id);
@@ -166,9 +167,11 @@ pub(crate) async fn create_concept_graph_from_concepts(
         .bind(tgt)
         .bind(*rel)
         .bind(*conf)
-        .execute(pool)
+        .execute(&mut *tx)
         .await;
     }
+
+    tx.commit().await.map_err(|e| e.to_string())?;
 
     println!("🕸  [graph] created concept graph {} for tree {} ({} nodes, {} edges)",
         graph_id, tree_id, derived.nodes.len(), derived.edges.len());
