@@ -28,6 +28,7 @@ mod orchestrator;
 #[allow(dead_code)]
 mod graph_audit;
 mod ext_server;
+mod concept_graph;
 mod mimir_memory;
 mod mimir_agent;
 
