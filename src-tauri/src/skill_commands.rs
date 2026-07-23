@@ -491,6 +491,7 @@ pub async fn recalculate_skill_levels(
 
 #[tauri::command]
 pub async fn sync_all_skills(
+    client: State<'_, reqwest::Client>,
     database: State<'_, Database>,
 ) -> Result<Vec<SyncResult>, String> {
     // Clear all evidence for a clean full sync
@@ -600,6 +601,10 @@ pub async fn sync_all_skills(
     let r4 = sync_jobs_inner(&database.pool).await?;
 
     sync_concept_slugs_inner(&database.pool).await?;
+    // Ensure skill embeddings exist before the ANN slug backfill queries them.
+    if let Err(e) = backfill_skill_embeddings(&*client, &database.pool).await {
+        println!("⚠️  backfill_skill_embeddings (pre-slug-backfill) failed: {}", e);
+    }
     backfill_concept_slugs_by_embedding_inner(&database.pool).await?;
     recalculate_levels_inner(&database.pool).await?;
     expand_seed_neighbors(&database.pool).await?;
@@ -2319,18 +2324,20 @@ pub async fn classify_skill_domains(
     // Seed common domain names the LLM tends to return. Idempotent: ON CONFLICT
     // on name skips existing rows. Uses generated UUIDs for new rows; existing
     // seeds (e.g. 'dom-*' slugs from migration 029) are untouched.
-    let seed_names: [&str; 35] = [
+    let seed_names: [&str; 39] = [
         "Machine Learning", "Data Science", "Software Engineering",
-        "Web Development", "DevOps", "Engineering", "Computing",
-        "Mathematics", "Physics", "Business", "Communication",
-        "Databases", "Natural Language Processing", "Deep Learning",
+        "Web Development", "DevOps", "Cloud Computing", "Engineering",
+        "Computing", "Computer Science", "Mathematics", "Physics",
+        "Business", "Communication", "Databases",
+        "Natural Language Processing", "Deep Learning",
         "Computer Vision", "Research Methods", "Science", "Visualization",
         "Cybersecurity", "Materials Science", "Energy",
         "Systems Programming", "High-Performance Computing",
         "Distributed Systems", "Human-Computer Interaction",
         "Robotics", "Simulation", "Hardware", "Embedded Systems",
-        "Quantum Computing", "Design", "GIS", "Bioinformatics",
-        "Control Systems", "Signal Processing",
+        "Electrical Engineering", "Quantum Computing", "Design",
+        "GIS", "Bioinformatics", "Control Systems", "Signal Processing",
+        "Problem Solving",
     ];
     for name in seed_names.iter() {
         let new_id = Uuid::new_v4().to_string();
@@ -2401,13 +2408,14 @@ pub async fn classify_skill_domains(
     let valid_domain_ids: std::collections::HashSet<&str> =
         domains.iter().map(|(id, _, _)| id.as_str()).collect();
 
-    // One line per domain: "  Machine Learning (dom-ml): algorithms that learn from data..."
+    // One line per domain name (no IDs — they confuse the LLM when they are raw UUIDs).
+    // The name→id resolution happens in domain_lookup after the LLM returns.
     let domain_list: String = domains.iter()
-        .map(|(id, name, desc)| {
+        .map(|(_, name, desc)| {
             if desc.is_empty() {
-                format!("  {} (id={})", name, id)
+                format!("  {}", name)
             } else {
-                format!("  {} (id={}): {}", name, id, desc)
+                format!("  {}: {}", name, desc)
             }
         })
         .collect::<Vec<_>>()
@@ -2445,11 +2453,12 @@ pub async fn classify_skill_domains(
 
         let prompt = format!(
             "You are classifying skills into specific learning domains.\n\n\
-             Available domains (id: name — description):\n{domain_list}\n\n\
+             Available domains:\n{domain_list}\n\n\
              Skills to classify (skill_id: skill_name):\n{skill_list}\n\n\
-             Return ONLY a JSON object mapping each skill_id to the single best-fitting domain_id:\n\
-             {{\"<skill_id>\": \"<domain_id>\", ...}}\n\n\
+             Return ONLY a JSON object mapping each skill_id to the exact domain name from the list above:\n\
+             {{\"<skill_id>\": \"<domain name>\", ...}}\n\n\
              Rules:\n\
+             - Use the EXACT domain name as it appears in the list (case-sensitive)\n\
              - Assign the MOST SPECIFIC domain that fits (e.g. prefer 'Machine Learning' over 'Computing' for 'gradient descent')\n\
              - Every skill must appear in the output exactly once\n\
              - Use the most general fitting domain only if no specific domain fits\n\

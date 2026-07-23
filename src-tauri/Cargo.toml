@@ -24,6 +24,8 @@ hex = "0.4"
 scraper = "0.22"
 ego-tree = "0.10"
 pdf-extract = "0.7"
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
 
 # Reduce debuginfo on dev builds to avoid MSVC linker OOM (STATUS_STACK_BUFFER_OVERRUN).
 # Line-tables-only is enough for backtraces and covers 95% of dev debugging needs.

@@ -1421,7 +1421,10 @@ async fn run_match_resource_to_nodes(pool: &PgPool, app: &AppHandle, client: &re
 
         // Embed each chunk individually, collect successes.
         let mut embeddings: Vec<Vec<f32>> = Vec::new();
-        for row in &chunk_rows {
+        for (i, row) in chunk_rows.iter().enumerate() {
+            if i > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
             let content: String = row.try_get("content").unwrap_or_default();
             if content.is_empty() { continue; }
             match crate::mimir_ingest::get_embedding(client, &content).await {

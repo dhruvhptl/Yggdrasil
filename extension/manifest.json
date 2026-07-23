@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Yggdrasil",
+  "version": "0.1.0",
+  "description": "Add job applications to Yggdrasil without opening the desktop app.",
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Add to Yggdrasil"
+  },
+  "permissions": ["storage", "activeTab", "scripting", "alarms"],
+  "host_permissions": ["http://127.0.0.1:1421/*"],
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["dist/content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "background": {
+    "service_worker": "dist/background.js",
+    "type": "module"
+  }
+}
