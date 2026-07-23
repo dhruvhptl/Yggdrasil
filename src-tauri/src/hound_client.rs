@@ -29,7 +29,7 @@ pub(crate) struct SearchResult {
     pub url: String,
     #[serde(default)]
     pub snippet: String,
-    #[serde(default)]
+    #[serde(default, alias = "relevance_score")]
     pub relevance_score: f32,
     #[serde(default)]
     pub source: String,
@@ -42,9 +42,9 @@ pub(crate) struct FetchResult {
     pub title: String,
     #[serde(default)]
     pub content: String,
-    #[serde(default)]
+    #[serde(default, alias = "content_ok")]
     pub content_ok: bool,
-    #[serde(default)]
+    #[serde(default, alias = "page_type")]
     pub page_type: String,
     #[serde(default)]
     pub url: String,
@@ -54,8 +54,9 @@ pub(crate) struct FetchResult {
 
 /// Extract a search-result array from either a bare array or a common envelope
 /// ({results:[...]} or {data:[...]}). Unknown/extra fields are ignored; missing
-/// fields fall back to type defaults. snake_case and camelCase both decode
-/// because serde matches the field name and we alias the snake_case variants.
+/// fields fall back to type defaults. Multi-word fields decode from either camelCase (default) or snake_case
+/// (via #[serde(alias)]) so we tolerate either spelling from the unverified
+/// Hound API. Unknown/extra fields are ignored; missing fields use type defaults.
 pub(crate) fn parse_search_results(body: &serde_json::Value) -> Vec<SearchResult> {
     let arr = if body.is_array() {
         body.clone()
