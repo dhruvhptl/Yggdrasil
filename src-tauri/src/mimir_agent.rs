@@ -95,6 +95,49 @@ pub(crate) fn tool_schemas() -> Vec<serde_json::Value> {
                 "parameters": { "type": "object", "properties": {}, "required": [] }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "query_graph",
+                "description": "Search the concept graph for concepts matching a topic. Returns matching concepts and the edges between them. Use to see how ideas in this project relate.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Topic to search for, e.g. 'sharding', 'RRF', 'authentication'" }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "path_between",
+                "description": "Find the shortest prerequisite path from one concept to another. Returns the ordered chain of concepts to learn from source to target.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "source": { "type": "string", "description": "Starting concept title (more foundational)" },
+                        "target": { "type": "string", "description": "Target concept title (more advanced)" }
+                    },
+                    "required": ["source", "target"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "explain_node",
+                "description": "Get full detail on one concept: its prerequisites, the concepts that depend on it, references, and linked learning resources from the user's library.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string", "description": "Concept title to explain" }
+                    },
+                    "required": ["title"]
+                }
+            }
+        }),
     ]
 }
 
@@ -368,6 +411,75 @@ pub(crate) async fn execute_tool(
             }
             Ok(out)
         }
+        "query_graph" => {
+            let Some(tid) = ctx.tree_id.as_deref() else {
+                return Ok("No learning tree is active — the concept graph is per-tree.".to_string());
+            };
+            let query = args["query"].as_str().unwrap_or(&ctx.message).to_string();
+            let sub = crate::concept_graph::query_graph(ctx.pool, tid, &query).await?;
+            if sub.nodes.is_empty() {
+                return Ok(format!("No concepts in the graph match '{}'.", query));
+            }
+            let mut out = String::from("Concepts:\n");
+            for n in &sub.nodes {
+                out.push_str(&format!("- {}: {}\n", n.title, n.description));
+            }
+            if !sub.edges.is_empty() {
+                // Build id->title for readable edges.
+                let title_of: std::collections::HashMap<&str, &str> =
+                    sub.nodes.iter().map(|n| (n.id.as_str(), n.title.as_str())).collect();
+                out.push_str("Relationships:\n");
+                for e in &sub.edges {
+                    let s = title_of.get(e.source_node_id.as_str()).copied().unwrap_or("?");
+                    let t = title_of.get(e.target_node_id.as_str()).copied().unwrap_or("?");
+                    out.push_str(&format!("- {} --{}--> {}\n", s, e.relationship, t));
+                }
+            }
+            Ok(out.chars().take(6000).collect())
+        }
+        "path_between" => {
+            let Some(tid) = ctx.tree_id.as_deref() else {
+                return Ok("No learning tree is active — the concept graph is per-tree.".to_string());
+            };
+            let source = args["source"].as_str().unwrap_or("").to_string();
+            let target = args["target"].as_str().unwrap_or("").to_string();
+            if source.is_empty() || target.is_empty() {
+                return Err("path_between requires 'source' and 'target'".to_string());
+            }
+            let path = crate::concept_graph::path_between(ctx.pool, tid, &source, &target).await?;
+            if path.is_empty() {
+                return Ok(format!("No prerequisite path found from '{}' to '{}'.", source, target));
+            }
+            let chain: Vec<String> = path.iter().map(|p| p.title.clone()).collect();
+            Ok(format!("Prerequisite path: {}", chain.join(" → ")))
+        }
+        "explain_node" => {
+            let Some(tid) = ctx.tree_id.as_deref() else {
+                return Ok("No learning tree is active — the concept graph is per-tree.".to_string());
+            };
+            let title = args["title"].as_str().unwrap_or("").to_string();
+            if title.is_empty() {
+                return Err("explain_node requires 'title'".to_string());
+            }
+            let Some(node_id) = crate::concept_graph::resolve_node_by_title(ctx.pool, tid, &title).await? else {
+                return Ok(format!("No concept titled '{}' in this tree's graph.", title));
+            };
+            let d = crate::concept_graph::explain_node(ctx.pool, &node_id).await?;
+            let mut out = format!("{}: {}\n", d.node.title, d.node.description);
+            if !d.prerequisites.is_empty() {
+                let names: Vec<String> = d.prerequisites.iter().map(|e| e.title.clone()).collect();
+                out.push_str(&format!("Prerequisites: {}\n", names.join(", ")));
+            }
+            if !d.dependents.is_empty() {
+                let names: Vec<String> = d.dependents.iter().map(|e| e.title.clone()).collect();
+                out.push_str(&format!("Leads to: {}\n", names.join(", ")));
+            }
+            if !d.resources.is_empty() {
+                let names: Vec<String> = d.resources.iter().map(|r| r.title.clone()).collect();
+                out.push_str(&format!("Your resources: {}\n", names.join(", ")));
+            }
+            Ok(out.chars().take(6000).collect())
+        }
         other => Err(format!("unknown tool '{}'", other)),
     }
 }
@@ -474,13 +586,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_schemas_declares_all_four_tools() {
+    fn tool_schemas_declares_all_seven_tools() {
         let schemas = tool_schemas();
         let names: Vec<&str> = schemas
             .iter()
             .filter_map(|s| s["function"]["name"].as_str())
             .collect();
-        assert_eq!(names, vec!["search_mimir", "get_facts", "set_fact", "read_tree"]);
+        assert_eq!(
+            names,
+            vec![
+                "search_mimir",
+                "get_facts",
+                "set_fact",
+                "read_tree",
+                "query_graph",
+                "path_between",
+                "explain_node",
+            ]
+        );
         for s in &schemas {
             assert_eq!(s["type"], "function");
             assert!(s["function"]["description"].as_str().unwrap_or("").len() > 20);
