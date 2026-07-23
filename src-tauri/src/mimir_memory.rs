@@ -272,6 +272,254 @@ pub async fn delete_memory_fact_cmd(
     delete_memory_fact(&database.pool, &fact_id).await
 }
 
+// ─── Tier 2: session consolidation ───────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ConsolidationOut {
+    pub summary: String,
+    #[serde(default)]
+    pub key_topics: Vec<String>,
+}
+
+pub(crate) fn parse_consolidation(raw: &str) -> Result<ConsolidationOut, String> {
+    serde_json::from_str(&crate::llm_client::clean_llm_json(raw))
+        .map_err(|e| format!("consolidation parse failed: {}", e))
+}
+
+fn default_extract_confidence() -> f64 { 0.6 }
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ExtractedFact {
+    pub fact_key: String,
+    pub fact_value: serde_json::Value,
+    #[serde(default = "default_extract_confidence")]
+    pub confidence: f64,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct ExtractedFacts {
+    #[serde(default)]
+    pub facts: Vec<ExtractedFact>,
+}
+
+pub(crate) fn parse_extracted_facts(raw: &str) -> ExtractedFacts {
+    serde_json::from_str(&crate::llm_client::clean_llm_json(raw)).unwrap_or_default()
+}
+
+/// Incrementally update the session's ONE rolling summary row.
+/// Only messages newer than covered_through are read; the previous summary is
+/// passed as context. Returns Ok(false) when there was too little new material.
+pub(crate) async fn consolidate_session(
+    pool: &PgPool,
+    client: &reqwest::Client,
+    session_id: &str,
+) -> Result<bool, String> {
+    let api_key = crate::mimir::groq_api_key()?;
+
+    let existing = sqlx::query(
+        "SELECT summary, key_topics, covered_through::text AS covered \
+         FROM mimir_memory_shortterm WHERE session_id = $1"
+    )
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (prev_summary, prev_topics, covered): (String, Vec<String>, Option<String>) = match &existing {
+        Some(r) => (
+            r.try_get("summary").unwrap_or_default(),
+            r.try_get("key_topics").unwrap_or_default(),
+            r.try_get::<Option<String>, _>("covered").unwrap_or(None),
+        ),
+        None => (String::new(), Vec::new(), None),
+    };
+
+    let rows = sqlx::query(
+        "SELECT role, content, created_at::text AS created_at \
+         FROM mimir_chat_messages \
+         WHERE session_id = $1 \
+           AND ($2::timestamptz IS NULL OR created_at > $2::timestamptz) \
+         ORDER BY created_at ASC LIMIT 40"
+    )
+    .bind(session_id)
+    .bind(&covered)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if rows.len() < 4 {
+        return Ok(false);
+    }
+
+    let mut transcript = String::new();
+    let mut last_ts = String::new();
+    for row in &rows {
+        let role: String = row.try_get("role").unwrap_or_default();
+        let content: String = row.try_get("content").unwrap_or_default();
+        last_ts = row.try_get("created_at").unwrap_or_default();
+        // User messages in full-ish; assistant answers trimmed — the gist is
+        // what a summary needs, not the retrieved passages.
+        let cap = if role == "assistant" { 600 } else { 1200 };
+        let trimmed: String = content.chars().take(cap).collect();
+        transcript.push_str(&format!("{}: {}\n", role, trimmed));
+    }
+
+    let system = "You maintain a rolling summary of a tutoring chat session. Merge the previous summary \
+                  with the new messages into one updated summary. Return ONLY JSON: \
+                  {\"summary\": \"<= 200 words\", \"key_topics\": [\"lowercase topic\", ...]} \
+                  with at most 12 topics.";
+    let prev_for_prompt = if prev_summary.is_empty() { "(none)".to_string() } else { prev_summary };
+    let user = format!("Previous summary:\n{}\n\nNew messages:\n{}", prev_for_prompt, transcript);
+
+    let (raw, latency) = crate::llm_client::call_llm(
+        client,
+        crate::constants::GROQ_API_URL,
+        &api_key,
+        "llama-3.3-70b-versatile",
+        system,
+        &user,
+        400,
+        true,
+        0.2,
+    )
+    .await?;
+    crate::brain::log_prompt_call(
+        pool.clone(), "mimir_consolidate", "llama-3.3-70b-versatile", "mimir_consolidate_v1",
+        latency, true, None, None,
+    );
+
+    let parsed = parse_consolidation(&raw)?;
+
+    // Union topics (case-insensitive), cap 12.
+    let mut topics = prev_topics;
+    for t in parsed.key_topics {
+        let tl = t.trim().to_lowercase();
+        if !tl.is_empty() && !topics.iter().any(|x| x.eq_ignore_ascii_case(&tl)) {
+            topics.push(tl);
+        }
+    }
+    topics.truncate(12);
+
+    let id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO mimir_memory_shortterm (id, session_id, summary, key_topics, covered_through) \
+         VALUES ($1, $2, $3, $4, $5::timestamptz) \
+         ON CONFLICT (session_id) DO UPDATE SET \
+           summary = EXCLUDED.summary, \
+           key_topics = EXCLUDED.key_topics, \
+           covered_through = EXCLUDED.covered_through, \
+           updated_at = NOW()"
+    )
+    .bind(&id)
+    .bind(session_id)
+    .bind(&parsed.summary)
+    .bind(&topics)
+    .bind(&last_ts)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    println!("🧠 [memory] consolidated session {} ({} new msgs, {} topics)", session_id, rows.len(), topics.len());
+    Ok(true)
+}
+
+// ─── Tier 2→3: fact extraction from summaries ────────────────────────────────
+
+/// Distill durable facts from recent short-term summaries for the session's
+/// tree. Works off summaries, not raw messages. Returns number written.
+pub(crate) async fn extract_longterm_facts(
+    pool: &PgPool,
+    client: &reqwest::Client,
+    session_id: &str,
+) -> Result<usize, String> {
+    let api_key = crate::mimir::groq_api_key()?;
+
+    let tree_row = sqlx::query("SELECT tree_id FROM mimir_chat_sessions WHERE id = $1")
+        .bind(session_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let tree_id: Option<String> = tree_row
+        .and_then(|r| r.try_get::<Option<String>, _>("tree_id").ok())
+        .flatten();
+    let Some(tree_id) = tree_id else { return Ok(0) };
+
+    let rows = sqlx::query(
+        "SELECT ms.summary, ms.key_topics \
+         FROM mimir_memory_shortterm ms \
+         JOIN mimir_chat_sessions cs ON cs.id = ms.session_id \
+         WHERE cs.tree_id = $1 AND ms.updated_at > NOW() - INTERVAL '24 hours' \
+         ORDER BY ms.updated_at DESC LIMIT 5"
+    )
+    .bind(&tree_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    let mut digest = String::new();
+    for row in &rows {
+        let summary: String = row.try_get("summary").unwrap_or_default();
+        let topics: Vec<String> = row.try_get("key_topics").unwrap_or_default();
+        digest.push_str(&format!("Session summary: {}\nTopics: {}\n\n", summary, topics.join(", ")));
+    }
+
+    let system = "Extract durable facts about the LEARNER from these tutoring-session summaries. \
+                  Only facts about the user themself: their knowledge level, misconceptions, \
+                  preferences, goals, background. NOT facts about the subject matter. \
+                  Return ONLY JSON: {\"facts\": [{\"fact_key\": \"snake_case_key\", \
+                  \"fact_value\": \"short string\", \"confidence\": 0.0}]} \
+                  — at most 8 facts, empty array if none.";
+
+    let (raw, latency) = crate::llm_client::call_llm(
+        client,
+        crate::constants::GROQ_API_URL,
+        &api_key,
+        "llama-3.3-70b-versatile",
+        system,
+        &digest,
+        500,
+        true,
+        0.2,
+    )
+    .await?;
+    crate::brain::log_prompt_call(
+        pool.clone(), "mimir_extract_facts", "llama-3.3-70b-versatile", "mimir_extract_facts_v1",
+        latency, true, None, None,
+    );
+
+    let parsed = parse_extracted_facts(&raw);
+    let mut written = 0usize;
+    for f in parsed.facts.into_iter().take(8) {
+        let key = f.fact_key.trim().to_lowercase().replace(' ', "_");
+        if key.is_empty() { continue; }
+        if set_memory_fact(
+            pool, "tree", Some(&tree_id), None, &key, None,
+            f.fact_value, f.confidence.clamp(0.0, 1.0), "session_consolidation",
+        )
+        .await
+        .is_ok()
+        {
+            written += 1;
+        }
+    }
+    println!("🧠 [memory] extracted {} long-term facts for tree {}", written, tree_id);
+    Ok(written)
+}
+
+#[tauri::command]
+pub async fn consolidate_session_cmd(
+    session_id: String,
+    client: State<'_, reqwest::Client>,
+    database: State<'_, Database>,
+) -> Result<(), String> {
+    consolidate_session(&database.pool, &*client, &session_id).await?;
+    let _ = extract_longterm_facts(&database.pool, &*client, &session_id).await;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,5 +567,24 @@ mod tests {
         let capped = format_memory_block(&ctx, 1);
         assert!(capped.contains("mastered_concept"));
         assert!(!capped.contains("prefers_format"));
+    }
+
+    #[test]
+    fn parse_consolidation_handles_fenced_json() {
+        let raw = "```json\n{\"summary\": \"Covered RRF and pgvector.\", \"key_topics\": [\"rrf\", \"pgvector\"]}\n```";
+        let out = parse_consolidation(raw).unwrap();
+        assert_eq!(out.summary, "Covered RRF and pgvector.");
+        assert_eq!(out.key_topics, vec!["rrf", "pgvector"]);
+    }
+
+    #[test]
+    fn parse_extracted_facts_tolerates_garbage() {
+        let good = "{\"facts\": [{\"fact_key\": \"career goal\", \"fact_value\": \"ML engineering\", \"confidence\": 0.8}]}";
+        let out = parse_extracted_facts(good);
+        assert_eq!(out.facts.len(), 1);
+        assert_eq!(out.facts[0].fact_key, "career goal");
+
+        let bad = "no json here at all";
+        assert_eq!(parse_extracted_facts(bad).facts.len(), 0);
     }
 }

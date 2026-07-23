@@ -25,6 +25,7 @@ pub(crate) enum OrchestratorJob {
     MatchResourceToNodes { resource_id: String },
     FetchTranscript { resource_id: String },
     ExtractSkillsFromResource { resource_id: String },
+    ConsolidateSession { session_id: String },
 }
 
 // ─── JobQueue (managed Tauri state) ──────────────────────────────────────────
@@ -105,6 +106,22 @@ pub fn start_worker(pool: PgPool, app: AppHandle, client: reqwest::Client) -> Jo
                 }
                 OrchestratorJob::ExtractSkillsFromResource { resource_id } => {
                     run_extract_skills_from_resource(&pool, &client, &resource_id).await;
+                }
+                OrchestratorJob::ConsolidateSession { session_id } => {
+                    match crate::mimir_memory::consolidate_session(&pool, &client, &session_id).await {
+                        Ok(true) => {
+                            // Chain fact extraction sequentially (worker holds no sender).
+                            match crate::mimir_memory::extract_longterm_facts(&pool, &client, &session_id).await {
+                                Ok(n) if n > 0 => {
+                                    let _ = app.emit("ygg-memory-updated", serde_json::json!({ "facts": n }));
+                                }
+                                Ok(_) => {}
+                                Err(e) => println!("⚠️  [orch] extract_longterm_facts failed: {}", e),
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(e) => println!("⚠️  [orch] consolidate_session failed: {}", e),
+                    }
                 }
             }
         }

@@ -968,6 +968,7 @@ pub async fn mimir_chat(
     project_name: Option<String>,
     tree_name: Option<String>,
     client: tauri::State<'_, reqwest::Client>,
+    queue: State<'_, crate::orchestrator::JobQueue>,
     database: State<'_, Database>,
 ) -> Result<MimirChatResponse, String> {
     let api_key = crate::mimir::groq_api_key()?;
@@ -1318,6 +1319,24 @@ pub async fn mimir_chat(
         .bind(&sources_json)
         .execute(&database.pool)
         .await;
+
+        // Every ~20 messages, consolidate this session into short-term memory.
+        let cnt_row = sqlx::query(
+            "SELECT COUNT(*) AS n FROM mimir_chat_messages WHERE session_id = $1"
+        )
+        .bind(sid)
+        .fetch_one(&database.pool)
+        .await;
+        if let Ok(row) = cnt_row {
+            let n: i64 = row.try_get("n").unwrap_or(0);
+            if n > 0 && n % 20 == 0 {
+                let _ = queue
+                    .send(crate::orchestrator::OrchestratorJob::ConsolidateSession {
+                        session_id: sid.clone(),
+                    })
+                    .await;
+            }
+        }
     }
 
     println!("✅ Chat response: {} chars, {} sources", answer.len(), sources.len());
