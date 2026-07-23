@@ -448,6 +448,36 @@ pub async fn on_resource_completed(
         }
     }
 
+    // Memory: record studied resource for every affected tree (entity-keyed).
+    let title_row = sqlx::query("SELECT title FROM mimir_resources WHERE id = $1")
+        .bind(resource_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+    let resource_title: String = title_row
+        .and_then(|r| r.try_get("title").ok())
+        .unwrap_or_default();
+    if !resource_title.is_empty() {
+        for tree_id in &affected_trees {
+            if let Err(e) = crate::mimir_memory::set_memory_fact(
+                pool,
+                "tree",
+                Some(tree_id),
+                None,
+                "resource_studied",
+                Some(resource_id),
+                serde_json::json!({ "title": resource_title, "resource_id": resource_id }),
+                0.8,
+                "resource_complete",
+            )
+            .await
+            {
+                println!("⚠️  [orch] memory fact (resource_studied) failed: {}", e);
+            }
+        }
+    }
+
     if let Err(e) = crate::skill_commands::sync_trees_inner(pool).await {
         println!("⚠️  [orch] sync_trees_inner failed: {}", e);
     } else if let Err(e) = crate::skill_commands::recalculate_levels_inner(pool).await {
@@ -509,6 +539,35 @@ pub async fn on_checkpoint_completed(
         // Enqueue debounced infer-deps via job queue (replaces the prior tokio::spawn debounce)
         if let Err(e) = queue.send(OrchestratorJob::InferSkillDeps).await {
             println!("⚠️  [orch] enqueue InferSkillDeps failed: {}", e);
+        }
+    }
+
+    // Memory: record mastered concept — entity-keyed so each checkpoint
+    // accumulates its own fact instead of overwriting the last one.
+    let title_row = sqlx::query("SELECT title FROM tree_nodes WHERE id = $1")
+        .bind(node_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+    if let Some(row) = title_row {
+        let title: String = row.try_get("title").unwrap_or_default();
+        if !title.is_empty() {
+            if let Err(e) = crate::mimir_memory::set_memory_fact(
+                pool,
+                "tree",
+                Some(tree_id),
+                None,
+                "mastered_concept",
+                Some(node_id),
+                serde_json::json!({ "title": title, "node_id": node_id }),
+                0.9,
+                "checkpoint_complete",
+            )
+            .await
+            {
+                println!("⚠️  [orch] memory fact (mastered_concept) failed: {}", e);
+            }
         }
     }
 
