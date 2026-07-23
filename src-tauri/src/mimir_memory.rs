@@ -89,6 +89,13 @@ pub(crate) fn format_memory_block(ctx: &MemoryContext, max_facts: usize) -> Stri
     )
 }
 
+/// Fact keys that describe the person, not a tree — always stored user-wide
+/// so every tree's chat recalls them.
+pub(crate) fn is_user_scope_key(key: &str) -> bool {
+    matches!(key, "career_goal" | "background" | "learning_style" | "current_role")
+        || key.starts_with("prefers_")
+}
+
 // ─── Tier 3: fact CRUD ───────────────────────────────────────────────────────
 
 const ALLOWED_SOURCES: [&str; 6] = [
@@ -503,8 +510,13 @@ pub(crate) async fn extract_longterm_facts(
     for f in parsed.facts.into_iter().take(8) {
         let key = f.fact_key.trim().to_lowercase().replace(' ', "_");
         if key.is_empty() { continue; }
+        let (scope, fact_tree_id) = if is_user_scope_key(&key) {
+            ("user", None)
+        } else {
+            ("tree", Some(tree_id.as_str()))
+        };
         if set_memory_fact(
-            pool, "tree", Some(&tree_id), None, &key, None,
+            pool, scope, fact_tree_id, None, &key, None,
             f.fact_value, f.confidence.clamp(0.0, 1.0), "session_consolidation",
         )
         .await
@@ -547,6 +559,15 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
         }
+    }
+
+    #[test]
+    fn user_scope_keys_are_detected() {
+        assert!(is_user_scope_key("career_goal"));
+        assert!(is_user_scope_key("prefers_format"));
+        assert!(is_user_scope_key("prefers_video_length"));
+        assert!(!is_user_scope_key("mastered_concept"));
+        assert!(!is_user_scope_key("resource_studied"));
     }
 
     #[test]

@@ -299,11 +299,13 @@ pub(crate) async fn execute_tool(
             };
             let confidence = args["confidence"].as_f64().unwrap_or(0.7);
             let entity_id = args["entity_id"].as_str().filter(|s| !s.is_empty());
-            let scope = if ctx.tree_id.is_some() { "tree" } else { "user" };
+            let user_key = crate::mimir_memory::is_user_scope_key(&fact_key);
+            let scope = if user_key { "user" } else if ctx.tree_id.is_some() { "tree" } else { "user" };
+            let scoped_tree_id = if user_key { None } else { ctx.tree_id.as_deref() };
             let id = crate::mimir_memory::set_memory_fact(
                 ctx.pool,
                 scope,
-                ctx.tree_id.as_deref(),
+                scoped_tree_id,
                 None,
                 &fact_key,
                 entity_id,
