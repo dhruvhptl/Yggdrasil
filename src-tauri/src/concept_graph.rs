@@ -540,6 +540,56 @@ pub async fn explain_node_cmd(
     explain_node(&database.pool, &node_id).await
 }
 
+// ─── One-shot backfill from the JSONB blob ───────────────────────────────────
+
+/// For each tree with a concept_graph blob and no concept_graphs row, parse the
+/// Vec<Concept> and create a graph. Idempotent, best-effort, never panics.
+/// Returns the number of graphs created.
+pub(crate) async fn backfill_concept_graphs(pool: &PgPool) -> usize {
+    let rows = match sqlx::query(
+        "SELECT t.id, t.concept_graph FROM trees t \
+         WHERE t.concept_graph IS NOT NULL \
+           AND NOT EXISTS (SELECT 1 FROM concept_graphs cg WHERE cg.tree_id = t.id)",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            println!("⚠️  [graph] backfill query failed: {}", e);
+            return 0;
+        }
+    };
+
+    let mut created = 0usize;
+    for row in &rows {
+        let tree_id: String = match row.try_get("id") {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let blob: serde_json::Value = match row.try_get("concept_graph") {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        // The blob is a flat array of Concept. Tolerate malformed/old shapes.
+        let concepts: Vec<Concept> = match serde_json::from_value(blob) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if concepts.is_empty() {
+            continue;
+        }
+        match create_concept_graph_from_concepts(pool, &tree_id, &concepts).await {
+            Ok(_) => created += 1,
+            Err(e) => println!("⚠️  [graph] backfill tree {} failed: {}", tree_id, e),
+        }
+    }
+    if created > 0 {
+        println!("🕸  [graph] backfilled {} concept graph(s)", created);
+    }
+    created
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
