@@ -7,6 +7,7 @@ import { Send, X, Loader2, ExternalLink, Trash2, BarChart2, Cpu, CheckCircle, Ar
 import { useMimirContext } from "../contexts/MimirContext";
 import { validateOrLog, MimirChatResponseSchema } from "../lib/validators";
 import type { NodeChatContext, Suggestion } from "../types";
+import { HitlConfirmation, type ActionProposal } from "./HitlConfirmation";
 
 interface Source {
   title: string;
@@ -24,6 +25,7 @@ interface ChatMessage {
   sources?: Source[];
   suggestions?: Suggestion[];
   createdAt?: string;
+  pendingApproval?: ActionProposal | null;
 }
 
 interface StoredChatMessage {
@@ -38,6 +40,7 @@ interface MimirChatResponse {
   answer: string;
   sources: Source[];
   suggestions: Suggestion[];
+  pendingApproval?: ActionProposal | null;
 }
 
 interface RetrievalStats {
@@ -225,6 +228,7 @@ export default function MimirChat({
           content: response.answer,
           sources: response.sources,
           suggestions: response.suggestions ?? [],
+          pendingApproval: response.pendingApproval ?? null,
         },
       ]);
     } catch (e) {
@@ -284,6 +288,16 @@ export default function MimirChat({
       }
     }
   }, [nodeId, nodeContext, navigate, onOpenCoverage]);
+
+  const handleApprovalResolved = useCallback((index: number, resultMessage: string) => {
+    setMessages((prev) => {
+      const updated = [...prev];
+      if (updated[index]) {
+        updated[index] = { ...updated[index], pendingApproval: null };
+      }
+      return [...updated, { role: "mimir", content: resultMessage }];
+    });
+  }, []);
 
   return (
     <div
@@ -669,6 +683,14 @@ export default function MimirChat({
                   >
                     {msg.content}
                   </div>
+                  {/* HITL confirmation card for destructive action proposals */}
+                  {msg.pendingApproval && (
+                    <HitlConfirmation
+                      proposal={msg.pendingApproval}
+                      treeId={treeId ?? null}
+                      onResolved={(resultMessage) => handleApprovalResolved(i, resultMessage)}
+                    />
+                  )}
                   {/* Source badges */}
                   {msg.sources && msg.sources.length > 0 && (
                     <div

@@ -34,10 +34,17 @@ export const SuggestionSchema = z.object({
   payload: z.unknown().optional(),
 });
 
+export const ActionProposalSchema = z.object({
+  actionType: z.string(),
+  summary: z.string(),
+  params: z.record(z.string(), z.unknown()),
+});
+
 export const MimirChatResponseSchema = z.object({
   answer: z.string(),
   sources: z.array(SourceSchema),
   suggestions: z.array(SuggestionSchema).default([]),
+  pendingApproval: ActionProposalSchema.nullable().optional(),
 });
 
 export const StoredChatMessageSchema = z.object({
