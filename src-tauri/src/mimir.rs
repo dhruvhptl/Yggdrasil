@@ -113,6 +113,7 @@ pub struct MimirChatResponse {
     pub answer: String,
     pub sources: Vec<MimirChatSource>,
     pub suggestions: Vec<Suggestion>,
+    pub pending_approval: Option<crate::hitl::ActionProposal>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

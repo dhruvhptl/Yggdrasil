@@ -660,6 +660,20 @@ pub(crate) async fn run_agent_turn(
             AgentStep::ToolCalls(calls) => {
                 messages.push(assistant_msg);
                 for call in calls {
+                    if let Some(proposal) = crate::hitl::requires_approval(&call.name, &call.arguments) {
+                        crate::brain::log_prompt_call(
+                            pool_for_log.clone(), "mimir_hitl_proposal", &cfg.model, "mimir_hitl_v1",
+                            t0.elapsed().as_millis() as i64, true, None,
+                            Some(json!({ "action_type": proposal.action_type })),
+                        );
+                        return Ok(AgentTurnResult {
+                            answer: format!("I'd like to {}. Approve?", proposal.summary),
+                            sources: dedup_sources(state.sources),
+                            stats: state.stats,
+                            tool_calls_made: state.tool_calls_made,
+                            pending_approval: Some(proposal),
+                        });
+                    }
                     if state.tool_calls_made >= MAX_TOOL_CALLS {
                         messages.push(json!({
                             "role": "tool",

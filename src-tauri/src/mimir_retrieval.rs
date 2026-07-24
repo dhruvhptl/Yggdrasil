@@ -1209,8 +1209,8 @@ pub async fn mimir_chat(
     }
 
     // 6c. Resolve answer + sources + stats from whichever path ran.
-    let (answer, sources, stats) = match agent_outcome {
-        Some(r) => (r.answer, r.sources, r.stats),
+    let (answer, sources, stats, pending_approval) = match agent_outcome {
+        Some(r) => (r.answer, r.sources, r.stats, r.pending_approval),
         None => {
             // Classic path: eager retrieval → full prompt → one-shot synthesis.
             let retrieval = run_retrieval(
@@ -1292,7 +1292,7 @@ pub async fn mimir_chat(
                 })),
             );
 
-            (answer, retrieval.sources, retrieval.stats)
+            (answer, retrieval.sources, retrieval.stats, None)
         }
     };
 
@@ -1490,7 +1490,7 @@ pub async fn mimir_chat(
         });
     }
 
-    Ok(MimirChatResponse { answer, sources, suggestions })
+    Ok(MimirChatResponse { answer, sources, suggestions, pending_approval })
 }
 
 // ─── Chat session commands ───────────────────────────────────────────────────
