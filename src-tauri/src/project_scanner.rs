@@ -66,7 +66,10 @@ pub(crate) fn extract_from_file(path: &str, source: &str) -> (Vec<ExtractedNode>
     };
     match ext.to_lowercase().as_str() {
         "py" | "pyw" | "pyx" => extract_python(&lang, path, source),
-        // Task 4 adds: js/jsx/mjs/cjs, ts/mts/cts, tsx, rs, go
+        "js" | "jsx" | "mjs" | "cjs" => extract_js_like(&lang, path, source),
+        "ts" | "mts" | "cts" | "tsx" => extract_ts_like(&lang, path, source),
+        "rs" => extract_rust(&lang, path, source),
+        "go" => extract_go(&lang, path, source),
         _ => (Vec::new(), Vec::new()),
     }
 }
@@ -120,6 +123,177 @@ fn extract_python(lang: &Language, path: &str, source: &str) -> (Vec<ExtractedNo
     // Imports → references edges
     for_each_named(lang, source,
         "(import_from_statement name: (dotted_name (identifier) @name))",
+        |name, _s, _e| edges.push(ExtractedEdge {
+            source_title: file_stem.clone(), target_title: name.to_string(), relationship: "references",
+        }));
+    (nodes, edges)
+}
+
+/// JavaScript (also used as the base pattern for TypeScript below).
+fn extract_js_like(lang: &Language, path: &str, source: &str) -> (Vec<ExtractedNode>, Vec<ExtractedEdge>) {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    // Functions
+    for_each_named(lang, source,
+        "(function_declaration name: (identifier) @name)",
+        |name, s, e| nodes.push(ExtractedNode {
+            title: name.to_string(), description: "JS function".into(),
+            file_path: path.to_string(), line_start: s, line_end: e,
+        }));
+    // Classes
+    for_each_named(lang, source,
+        "(class_declaration name: (identifier) @name)",
+        |name, s, e| nodes.push(ExtractedNode {
+            title: name.to_string(), description: "JS class".into(),
+            file_path: path.to_string(), line_start: s, line_end: e,
+        }));
+    // Calls → implements edges
+    let file_stem = std::path::Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or(path).to_string();
+    for_each_named(lang, source,
+        "(call_expression function: (identifier) @name)",
+        |name, _s, _e| edges.push(ExtractedEdge {
+            source_title: file_stem.clone(), target_title: name.to_string(), relationship: "implements",
+        }));
+    // Imports → references edges
+    for_each_named(lang, source,
+        "(import_statement source: (string) @name)",
+        |name, _s, _e| edges.push(ExtractedEdge {
+            source_title: file_stem.clone(), target_title: name.to_string(), relationship: "references",
+        }));
+    (nodes, edges)
+}
+
+/// TypeScript: same shape as JS, but `class_declaration`'s name field is a
+/// `type_identifier` in the TS/TSX grammar (unlike plain JS, where it is an
+/// `identifier`) — so class/interface/type-alias queries all key on
+/// `type_identifier` while functions/calls stay on `identifier`.
+fn extract_ts_like(lang: &Language, path: &str, source: &str) -> (Vec<ExtractedNode>, Vec<ExtractedEdge>) {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    // Functions
+    for_each_named(lang, source,
+        "(function_declaration name: (identifier) @name)",
+        |name, s, e| nodes.push(ExtractedNode {
+            title: name.to_string(), description: "TS function".into(),
+            file_path: path.to_string(), line_start: s, line_end: e,
+        }));
+    // Classes
+    for_each_named(lang, source,
+        "(class_declaration name: (type_identifier) @name)",
+        |name, s, e| nodes.push(ExtractedNode {
+            title: name.to_string(), description: "TS class".into(),
+            file_path: path.to_string(), line_start: s, line_end: e,
+        }));
+    // Interfaces
+    for_each_named(lang, source,
+        "(interface_declaration name: (type_identifier) @name)",
+        |name, s, e| nodes.push(ExtractedNode {
+            title: name.to_string(), description: "TS interface".into(),
+            file_path: path.to_string(), line_start: s, line_end: e,
+        }));
+    // Type aliases
+    for_each_named(lang, source,
+        "(type_alias_declaration name: (type_identifier) @name)",
+        |name, s, e| nodes.push(ExtractedNode {
+            title: name.to_string(), description: "TS type alias".into(),
+            file_path: path.to_string(), line_start: s, line_end: e,
+        }));
+    // Calls → implements edges
+    let file_stem = std::path::Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or(path).to_string();
+    for_each_named(lang, source,
+        "(call_expression function: (identifier) @name)",
+        |name, _s, _e| edges.push(ExtractedEdge {
+            source_title: file_stem.clone(), target_title: name.to_string(), relationship: "implements",
+        }));
+    // Imports → references edges
+    for_each_named(lang, source,
+        "(import_statement source: (string) @name)",
+        |name, _s, _e| edges.push(ExtractedEdge {
+            source_title: file_stem.clone(), target_title: name.to_string(), relationship: "references",
+        }));
+    (nodes, edges)
+}
+
+fn extract_rust(lang: &Language, path: &str, source: &str) -> (Vec<ExtractedNode>, Vec<ExtractedEdge>) {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    // Functions
+    for_each_named(lang, source,
+        "(function_item name: (identifier) @name)",
+        |name, s, e| nodes.push(ExtractedNode {
+            title: name.to_string(), description: "Rust function".into(),
+            file_path: path.to_string(), line_start: s, line_end: e,
+        }));
+    // Structs
+    for_each_named(lang, source,
+        "(struct_item name: (type_identifier) @name)",
+        |name, s, e| nodes.push(ExtractedNode {
+            title: name.to_string(), description: "Rust struct".into(),
+            file_path: path.to_string(), line_start: s, line_end: e,
+        }));
+    // Traits
+    for_each_named(lang, source,
+        "(trait_item name: (type_identifier) @name)",
+        |name, s, e| nodes.push(ExtractedNode {
+            title: name.to_string(), description: "Rust trait".into(),
+            file_path: path.to_string(), line_start: s, line_end: e,
+        }));
+    // Calls → implements edges
+    let file_stem = std::path::Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or(path).to_string();
+    for_each_named(lang, source,
+        "(call_expression function: (identifier) @name)",
+        |name, _s, _e| edges.push(ExtractedEdge {
+            source_title: file_stem.clone(), target_title: name.to_string(), relationship: "implements",
+        }));
+    // `use` paths → references edges
+    for_each_named(lang, source,
+        "(use_declaration argument: (scoped_identifier name: (identifier) @name))",
+        |name, _s, _e| edges.push(ExtractedEdge {
+            source_title: file_stem.clone(), target_title: name.to_string(), relationship: "references",
+        }));
+    // `impl Trait for Type` → prerequisite edges (trait must exist before the impl)
+    for_each_named(lang, source,
+        "(impl_item trait: (type_identifier) @name)",
+        |name, _s, _e| edges.push(ExtractedEdge {
+            source_title: file_stem.clone(), target_title: name.to_string(), relationship: "prerequisite",
+        }));
+    (nodes, edges)
+}
+
+fn extract_go(lang: &Language, path: &str, source: &str) -> (Vec<ExtractedNode>, Vec<ExtractedEdge>) {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    // Functions
+    for_each_named(lang, source,
+        "(function_declaration name: (identifier) @name)",
+        |name, s, e| nodes.push(ExtractedNode {
+            title: name.to_string(), description: "Go function".into(),
+            file_path: path.to_string(), line_start: s, line_end: e,
+        }));
+    // Methods (receiver functions)
+    for_each_named(lang, source,
+        "(method_declaration name: (field_identifier) @name)",
+        |name, s, e| nodes.push(ExtractedNode {
+            title: name.to_string(), description: "Go method".into(),
+            file_path: path.to_string(), line_start: s, line_end: e,
+        }));
+    // Type declarations (struct/interface/alias)
+    for_each_named(lang, source,
+        "(type_declaration (type_spec name: (type_identifier) @name))",
+        |name, s, e| nodes.push(ExtractedNode {
+            title: name.to_string(), description: "Go type".into(),
+            file_path: path.to_string(), line_start: s, line_end: e,
+        }));
+    // Calls → implements edges
+    let file_stem = std::path::Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or(path).to_string();
+    for_each_named(lang, source,
+        "(call_expression function: (identifier) @name)",
+        |name, _s, _e| edges.push(ExtractedEdge {
+            source_title: file_stem.clone(), target_title: name.to_string(), relationship: "implements",
+        }));
+    // Imports → references edges
+    for_each_named(lang, source,
+        "(import_spec path: (interpreted_string_literal) @name)",
         |name, _s, _e| edges.push(ExtractedEdge {
             source_title: file_stem.clone(), target_title: name.to_string(), relationship: "references",
         }));
@@ -282,5 +456,24 @@ mod tests {
         assert!(titles.contains(&"rrf_merge"));
         assert!(nodes.iter().any(|n| n.title == "rrf_merge" && n.line_start >= 1));
         assert!(edges.iter().any(|e| e.target_title == "cosine" && e.relationship == "implements"));
+    }
+
+    #[test]
+    fn rust_extraction_finds_fn_struct_trait() {
+        let src = "struct SearchResult;\ntrait Scorer {}\nfn cosine_similarity(a: f64) -> f64 { helper(a) }\n";
+        let (nodes, edges) = extract_from_file("lib.rs", src);
+        let t: Vec<&str> = nodes.iter().map(|n| n.title.as_str()).collect();
+        assert!(t.contains(&"SearchResult") && t.contains(&"Scorer") && t.contains(&"cosine_similarity"));
+        assert!(edges.iter().any(|e| e.target_title == "helper"));
+    }
+
+    #[test]
+    fn go_js_ts_extraction_find_functions() {
+        let (gn, _) = extract_from_file("main.go", "func HybridSearch(q string) {}\ntype Store struct{}\n");
+        assert!(gn.iter().any(|n| n.title == "HybridSearch"));
+        let (jn, _) = extract_from_file("app.js", "function render() {}\nclass Widget {}\n");
+        assert!(jn.iter().any(|n| n.title == "render"));
+        let (tn, _) = extract_from_file("api.ts", "interface Provider {}\nfunction fetchIt() {}\n");
+        assert!(tn.iter().any(|n| n.title == "fetchIt"));
     }
 }
