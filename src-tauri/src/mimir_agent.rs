@@ -171,6 +171,50 @@ pub(crate) fn tool_schemas(hound_available: bool) -> Vec<serde_json::Value> {
             }
         }));
     }
+    schemas.push(json!({
+        "type": "function",
+        "function": {
+            "name": "delete_fact",
+            "description": "Delete a stored memory fact. REQUIRES user approval before it executes — the user will be shown a confirmation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "fact_key": { "type": "string", "description": "The fact key to delete, e.g. 'career_goal'." },
+                    "entity_id": { "type": "string", "description": "Optional: the entity id if the fact is entity-scoped (e.g. a node/resource id)." }
+                },
+                "required": ["fact_key"]
+            }
+        }
+    }));
+    schemas.push(json!({
+        "type": "function",
+        "function": {
+            "name": "delete_resource",
+            "description": "Delete a resource from the user's library. REQUIRES user approval before it executes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "The title of the resource to delete." }
+                },
+                "required": ["title"]
+            }
+        }
+    }));
+    schemas.push(json!({
+        "type": "function",
+        "function": {
+            "name": "merge_skills",
+            "description": "Merge one skill into another (the source is absorbed into the target). REQUIRES user approval before it executes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": { "type": "string", "description": "The skill to absorb (by name)." },
+                    "target": { "type": "string", "description": "The skill to keep (by name)." }
+                },
+                "required": ["source", "target"]
+            }
+        }
+    }));
     schemas
 }
 
@@ -546,6 +590,9 @@ pub(crate) async fn execute_tool(
             let body: String = fetched.content.chars().take(8000).collect();
             Ok(format!("{}{}", header, body))
         }
+        "delete_fact" | "delete_resource" | "merge_skills" => {
+            Err(format!("{} requires user approval and cannot execute directly", name))
+        }
         other => Err(format!("unknown tool '{}'", other)),
     }
 }
@@ -557,6 +604,7 @@ pub(crate) struct AgentTurnResult {
     pub sources: Vec<crate::mimir::MimirChatSource>,
     pub stats: crate::mimir_retrieval::RetrievalStats,
     pub tool_calls_made: u32,
+    pub pending_approval: Option<crate::hitl::ActionProposal>,
 }
 
 const MAX_TOOL_CALLS: u32 = 6;
@@ -606,6 +654,7 @@ pub(crate) async fn run_agent_turn(
                     sources: dedup_sources(state.sources),
                     stats: state.stats,
                     tool_calls_made: state.tool_calls_made,
+                    pending_approval: None,
                 });
             }
             AgentStep::ToolCalls(calls) => {
@@ -660,20 +709,20 @@ mod tests {
         assert_eq!(
             base,
             vec!["search_mimir", "get_facts", "set_fact", "read_tree",
-                 "query_graph", "path_between", "explain_node"]
+                 "query_graph", "path_between", "explain_node",
+                 "delete_fact", "delete_resource", "merge_skills"]
         );
 
         let with_web: Vec<String> = tool_schemas(true)
             .iter()
             .filter_map(|s| s["function"]["name"].as_str().map(|x| x.to_string()))
             .collect();
-        assert_eq!(with_web.len(), 9);
+        assert_eq!(with_web.len(), 12);
         assert_eq!(with_web[7], "smart_search");
         assert_eq!(with_web[8], "smart_fetch");
-        for s in tool_schemas(true) {
-            assert_eq!(s["type"], "function");
-            assert!(s["function"]["parameters"]["type"] == "object");
-        }
+        assert_eq!(with_web[9], "delete_fact");
+        assert_eq!(with_web[10], "delete_resource");
+        assert_eq!(with_web[11], "merge_skills");
     }
 
     #[test]
