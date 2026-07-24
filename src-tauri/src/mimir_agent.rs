@@ -215,6 +215,20 @@ pub(crate) fn tool_schemas(hound_available: bool) -> Vec<serde_json::Value> {
             }
         }
     }));
+    schemas.push(json!({
+        "type": "function",
+        "function": {
+            "name": "scan_project",
+            "description": "Parse a local project directory and extract concept nodes and edges from source code into the concept graph (confidence='extracted'). Supports Python, JavaScript, TypeScript, Rust, Go.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Absolute or relative path to the project directory." }
+                },
+                "required": ["path"]
+            }
+        }
+    }));
     schemas
 }
 
@@ -593,6 +607,21 @@ pub(crate) async fn execute_tool(
         "delete_fact" | "delete_resource" | "merge_skills" => {
             Err(format!("{} requires user approval and cannot execute directly", name))
         }
+        "scan_project" => {
+            let path = args["path"].as_str().ok_or("scan_project requires a 'path' argument")?;
+            let Some(tree_id) = ctx.tree_id.as_deref() else {
+                return Ok("No active tree to scan into — open a tree first.".to_string());
+            };
+            let r = crate::project_scanner::scan_project(ctx.pool, path, tree_id).await?;
+            let mut msg = format!(
+                "Scanned {} files ({} skipped). Added {} new concepts, enriched {} existing, added {} edges.",
+                r.files_scanned, r.files_skipped, r.nodes_added, r.nodes_enriched, r.edges_added
+            );
+            if !r.errors.is_empty() {
+                msg.push_str(&format!(" {} file(s) had errors and were skipped.", r.errors.len()));
+            }
+            Ok(msg)
+        }
         other => Err(format!("unknown tool '{}'", other)),
     }
 }
@@ -724,19 +753,20 @@ mod tests {
             base,
             vec!["search_mimir", "get_facts", "set_fact", "read_tree",
                  "query_graph", "path_between", "explain_node",
-                 "delete_fact", "delete_resource", "merge_skills"]
+                 "delete_fact", "delete_resource", "merge_skills", "scan_project"]
         );
 
         let with_web: Vec<String> = tool_schemas(true)
             .iter()
             .filter_map(|s| s["function"]["name"].as_str().map(|x| x.to_string()))
             .collect();
-        assert_eq!(with_web.len(), 12);
+        assert_eq!(with_web.len(), 13);
         assert_eq!(with_web[7], "smart_search");
         assert_eq!(with_web[8], "smart_fetch");
         assert_eq!(with_web[9], "delete_fact");
         assert_eq!(with_web[10], "delete_resource");
         assert_eq!(with_web[11], "merge_skills");
+        assert_eq!(with_web[12], "scan_project");
     }
 
     #[test]
