@@ -31,6 +31,7 @@ mod ext_server;
 mod concept_graph;
 mod hound_client;
 mod hitl;
+mod project_scanner;
 mod mimir_memory;
 mod mimir_agent;
 
