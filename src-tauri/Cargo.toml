@@ -27,6 +27,16 @@ pdf-extract = "0.7"
 axum = "0.7"
 tower-http = { version = "0.5", features = ["cors"] }
 
+# Scanner — tree-sitter project scanner
+tree-sitter = "0.24"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-rust = "0.23"
+tree-sitter-go = "0.23"
+ignore = "0.4"
+streaming-iterator = "0.1"
+
 # Reduce debuginfo on dev builds to avoid MSVC linker OOM (STATUS_STACK_BUFFER_OVERRUN).
 # Line-tables-only is enough for backtraces and covers 95% of dev debugging needs.
 # Full debuginfo is kept for release (default).
