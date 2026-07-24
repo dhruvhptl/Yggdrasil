@@ -247,6 +247,10 @@ struct CreateLibraryBody {
     title: Option<String>,
     #[serde(default)]
     note: Option<String>,
+    #[serde(default)]
+    local_path: Option<String>,
+    #[serde(default)]
+    tree_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -539,6 +543,22 @@ async fn create_library_handler(
         }
         crate::orchestrator::on_resource_ingested_async(&pool_bg, &app_bg, &client_bg, &id_bg, &queue_bg).await;
     });
+
+    // Fire-and-forget project scan — only when both local_path and tree_id are provided
+    if let (Some(lp), Some(tid)) = (
+        body.local_path.as_ref().filter(|s| !s.is_empty()),
+        body.tree_id.as_ref().filter(|s| !s.is_empty()),
+    ) {
+        let pool = state.pool.clone();
+        let lp = lp.clone();
+        let tid = tid.clone();
+        tokio::spawn(async move {
+            match crate::project_scanner::scan_project(&pool, &lp, &tid).await {
+                Ok(r) => println!("📡 [ext] auto-scan: {} files, {} nodes, {} edges", r.files_scanned, r.nodes_added, r.edges_added),
+                Err(e) => println!("⚠️  [ext] auto-scan failed: {}", e),
+            }
+        });
+    }
 
     (StatusCode::OK, Json(serde_json::json!({
         "id": id,
