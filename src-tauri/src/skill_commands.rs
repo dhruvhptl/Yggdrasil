@@ -1556,7 +1556,7 @@ pub async fn auto_merge_suggested(
 
 // ─── Merge implementation (inner, pool-only) ──────────────────────────────────
 
-async fn merge_skills_inner(canonical_id: &str, alias_ids: &[String], pool: &PgPool) -> Result<(), String> {
+pub(crate) async fn merge_skills_inner(canonical_id: &str, alias_ids: &[String], pool: &PgPool) -> Result<(), String> {
     if alias_ids.is_empty() { return Ok(()); }
 
     let canonical_row = sqlx::query(

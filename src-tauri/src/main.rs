@@ -247,6 +247,7 @@ fn main() {
             daily_commands::move_to_quadrant,
             daily_commands::remove_from_day,
             daily_commands::toggle_task_complete,
+            hitl::execute_destructive_action_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
