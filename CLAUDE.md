@@ -22,7 +22,7 @@ All core features shipped (Phases 0-6 complete):
 
 **Pages:** Homepage, ProjectTreePage, TreesPage, DailyPage (Eisenhower Matrix), ResourcesPage, WorkPage (co-op galaxy), JobsPage (kanban + JD analysis + tailored projects panel), ResumePage, IdeasPage, SkillsPage (canvas lane layout, hover subgraph, zoom-adaptive labels).
 
-**Infrastructure:** Background async job queue (orchestrator.rs, tokio mpsc, cap 64). 11 read-model commands (`read_models.rs`). Shared `reqwest::Client` as Tauri state. Prompt/model version logging (`prompt_logs`). Retrieval logging (`mimir_retrieval_logs`). All migrations (001–047) auto-run on startup.
+**Infrastructure:** Background async job queue (orchestrator.rs, tokio mpsc, cap 64). 11 read-model commands (`read_models.rs`). Shared `reqwest::Client` as Tauri state. Prompt/model version logging (`prompt_logs`). Retrieval logging (`mimir_retrieval_logs`). All migrations (001–052) auto-run on startup.
 
 ### Graph Audit Workflow
 ```
@@ -71,7 +71,7 @@ src-tauri/src/
   idea_commands.rs      # Ideas CRUD
   export_commands.rs    # Tree ZIP export
   database.rs           # PgPool + migrations
-src-tauri/migrations/   # 001–048, auto-run on startup
+src-tauri/migrations/   # 001–052, auto-run on startup
 scraper/main.py         # Python FastAPI (port 3002): /fetch /fetch-pdf /fetch-playlist /discover /health
 dev.sh                  # Bitwarden env loader + launch
 extension/              # Chrome extension (MV3)
@@ -225,7 +225,7 @@ const unlisten = await listen<Payload>('event-name', ({ payload }) => { });
 3. Call from frontend: `invoke('command_name', { params })`
 
 ### Add a Migration
-`src-tauri/migrations/NNN_description.sql` — auto-runs on startup. Never modify existing. Current highest: **047**.
+`src-tauri/migrations/NNN_description.sql` — auto-runs on startup. Never modify existing. Current highest: **052**.
 
 ### Add a New Page
 1. `src/pages/NewPage.tsx`

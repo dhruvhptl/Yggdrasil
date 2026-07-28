@@ -4,6 +4,9 @@
 
 set -e
 
+# Clean up the Hound sidecar when this script exits (Ctrl+C, app quit, or error)
+trap 'taskkill //IM hound.exe //F >/dev/null 2>&1 || true' EXIT
+
 # Ensure BW_SESSION is set for vault access
 if [ -z "$BW_SESSION" ]; then
     echo "BW_SESSION not set. Unlocking Bitwarden..."
@@ -34,9 +37,12 @@ export TREE_GEN_MODEL="google/gemini-2.5-flash"
 export CONCEPT_GRAPH_MODEL="google/gemini-2.5-flash"
 export CONCEPT_GRAPH_BASE_URL="https://openrouter.ai/api/v1/chat/completions"
 export CONCEPT_GRAPH_API_KEY="$OPENROUTER_API_KEY"
-export MIMIR_AGENT_MODEL="llama-3.3-70b-versatile"
-export MIMIR_AGENT_BASE_URL="https://api.groq.com/openai/v1/chat/completions"
-export MIMIR_AGENT_API_KEY="$GROQ_API_KEY"
+# Agent chat model — DeepSeek V4 Flash via OpenRouter (1M ctx, tool_choice support).
+# Fallback: swap MODEL to google/gemini-2.5-flash or qwen/qwen3-coder-flash — no code change.
+# (Qwen-coder-vs-DeepSeek per-turn routing lands with the project/FS tool schema.)
+export MIMIR_AGENT_MODEL="deepseek/deepseek-v4-flash"
+export MIMIR_AGENT_BASE_URL="https://openrouter.ai/api/v1/chat/completions"
+export MIMIR_AGENT_API_KEY="$OPENROUTER_API_KEY"
 # export MIMIR_AGENT_ENABLED="false"   # uncomment to force the classic one-shot chat path
 export MIMIR_PORT="3001"
 
@@ -49,6 +55,18 @@ export MIMIR_PORT="3001"
 # export MIMIR_HYBRID_WEIGHT="0.5" # reserved for weighted combination (RRF is default)
 
 echo "✓ Environment loaded from Bitwarden"
+
+# Start Hound web-research sidecar (optional; MCP server on 127.0.0.1:8765)
+HOUND_EXE="$APPDATA/Python/Python313/Scripts/hound.exe"
+if [ -f "$HOUND_EXE" ]; then
+    echo "🚀 Starting Hound on port 8765..."
+    taskkill //IM hound.exe //F >/dev/null 2>&1 || true
+    "$HOUND_EXE" --http --port 8765 >"${TEMP:-/tmp}/hound.log" 2>&1 &
+    sleep 2
+    echo "✓ Hound launched in background (logs: ${TEMP:-/tmp}/hound.log)"
+else
+    echo "⚠ hound.exe not found at $HOUND_EXE — web tools disabled"
+fi
 
 # Write env file to Tauri app data dir (keeps it current for production builds too)
 APP_DATA_DIR="$APPDATA/com.universal.skilltree"
