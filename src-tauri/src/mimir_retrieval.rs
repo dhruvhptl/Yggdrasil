@@ -967,6 +967,8 @@ pub async fn mimir_chat(
     node_title: Option<String>,
     project_name: Option<String>,
     tree_name: Option<String>,
+    turn_id: String,
+    app: tauri::AppHandle,
     client: tauri::State<'_, reqwest::Client>,
     queue: State<'_, crate::orchestrator::JobQueue>,
     hound: State<'_, crate::hound_client::HoundStatus>,
@@ -1187,6 +1189,8 @@ pub async fn mimir_chat(
                     node_description: node_description.clone(),
                     message: message.clone(),
                     hound_base_url: hound_base_url.clone(),
+                    app: Some(app.clone()),
+                    turn_id: turn_id.clone(),
                 };
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(120),
@@ -1211,8 +1215,11 @@ pub async fn mimir_chat(
     }
 
     // 6c. Resolve answer + sources + stats from whichever path ran.
-    let (answer, sources, stats, pending_approval) = match agent_outcome {
-        Some(r) => (r.answer, r.sources, r.stats, r.pending_approval),
+    let (answer, sources, stats, pending_approval, tool_calls_json, reasoning) = match agent_outcome {
+        Some(r) => {
+            let tcj = serde_json::to_value(&r.tool_calls).unwrap_or(serde_json::Value::Null);
+            (r.answer, r.sources, r.stats, r.pending_approval, tcj, r.reasoning)
+        }
         None => {
             // Classic path: eager retrieval → full prompt → one-shot synthesis.
             let retrieval = run_retrieval(
@@ -1294,7 +1301,7 @@ pub async fn mimir_chat(
                 })),
             );
 
-            (answer, retrieval.sources, retrieval.stats, None)
+            (answer, retrieval.sources, retrieval.stats, None, serde_json::Value::Null, None)
         }
     };
 
@@ -1331,8 +1338,8 @@ pub async fn mimir_chat(
         .bind(sid)
         .bind(&answer)
         .bind(&sources_json)
-        .bind(serde_json::Value::Null)          // tool_calls — Task 2 supplies real value
-        .bind(Option::<String>::None)           // reasoning  — Task 2 supplies real value
+        .bind(&tool_calls_json)
+        .bind(&reasoning)
         .execute(&database.pool)
         .await;
 

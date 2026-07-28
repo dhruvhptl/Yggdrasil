@@ -5,6 +5,7 @@
 // provider exposing that API works (Groq, OpenRouter → Gemini/Claude/GPT...).
 // Default: Groq LLaMA 3.3-70b. Swap via MIMIR_AGENT_{MODEL,BASE_URL,API_KEY}.
 
+use serde::Serialize;
 use serde_json::json;
 use sqlx::Row;
 
@@ -245,6 +246,45 @@ pub(crate) enum AgentStep {
     ToolCalls(Vec<ToolCallReq>),
 }
 
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ToolCallRecord {
+    pub call_index: u32,
+    pub tool_name: String,
+    pub status: String,           // "success" | "error"
+    pub input: serde_json::Value,
+    pub output: Option<String>,
+    pub duration_ms: Option<u64>,
+}
+
+/// Pull the model's chain-of-thought from an assistant message, if present.
+pub(crate) fn extract_reasoning(assistant_msg: &serde_json::Value) -> Option<String> {
+    assistant_msg
+        .get("reasoning")
+        .or_else(|| assistant_msg.get("reasoning_content"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Map Hound web-search results into chat sources so they become citations.
+pub(crate) fn web_results_to_sources(
+    results: &[crate::hound_client::SearchResult],
+) -> Vec<crate::mimir::MimirChatSource> {
+    results
+        .iter()
+        .map(|r| crate::mimir::MimirChatSource {
+            title: r.title.clone(),
+            url: if r.url.is_empty() { None } else { Some(r.url.clone()) },
+            chunk: r.snippet.clone(),
+            score: r.relevance_score,
+            section_title: None,
+            page_start: None,
+            page_end: None,
+        })
+        .collect()
+}
+
 /// Parse one chat-completions response body into either a final answer or a
 /// list of requested tool calls. Also returns the raw assistant message (to
 /// append back into the conversation before tool results).
@@ -332,6 +372,8 @@ pub(crate) struct ToolCtx<'a> {
     pub node_description: Option<String>,
     pub message: String,
     pub hound_base_url: Option<String>,
+    pub app: Option<tauri::AppHandle>,
+    pub turn_id: String,
 }
 
 #[derive(Default)]
@@ -339,6 +381,8 @@ pub(crate) struct AgentTurnState {
     pub sources: Vec<crate::mimir::MimirChatSource>,
     pub stats: crate::mimir_retrieval::RetrievalStats,
     pub tool_calls_made: u32,
+    pub tool_calls: Vec<ToolCallRecord>,
+    pub reasoning: Vec<String>,
 }
 
 /// Drop duplicate sources across multiple search_mimir calls in one turn.
@@ -593,6 +637,7 @@ pub(crate) async fn execute_tool(
             for r in results.iter().take(10) {
                 out.push_str(&format!("- {} — {}\n  {}\n  (source: {})\n", r.title, r.url, r.snippet, r.source));
             }
+            state.sources.extend(web_results_to_sources(&results));
             Ok(out.chars().take(6000).collect())
         }
         "smart_fetch" => {
@@ -641,6 +686,16 @@ pub(crate) struct AgentTurnResult {
     pub stats: crate::mimir_retrieval::RetrievalStats,
     pub tool_calls_made: u32,
     pub pending_approval: Option<crate::hitl::ActionProposal>,
+    pub tool_calls: Vec<ToolCallRecord>,
+    pub reasoning: Option<String>,
+}
+
+/// Emit a `ygg-*` event to the frontend if a Tauri handle is present (no-op in tests).
+fn emit_agent_event<S: serde::Serialize>(ctx: &ToolCtx, event: &str, payload: &S) {
+    if let Some(app) = &ctx.app {
+        use tauri::Emitter;
+        let _ = app.emit(event, payload);
+    }
 }
 
 const MAX_TOOL_CALLS: u32 = 6;
@@ -670,6 +725,11 @@ pub(crate) async fn run_agent_turn(
         let (step, assistant_msg) =
             call_agent_llm(ctx.client, cfg, &messages, &tools, force_answer).await?;
 
+        if let Some(reason) = extract_reasoning(&assistant_msg) {
+            emit_agent_event(ctx, "ygg-agent-think", &json!({ "turnId": ctx.turn_id, "text": reason }));
+            state.reasoning.push(reason);
+        }
+
         match step {
             AgentStep::Answer(content) => {
                 if content.trim().is_empty() {
@@ -685,12 +745,16 @@ pub(crate) async fn run_agent_turn(
                     None,
                     Some(json!({ "tool_calls_made": state.tool_calls_made })),
                 );
+                let tool_calls = state.tool_calls.clone();
+                let reasoning = if state.reasoning.is_empty() { None } else { Some(state.reasoning.join("\n\n")) };
                 return Ok(AgentTurnResult {
                     answer: content,
                     sources: dedup_sources(state.sources),
                     stats: state.stats,
                     tool_calls_made: state.tool_calls_made,
                     pending_approval: None,
+                    tool_calls,
+                    reasoning,
                 });
             }
             AgentStep::ToolCalls(calls) => {
@@ -702,12 +766,16 @@ pub(crate) async fn run_agent_turn(
                             t0.elapsed().as_millis() as i64, true, None,
                             Some(json!({ "action_type": proposal.action_type })),
                         );
+                        let tool_calls = state.tool_calls.clone();
+                        let reasoning = if state.reasoning.is_empty() { None } else { Some(state.reasoning.join("\n\n")) };
                         return Ok(AgentTurnResult {
                             answer: format!("I'd like to {}. Approve?", proposal.summary),
                             sources: dedup_sources(state.sources),
                             stats: state.stats,
                             tool_calls_made: state.tool_calls_made,
                             pending_approval: Some(proposal),
+                            tool_calls,
+                            reasoning,
                         });
                     }
                     if state.tool_calls_made >= MAX_TOOL_CALLS {
@@ -719,16 +787,29 @@ pub(crate) async fn run_agent_turn(
                         continue;
                     }
                     state.tool_calls_made += 1;
-                    println!("🛠  [agent] tool call {}/{}: {}", state.tool_calls_made, MAX_TOOL_CALLS, call.name);
+                    let call_index = state.tool_calls_made;
+                    println!("🛠  [agent] tool call {}/{}: {}", call_index, MAX_TOOL_CALLS, call.name);
+                    emit_agent_event(ctx, "ygg-agent-tool", &json!({
+                        "turnId": ctx.turn_id, "callIndex": call_index, "toolName": call.name.clone(),
+                        "status": "running", "input": call.arguments.clone(),
+                    }));
+                    let started = std::time::Instant::now();
                     let observation = match execute_tool(&call.name, &call.arguments, ctx, &mut state).await {
                         Ok(o) => o,
                         Err(e) => format!("Tool error: {}", e),
                     };
-                    messages.push(json!({
-                        "role": "tool",
-                        "tool_call_id": call.id,
-                        "content": observation
+                    let duration_ms = started.elapsed().as_millis() as u64;
+                    let status = if observation.starts_with("Tool error:") { "error" } else { "success" };
+                    let output_preview = crate::text_util::truncate_chars(&observation, 500);
+                    emit_agent_event(ctx, "ygg-agent-tool", &json!({
+                        "turnId": ctx.turn_id, "callIndex": call_index, "toolName": call.name.clone(),
+                        "status": status, "output": output_preview, "durationMs": duration_ms,
                     }));
+                    state.tool_calls.push(ToolCallRecord {
+                        call_index, tool_name: call.name.clone(), status: status.to_string(),
+                        input: call.arguments.clone(), output: Some(output_preview), duration_ms: Some(duration_ms),
+                    });
+                    messages.push(json!({ "role": "tool", "tool_call_id": call.id, "content": observation }));
                 }
             }
         }
@@ -859,5 +940,34 @@ mod tests {
         let out = dedup_sources(sources);
         assert_eq!(out.len(), 3);
         assert_eq!(out[0].score, 1.0); // first occurrence wins
+    }
+
+    #[test]
+    fn extract_reasoning_reads_reasoning_fields() {
+        let with = json!({ "role": "assistant", "reasoning": "  I should search first.  " });
+        assert_eq!(extract_reasoning(&with).as_deref(), Some("I should search first."));
+        let alt = json!({ "role": "assistant", "reasoning_content": "alt" });
+        assert_eq!(extract_reasoning(&alt).as_deref(), Some("alt"));
+        let none = json!({ "role": "assistant", "content": "hi" });
+        assert_eq!(extract_reasoning(&none), None);
+        let empty = json!({ "role": "assistant", "reasoning": "   " });
+        assert_eq!(extract_reasoning(&empty), None);
+    }
+
+    #[test]
+    fn web_results_map_to_sources_with_url_and_score() {
+        let results = vec![crate::hound_client::SearchResult {
+            title: "T".into(), url: "https://x".into(), snippet: "s".into(),
+            relevance_score: 0.9, source: "brave".into(),
+        }];
+        let s = web_results_to_sources(&results);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].title, "T");
+        assert_eq!(s[0].url.as_deref(), Some("https://x"));
+        assert_eq!(s[0].chunk, "s");
+        assert!((s[0].score - 0.9).abs() < 1e-6);
+
+        let empty_url = vec![crate::hound_client::SearchResult { url: "".into(), ..Default::default() }];
+        assert_eq!(web_results_to_sources(&empty_url)[0].url, None);
     }
 }
