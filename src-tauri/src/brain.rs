@@ -98,7 +98,7 @@ async fn generate_skill_tree_inner_with_context(
     };
 
     // Fix 3: Cap PRD text at 6000 chars for the outline input
-    let prd_excerpt = if prd_text.len() > 6000 { &prd_text[..6000] } else { &prd_text };
+    let prd_excerpt = crate::text_util::truncate_chars(&prd_text, 6000);
 
     // Phase 2: Two-stage tree generation
     let outline_user_prompt = if let Some(ref gc) = graph_context {
@@ -122,14 +122,14 @@ async fn generate_skill_tree_inner_with_context(
                 project_id,
                 gc,
                 prd_profile_section,
-                if prd_text.len() > 1500 { &prd_text[..1500] } else { &prd_text }
+                crate::text_util::truncate_chars(&prd_text, 1500)
             )
         } else {
             format!(
                 "Project ID: {}\n\n{}\nPRD excerpt:\n{}",
                 project_id,
                 prd_profile_section,
-                if prd_text.len() > 2000 { &prd_text[..2000] } else { &prd_text }
+                crate::text_util::truncate_chars(&prd_text, 2000)
             )
         }
     } else {
@@ -139,13 +139,13 @@ async fn generate_skill_tree_inner_with_context(
                 "Project ID: {}\n\n{}\n\nPRD:\n{}",
                 project_id,
                 gc,
-                if prd_text.len() > 2000 { &prd_text[..2000] } else { &prd_text }
+                crate::text_util::truncate_chars(&prd_text, 2000)
             )
         } else {
             format!(
                 "Project ID: {}\n\nProject description:\n{}",
                 project_id,
-                if prd_text.len() > 3000 { &prd_text[..3000] } else { &prd_text }
+                crate::text_util::truncate_chars(&prd_text, 3000)
             )
         }
     };
@@ -414,7 +414,7 @@ async fn analyze_repo_inner(
                     };
                     let author = c["commit"]["author"]["name"].as_str().unwrap_or("unknown");
                     let date = c["commit"]["author"]["date"].as_str().unwrap_or("");
-                    let date_short = &date[..date.len().min(10)];
+                    let date_short = crate::text_util::truncate_chars(date, 10);
                     Some(format!("[{}] {} — {} ({})", sha, msg, author, date_short))
                 })
                 .collect()
@@ -477,7 +477,7 @@ async fn analyze_repo_inner(
                     let number = pr["number"].as_i64()?;
                     let title = pr["title"].as_str().unwrap_or("");
                     let merged_at = pr["merged_at"].as_str().unwrap_or("");
-                    let date_short = &merged_at[..merged_at.len().min(10)];
+                    let date_short = crate::text_util::truncate_chars(merged_at, 10);
                     Some(format!("#{}: {} (merged {})", number, title, date_short))
                 })
                 .collect()
@@ -587,10 +587,10 @@ async fn analyze_repo_inner(
 
     if let Some(ref paper) = paper_text {
         // Cap at 20k chars so a long paper doesn't blow the tree-gen context budget
-        let truncated = if paper.len() > 20_000 { &paper[..20_000] } else { paper.as_str() };
+        let truncated = crate::text_util::truncate_chars(paper, 20_000);
         context.push_str("## PAPER CONTEXT\n\n");
         context.push_str("The following reference paper describes the theoretical background this repository implements. Use it to anchor concepts, terminology, and learning progression.\n\n");
-        context.push_str(truncated);
+        context.push_str(&truncated);
         context.push_str("\n\n");
     }
 
@@ -638,16 +638,16 @@ async fn analyze_repo_inner(
         format!(
             "Repository: {}/{}\n\n{}",
             owner, repo,
-            if context.len() > 3000 { &context[..3000] } else { &context }
+            crate::text_util::truncate_chars(&context, 3000)
         )
     };
 
     if let Some(ref paper) = paper_text {
         // Per-skill expansion happens once per skill (often 9+ calls) — keep the
         // paper slice small so we don't multiply token cost by the fanout.
-        let snippet = if paper.len() > 4_000 { &paper[..4_000] } else { paper.as_str() };
+        let snippet = crate::text_util::truncate_chars(paper, 4_000);
         expansion_context.push_str("\n\n## PAPER CONTEXT (reference material)\n\n");
-        expansion_context.push_str(snippet);
+        expansion_context.push_str(&snippet);
     }
 
     let tree_model = std::env::var("TREE_GEN_MODEL")

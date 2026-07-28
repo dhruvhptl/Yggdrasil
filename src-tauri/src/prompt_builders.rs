@@ -159,7 +159,7 @@ pub(crate) async fn extract_concept_graph(
     pool: Option<&sqlx::PgPool>,
 ) -> Result<ConceptGraph, String> {
     let user_prompt = if let Some(paper) = paper_context {
-        let truncated = if paper.len() > 20_000 { &paper[..20_000] } else { paper };
+        let truncated = crate::text_util::truncate_chars(paper, 20_000);
         format!(
             "## PAPER / THEORY CONTEXT\n\nThe following reference paper describes the theoretical background this project implements. Use it to decide which concepts matter and which files contain the core logic.\n\n{}\n\n---\n\nExtract the concept dependency graph from this project:\n\n{}\n\nGenerate the concept graph JSON:",
             truncated, context
@@ -206,7 +206,7 @@ pub(crate) async fn extract_concept_graph(
     let preview_len = raw_graph_json.len().min(600);
     println!("🔎 Concept graph raw response ({} chars): {}{}",
         raw_graph_json.len(),
-        &raw_graph_json[..preview_len],
+        crate::text_util::truncate_chars(&raw_graph_json, preview_len),
         if raw_graph_json.len() > preview_len { "…" } else { "" }
     );
 
@@ -214,7 +214,7 @@ pub(crate) async fn extract_concept_graph(
 
     // Parse via Value first to tolerate LLM quirks like duplicate keys
     let value: serde_json::Value = serde_json::from_str(&graph_json)
-        .map_err(|e| format!("Concept graph JSON is not valid JSON: {} (raw preview: {}…)", e, &raw_graph_json[..raw_graph_json.len().min(200)]))?;
+        .map_err(|e| format!("Concept graph JSON is not valid JSON: {} (raw preview: {}…)", e, crate::text_util::truncate_chars(&raw_graph_json, 200)))?;
     let graph: ConceptGraph = serde_json::from_value(value)
         .map_err(|e| format!("Concept graph JSON doesn't match schema: {}", e))?;
 
@@ -469,7 +469,7 @@ pub(crate) async fn build_prd_profile(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let prd_excerpt = if prd_text.len() > 4000 { &prd_text[..4000] } else { prd_text };
+    let prd_excerpt = crate::text_util::truncate_chars(prd_text, 4000);
 
     let user_prompt = format!(
         "PRD:\n{}\n\nConcept graph ({} concepts, topologically sorted):\n{}\n\nGenerate the project profile JSON:",
@@ -1150,7 +1150,7 @@ async fn expand_skill_checkpoints(
     }
 
     let expansion: CheckpointExpansion = serde_json::from_str(&repaired)
-        .map_err(|e| format!("Checkpoint expansion parse failed for '{}': {} (raw: {}…)", skill.name, e, &raw[..raw.len().min(200)]))?;
+        .map_err(|e| format!("Checkpoint expansion parse failed for '{}': {} (raw: {}…)", skill.name, e, crate::text_util::truncate_chars(&raw, 200)))?;
 
     if expansion.checkpoints.is_empty() {
         return Err(format!("Skill '{}' expansion returned zero checkpoints", skill.name));
@@ -1205,7 +1205,7 @@ pub(crate) async fn generate_tree_two_stage(
     let raw_preview_len = raw_outline.len().min(600);
     println!("🔎 Outline raw ({} chars): {}{}",
         raw_outline.len(),
-        &raw_outline[..raw_preview_len],
+        crate::text_util::truncate_chars(&raw_outline, raw_preview_len),
         if raw_outline.len() > raw_preview_len { "…" } else { "" }
     );
 
@@ -1219,7 +1219,7 @@ pub(crate) async fn generate_tree_two_stage(
     // Step 2: fix `[ { {` duplicate-open-brace pattern
     let (deduped_outline, was_deduped) = repair_duplicate_open_braces(&cleaned_outline);
     if was_deduped {
-        let deduped_preview = &deduped_outline[..deduped_outline.len().min(400)];
+        let deduped_preview = crate::text_util::truncate_chars(&deduped_outline, 400);
         println!("⚠️  Outline: duplicate-brace repair applied. After repair: {}…", deduped_preview);
     }
 
@@ -1233,7 +1233,7 @@ pub(crate) async fn generate_tree_two_stage(
         .map_err(|e| format!(
             "Outline JSON malformed after cleanup/repair: {} (raw preview: {}…)",
             e,
-            &raw_outline[..raw_outline.len().min(300)]
+            crate::text_util::truncate_chars(&raw_outline, 300)
         ))?;
     outline.project_id = project_id.to_string();
 

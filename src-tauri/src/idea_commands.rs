@@ -144,7 +144,7 @@ pub async fn idea_to_project(
     // First non-empty line → name (capped at 120 chars).
     let mut lines = content.lines();
     let raw_name = lines.next().unwrap_or("New Project").trim().to_string();
-    let name = if raw_name.len() > 120 { raw_name[..120].to_string() } else { raw_name };
+    let name = crate::text_util::truncate_chars(&raw_name, 120);
     let description = lines.collect::<Vec<_>>().join("\n").trim().to_string();
 
     let project_id = Uuid::new_v4().to_string();

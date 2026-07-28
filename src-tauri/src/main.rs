@@ -34,6 +34,7 @@ mod hitl;
 mod project_scanner;
 mod mimir_memory;
 mod mimir_agent;
+mod text_util;
 
 use database::Database;
 use tauri::Manager;

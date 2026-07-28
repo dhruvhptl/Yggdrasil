@@ -708,7 +708,7 @@ pub(crate) async fn run_retrieval(
             let rerank_chunks: String = candidates
                 .iter()
                 .enumerate()
-                .map(|(i, c)| format!("[{}] {}", i, &c.content[..c.content.len().min(200)]))
+                .map(|(i, c)| format!("[{}] {}", i, c.content.chars().take(200).collect::<String>()))
                 .collect::<Vec<_>>()
                 .join("\n");
 

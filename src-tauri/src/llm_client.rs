@@ -433,7 +433,7 @@ pub(crate) async fn call_llm(
     }
 
     let parsed: GroqResponse = serde_json::from_str(&response_text)
-        .map_err(|e| format!("Failed to parse LLM response: {}\nRaw: {}", e, &response_text[..response_text.len().min(500)]))?;
+        .map_err(|e| format!("Failed to parse LLM response: {}\nRaw: {}", e, crate::text_util::truncate_chars(&response_text, 500)))?;
 
     Ok((parsed.choices[0].message.content.clone(), latency_ms))
 }

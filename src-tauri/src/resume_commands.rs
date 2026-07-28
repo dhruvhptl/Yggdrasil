@@ -181,7 +181,7 @@ pub async fn parse_resume(
     println!("Got profile response: {} chars", profile_json.len());
 
     let profile: ParsedProfileAI = serde_json::from_str(&profile_json)
-        .map_err(|e| format!("Failed to parse profile AI response: {}. Raw: {}", e, &profile_json[..200.min(profile_json.len())]))?;
+        .map_err(|e| format!("Failed to parse profile AI response: {}. Raw: {}", e, crate::text_util::truncate_chars(&profile_json, 200)))?;
 
     // ── Call 2: Extract projects ────────────────────────────────────────────────
     println!("Calling Groq API — Call 2: project extraction…");
@@ -202,7 +202,7 @@ pub async fn parse_resume(
     println!("Got projects response: {} chars", projects_json.len());
 
     let projects_parsed: ParsedProjectsAI = serde_json::from_str(&projects_json)
-        .map_err(|e| format!("Failed to parse projects AI response: {}. Raw: {}", e, &projects_json[..200.min(projects_json.len())]))?;
+        .map_err(|e| format!("Failed to parse projects AI response: {}. Raw: {}", e, crate::text_util::truncate_chars(&projects_json, 200)))?;
 
     // ── Save to database ────────────────────────────────────────────────────────
 
