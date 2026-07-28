@@ -52,6 +52,8 @@ export const StoredChatMessageSchema = z.object({
   role: z.string(),
   content: z.string(),
   sources: z.array(SourceSchema).nullable(),
+  toolCalls: z.array(z.unknown()).nullable().optional(),
+  reasoning: z.string().nullable().optional(),
   createdAt: z.string(),
 });
 

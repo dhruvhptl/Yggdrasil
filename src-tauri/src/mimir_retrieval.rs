@@ -1324,13 +1324,15 @@ pub async fn mimir_chat(
 
         let asst_msg_id = uuid::Uuid::new_v4().to_string();
         let _ = sqlx::query(
-            "INSERT INTO mimir_chat_messages (id, session_id, role, content, sources) \
-             VALUES ($1, $2, 'assistant', $3, $4)"
+            "INSERT INTO mimir_chat_messages (id, session_id, role, content, sources, tool_calls, reasoning) \
+             VALUES ($1, $2, 'assistant', $3, $4, $5, $6)"
         )
         .bind(&asst_msg_id)
         .bind(sid)
         .bind(&answer)
         .bind(&sources_json)
+        .bind(serde_json::Value::Null)          // tool_calls — Task 2 supplies real value
+        .bind(Option::<String>::None)           // reasoning  — Task 2 supplies real value
         .execute(&database.pool)
         .await;
 
@@ -1521,7 +1523,7 @@ pub async fn get_chat_session(
     let session_id: String = session_row.try_get("id").map_err(|e| e.to_string())?;
 
     let rows = sqlx::query(
-        "SELECT id, role, content, sources, \
+        "SELECT id, role, content, sources, tool_calls, reasoning, \
                 created_at::TEXT AS created_at \
          FROM mimir_chat_messages \
          WHERE session_id = $1 \
@@ -1535,14 +1537,14 @@ pub async fn get_chat_session(
 
     let messages = rows.iter().map(|row| {
         let sources_val: Option<serde_json::Value> = row.try_get("sources").ok();
-        let sources: Option<Vec<MimirChatSource>> = sources_val.and_then(|v| {
-            serde_json::from_value(v).ok()
-        });
+        let sources: Option<Vec<MimirChatSource>> = sources_val.and_then(|v| serde_json::from_value(v).ok());
         StoredChatMessage {
             id: row.try_get("id").unwrap_or_default(),
             role: row.try_get("role").unwrap_or_default(),
             content: row.try_get("content").unwrap_or_default(),
             sources,
+            tool_calls: row.try_get::<Option<serde_json::Value>, _>("tool_calls").unwrap_or(None),
+            reasoning: row.try_get::<Option<String>, _>("reasoning").unwrap_or(None),
             created_at: row.try_get("created_at").unwrap_or_default(),
         }
     }).collect();

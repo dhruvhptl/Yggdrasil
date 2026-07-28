@@ -123,6 +123,8 @@ pub struct StoredChatMessage {
     pub role: String,
     pub content: String,
     pub sources: Option<Vec<MimirChatSource>>,
+    pub tool_calls: Option<serde_json::Value>,
+    pub reasoning: Option<String>,
     pub created_at: String,
 }
 
