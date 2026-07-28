@@ -81,7 +81,7 @@ pub(crate) fn tool_schemas(hound_available: bool) -> Vec<serde_json::Value> {
                         "fact_key": { "type": "string", "description": "snake_case key, e.g. 'career_goal'" },
                         "fact_value": { "type": "string", "description": "Short value, e.g. 'transition into ML engineering'" },
                         "entity_id": { "type": "string", "description": "Optional: id of the node/resource this fact is about, when it concerns a specific one." },
-                        "confidence": { "type": "number", "description": "0.0-1.0, how certain the fact is. Default 0.7." }
+                        "confidence": { "type": ["number", "string"], "description": "0.0-1.0, how certain the fact is. Default 0.7." }
                     },
                     "required": ["fact_key", "fact_value"]
                 }
@@ -149,7 +149,7 @@ pub(crate) fn tool_schemas(hound_available: bool) -> Vec<serde_json::Value> {
                     "type": "object",
                     "properties": {
                         "query": { "type": "string", "description": "The search query — be specific." },
-                        "count": { "type": "integer", "description": "Number of results (max 10, default 6)." }
+                        "count": { "type": ["integer", "string"], "description": "Number of results (max 10, default 6)." }
                     },
                     "required": ["query"]
                 }
@@ -432,7 +432,11 @@ pub(crate) async fn execute_tool(
                 }
                 v => v,
             };
-            let confidence = args["confidence"].as_f64().unwrap_or(0.7);
+            // Groq LLaMA sometimes sends a stringified number ("0.0"); accept either.
+            let confidence = args["confidence"]
+                .as_f64()
+                .or_else(|| args["confidence"].as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+                .unwrap_or(0.7);
             let entity_id = args["entity_id"].as_str().filter(|s| !s.is_empty());
             let user_key = crate::mimir_memory::is_user_scope_key(&fact_key);
             let scope = if user_key { "user" } else if ctx.tree_id.is_some() { "tree" } else { "user" };
@@ -577,7 +581,10 @@ pub(crate) async fn execute_tool(
                 return Ok("Web search is not available (Hound is not running).".to_string());
             };
             let query = args["query"].as_str().unwrap_or(&ctx.message).to_string();
-            let count = args["count"].as_u64().map(|n| n as u32);
+            let count = args["count"]
+                .as_u64()
+                .or_else(|| args["count"].as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                .map(|n| n as u32);
             let results = crate::hound_client::smart_search(ctx.client, base_url, &query, count).await?;
             if results.is_empty() {
                 return Ok(format!("No web results found for '{}'.", query));
