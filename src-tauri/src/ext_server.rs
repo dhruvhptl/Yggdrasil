@@ -544,20 +544,15 @@ async fn create_library_handler(
         crate::orchestrator::on_resource_ingested_async(&pool_bg, &app_bg, &client_bg, &id_bg, &queue_bg).await;
     });
 
-    // Fire-and-forget project scan — only when both local_path and tree_id are provided
+    // Enqueue a background project scan when both local_path and tree_id are provided
     if let (Some(lp), Some(tid)) = (
         body.local_path.as_ref().filter(|s| !s.is_empty()),
         body.tree_id.as_ref().filter(|s| !s.is_empty()),
     ) {
-        let pool = state.pool.clone();
-        let lp = lp.clone();
-        let tid = tid.clone();
-        tokio::spawn(async move {
-            match crate::project_scanner::scan_project_inner(&pool, &lp, &tid).await {
-                Ok(r) => println!("📡 [ext] auto-scan: {} files, {} nodes, {} edges", r.files_scanned, r.nodes_added, r.edges_added),
-                Err(e) => println!("⚠️  [ext] auto-scan failed: {}", e),
-            }
-        });
+        let _ = state.queue.send(crate::orchestrator::OrchestratorJob::ScanProject {
+            path: lp.clone(),
+            tree_id: tid.clone(),
+        }).await;
     }
 
     (StatusCode::OK, Json(serde_json::json!({

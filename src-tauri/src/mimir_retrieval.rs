@@ -1191,6 +1191,7 @@ pub async fn mimir_chat(
                     hound_base_url: hound_base_url.clone(),
                     app: Some(app.clone()),
                     turn_id: turn_id.clone(),
+                    queue: Some(&queue),
                 };
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(120),

@@ -374,6 +374,7 @@ pub(crate) struct ToolCtx<'a> {
     pub hound_base_url: Option<String>,
     pub app: Option<tauri::AppHandle>,
     pub turn_id: String,
+    pub queue: Option<&'a crate::orchestrator::JobQueue>,
 }
 
 #[derive(Default)]
@@ -664,15 +665,16 @@ pub(crate) async fn execute_tool(
             let Some(tree_id) = ctx.tree_id.as_deref() else {
                 return Ok("No active tree to scan into — open a tree first.".to_string());
             };
-            let r = crate::project_scanner::scan_project_inner(ctx.pool, path, tree_id).await?;
-            let mut msg = format!(
-                "Scanned {} files ({} skipped). Added {} new concepts, enriched {} existing, added {} edges.",
-                r.files_scanned, r.files_skipped, r.nodes_added, r.nodes_enriched, r.edges_added
-            );
-            if !r.errors.is_empty() {
-                msg.push_str(&format!(" {} file(s) had errors and were skipped.", r.errors.len()));
-            }
-            Ok(msg)
+            let Some(queue) = ctx.queue else {
+                return Ok("Background scanning is unavailable right now.".to_string());
+            };
+            queue
+                .send(crate::orchestrator::OrchestratorJob::ScanProject {
+                    path: path.to_string(),
+                    tree_id: tree_id.to_string(),
+                })
+                .await?;
+            Ok(format!("Scan of '{}' started in the background — I'll surface the results when it finishes.", path))
         }
         other => Err(format!("unknown tool '{}'", other)),
     }
