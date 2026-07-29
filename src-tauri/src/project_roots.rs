@@ -10,7 +10,9 @@ pub(crate) struct ProjectRoot {
     pub path: String,
 }
 
-const DENY_COMPONENTS: &[&str] = &[".git", ".ssh", ".aws", ".gnupg"];
+const DENY_COMPONENTS: &[&str] = &[
+    ".git", ".ssh", ".aws", ".gnupg", ".docker", ".kube", ".azure", ".gcloud",
+];
 
 /// True if the canonical path is secret-adjacent (a blocked dir component or a
 /// secret-looking file name). Case-insensitive.
@@ -26,9 +28,11 @@ pub(crate) fn is_denied(canon: &Path) -> bool {
     if let Some(name) = canon.file_name().map(|n| n.to_string_lossy().to_lowercase()) {
         if name == ".env" || name.starts_with(".env.") { return true; }
         if name.ends_with(".pem") || name.ends_with(".key") { return true; }
+        if name.ends_with(".p12") || name.ends_with(".pfx") || name.ends_with(".jks") || name.ends_with(".keystore") { return true; }
         if name.starts_with("id_") { return true; }
         if name.starts_with("credentials") { return true; }
-        if name == ".git-credentials" || name == ".npmrc" { return true; }
+        if name == ".netrc" || name == ".pgpass" { return true; }
+        if name == ".git-credentials" || name == ".npmrc" || name == ".dockercfg" || name == ".pypirc" || name == ".htpasswd" { return true; }
     }
     false
 }
@@ -167,6 +171,25 @@ mod tests {
         let f = ssh.join("id_rsa");
         fs::write(&f, "KEY").unwrap();
         assert!(resolve_safe_path(f.to_str().unwrap(), &[root_of(&root)]).is_err());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn rejects_expanded_secret_files_and_dirs() {
+        let root = tmp_root();
+        let roots = [root_of(&root)];
+        for name in [".netrc", ".pgpass", "keystore.p12", "cert.pfx", "app.jks", ".dockercfg", ".pypirc", ".htpasswd"] {
+            let f = root.join(name);
+            fs::write(&f, "x").unwrap();
+            assert!(resolve_safe_path(f.to_str().unwrap(), &roots).is_err(), "{} should be denied", name);
+        }
+        for dir in [".docker", ".kube", ".azure", ".gcloud"] {
+            let d = root.join(dir);
+            fs::create_dir_all(&d).unwrap();
+            let f = d.join("config");
+            fs::write(&f, "x").unwrap();
+            assert!(resolve_safe_path(f.to_str().unwrap(), &roots).is_err(), "{}/config should be denied", dir);
+        }
         fs::remove_dir_all(&root).ok();
     }
 
