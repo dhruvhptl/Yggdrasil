@@ -2,12 +2,16 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useLocation, useNavigate } from "react-router-dom";
-import { emit } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { Send, X, Loader2, ExternalLink, Trash2, BarChart2, Cpu, CheckCircle, ArrowRight, HelpCircle, Plus, Search } from "lucide-react";
 import { useMimirContext } from "../contexts/MimirContext";
 import { validateOrLog, MimirChatResponseSchema } from "../lib/validators";
 import type { NodeChatContext, Suggestion } from "../types";
 import { HitlConfirmation, type ActionProposal } from "./HitlConfirmation";
+import { ToolCallBlock } from "./ui/ToolCallBlock";
+import { SourceCard } from "./ui/SourceCard";
+import { tokenizeCitations } from "../lib/citations";
+import type { ToolStatus } from "./ui/StatusBadge";
 
 interface Source {
   title: string;
@@ -19,6 +23,15 @@ interface Source {
   pageEnd: number | null;
 }
 
+interface LiveToolCall {
+  callIndex: number;
+  toolName: string;
+  status: ToolStatus;
+  input?: unknown;
+  output?: string;
+  durationMs?: number;
+}
+
 interface ChatMessage {
   role: "user" | "mimir";
   content: string;
@@ -26,6 +39,10 @@ interface ChatMessage {
   suggestions?: Suggestion[];
   createdAt?: string;
   pendingApproval?: ActionProposal | null;
+  toolCalls?: LiveToolCall[];
+  reasoning?: string;
+  /** Per-turn id used to route live ygg-agent-tool/ygg-agent-think events to this message while it's in flight. */
+  turnId?: string;
 }
 
 interface StoredChatMessage {
@@ -33,6 +50,8 @@ interface StoredChatMessage {
   role: string;
   content: string;
   sources: Source[] | null;
+  toolCalls?: LiveToolCall[] | null;
+  reasoning?: string | null;
   createdAt: string;
 }
 
@@ -154,6 +173,8 @@ export default function MimirChat({
         content: m.content,
         sources: m.sources ?? undefined,
         createdAt: m.createdAt,
+        toolCalls: m.toolCalls ?? undefined,
+        reasoning: m.reasoning ?? undefined,
       }));
       setMessages(loaded);
       setResumed(true);
@@ -203,9 +224,53 @@ export default function MimirChat({
     const msg = input.trim();
     if (!msg || loading) return;
 
+    const turnId = crypto.randomUUID();
+
     setInput("");
-    setMessages((prev) => [...prev, { role: "user", content: msg }]);
+    setMessages((prev) => [
+      ...prev,
+      { role: "user", content: msg },
+      { role: "mimir", content: "", turnId, toolCalls: [] },
+    ]);
     setLoading(true);
+
+    // Live agent visibility — route ygg-agent-tool/ygg-agent-think events for this
+    // turn onto the pending assistant message, matched by turnId (not array index,
+    // which can go stale if setMessages runs between updates).
+    const unlistenTool = await listen<LiveToolCall & { turnId: string }>("ygg-agent-tool", ({ payload }) => {
+      if (payload.turnId !== turnId) return;
+      setMessages((prev) => {
+        const idx = prev.findIndex((m) => m.turnId === turnId);
+        if (idx === -1) return prev;
+        const target = prev[idx];
+        const calls = [...(target.toolCalls ?? [])];
+        const at = calls.findIndex((c) => c.callIndex === payload.callIndex);
+        const rec: LiveToolCall = {
+          callIndex: payload.callIndex,
+          toolName: payload.toolName,
+          status: payload.status,
+          input: payload.input,
+          output: payload.output,
+          durationMs: payload.durationMs,
+        };
+        if (at >= 0) calls[at] = { ...calls[at], ...rec };
+        else calls.push(rec);
+        const next = [...prev];
+        next[idx] = { ...target, toolCalls: calls };
+        return next;
+      });
+    });
+    const unlistenThink = await listen<{ turnId: string; text: string }>("ygg-agent-think", ({ payload }) => {
+      if (payload.turnId !== turnId) return;
+      setMessages((prev) => {
+        const idx = prev.findIndex((m) => m.turnId === turnId);
+        if (idx === -1) return prev;
+        const target = prev[idx];
+        const next = [...prev];
+        next[idx] = { ...target, reasoning: [target.reasoning, payload.text].filter(Boolean).join("\n\n") };
+        return next;
+      });
+    });
 
     try {
       const raw = await invoke("mimir_chat", {
@@ -216,29 +281,50 @@ export default function MimirChat({
         nodeTitle,
         projectName,
         treeName,
+        turnId,
       });
       const response = validateOrLog(MimirChatResponseSchema, raw, 'mimir_chat') as MimirChatResponse;
       setResumed(false);
       setSuggestionTapped(false);
 
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "mimir",
+      setMessages((prev) => {
+        const idx = prev.findIndex((m) => m.turnId === turnId);
+        if (idx === -1) {
+          return [
+            ...prev,
+            {
+              role: "mimir",
+              content: response.answer,
+              sources: response.sources,
+              suggestions: response.suggestions ?? [],
+              pendingApproval: response.pendingApproval ?? null,
+            },
+          ];
+        }
+        const next = [...prev];
+        next[idx] = {
+          ...next[idx],
           content: response.answer,
           sources: response.sources,
           suggestions: response.suggestions ?? [],
           pendingApproval: response.pendingApproval ?? null,
-        },
-      ]);
+        };
+        return next;
+      });
+      unlistenTool();
+      unlistenThink();
     } catch (e) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "mimir",
-          content: `Error: ${e}`,
-        },
-      ]);
+      setMessages((prev) => {
+        const idx = prev.findIndex((m) => m.turnId === turnId);
+        if (idx === -1) {
+          return [...prev, { role: "mimir", content: `Error: ${e}` }];
+        }
+        const next = [...prev];
+        next[idx] = { ...next[idx], content: `Error: ${e}` };
+        return next;
+      });
+      unlistenTool();
+      unlistenThink();
     } finally {
       setLoading(false);
     }
@@ -681,7 +767,40 @@ export default function MimirChat({
                       whiteSpace: "pre-wrap",
                     }}
                   >
-                    {msg.content}
+                    {/* Collapsed-by-default agent reasoning trace */}
+                    {msg.reasoning && (
+                      <details className="mb-2 text-xs opacity-60">
+                        <summary className="cursor-pointer select-none">🤔 Thinking</summary>
+                        <pre className="mt-1 whitespace-pre-wrap break-words">{msg.reasoning}</pre>
+                      </details>
+                    )}
+                    {/* Live/persisted tool-call trace */}
+                    {msg.toolCalls?.map((tc) => (
+                      <div className="mb-1" key={tc.callIndex}>
+                        <ToolCallBlock
+                          toolName={tc.toolName}
+                          status={tc.status}
+                          input={tc.input}
+                          output={tc.output}
+                          durationMs={tc.durationMs}
+                        />
+                      </div>
+                    ))}
+                    {tokenizeCitations(msg.content).map((t, k) =>
+                      t.kind === "text" ? (
+                        <span key={k}>{t.text}</span>
+                      ) : (
+                        <a
+                          key={k}
+                          href={msg.sources?.[t.index - 1]?.url ?? undefined}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-blue-400"
+                        >
+                          [{t.index}]
+                        </a>
+                      )
+                    )}
                   </div>
                   {/* HITL confirmation card for destructive action proposals */}
                   {msg.pendingApproval && (
@@ -691,18 +810,11 @@ export default function MimirChat({
                       onResolved={(resultMessage) => handleApprovalResolved(i, resultMessage)}
                     />
                   )}
-                  {/* Source badges */}
+                  {/* Source cards */}
                   {msg.sources && msg.sources.length > 0 && (
-                    <div
-                      style={{
-                        display: "flex",
-                        flexWrap: "wrap",
-                        gap: 4,
-                        marginTop: 6,
-                      }}
-                    >
+                    <div className="mt-2 space-y-1">
                       {msg.sources.map((src, j) => (
-                        <SourceBadge key={j} source={src} />
+                        <SourceCard key={j} index={j + 1} title={src.title} url={src.url} snippet={src.chunk} />
                       ))}
                     </div>
                   )}
@@ -861,73 +973,3 @@ export default function MimirChat({
   );
 }
 
-// ─── Source Badge ────────────────────────────────────────────────────────────
-
-function SourceBadge({ source }: { source: Source }) {
-  const pageLabel = source.pageStart != null
-    ? source.pageEnd != null && source.pageEnd !== source.pageStart
-      ? `pp. ${source.pageStart}–${source.pageEnd}`
-      : `p. ${source.pageStart}`
-    : null;
-
-  const inner = (
-    <span
-      style={{
-        display: "inline-flex",
-        flexDirection: "column",
-        padding: "3px 8px",
-        borderRadius: 6,
-        background: "#1e293b",
-        border: "1px solid #334155",
-        cursor: source.url ? "pointer" : "default",
-        maxWidth: 220,
-      }}
-      title={`${source.title} (${Math.round(source.score * 100)}% match)\n${source.chunk}`}
-    >
-      <span
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 3,
-          color: "#94a3b8",
-          fontSize: 10,
-          overflow: "hidden",
-          textOverflow: "ellipsis",
-          whiteSpace: "nowrap",
-        }}
-      >
-        {source.title}
-        <span style={{ color: "#475569" }}>{Math.round(source.score * 100)}%</span>
-        {source.url && <ExternalLink size={9} />}
-      </span>
-      {(source.sectionTitle || pageLabel) && (
-        <span
-          style={{
-            color: "#475569",
-            fontSize: 9,
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap",
-          }}
-        >
-          {[source.sectionTitle, pageLabel].filter(Boolean).join(" · ")}
-        </span>
-      )}
-    </span>
-  );
-
-  if (source.url) {
-    return (
-      <a
-        href={source.url}
-        target="_blank"
-        rel="noopener noreferrer"
-        style={{ textDecoration: "none" }}
-      >
-        {inner}
-      </a>
-    );
-  }
-
-  return inner;
-}
