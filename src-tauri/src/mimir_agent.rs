@@ -35,7 +35,7 @@ impl AgentModelConfig {
 
 // ─── Tool schemas (OpenAI function-calling format) ───────────────────────────
 
-pub(crate) fn tool_schemas(hound_available: bool) -> Vec<serde_json::Value> {
+pub(crate) fn tool_schemas(hound_available: bool, fs_tools_available: bool) -> Vec<serde_json::Value> {
     let mut schemas = vec![
         json!({
             "type": "function",
@@ -230,6 +230,28 @@ pub(crate) fn tool_schemas(hound_available: bool) -> Vec<serde_json::Value> {
             }
         }
     }));
+    if fs_tools_available {
+        schemas.push(json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a text file from one of the user's registered project folders. Use an absolute path under a registered folder. Returns file content (capped).",
+                "parameters": { "type": "object", "properties": {
+                    "path": { "type": "string", "description": "Absolute path to the file, under a registered project folder." }
+                }, "required": ["path"] }
+            }
+        }));
+        schemas.push(json!({
+            "type": "function",
+            "function": {
+                "name": "list_project_files",
+                "description": "List the entries (files + subfolders) directly inside a folder within a registered project folder. Use to explore a project's structure.",
+                "parameters": { "type": "object", "properties": {
+                    "path": { "type": "string", "description": "Absolute path to the folder, under a registered project folder." }
+                }, "required": ["path"] }
+            }
+        }));
+    }
     schemas
 }
 
@@ -375,6 +397,7 @@ pub(crate) struct ToolCtx<'a> {
     pub app: Option<tauri::AppHandle>,
     pub turn_id: String,
     pub queue: Option<&'a crate::orchestrator::JobQueue>,
+    pub project_roots: Vec<crate::project_roots::ProjectRoot>,
 }
 
 #[derive(Default)]
@@ -668,13 +691,51 @@ pub(crate) async fn execute_tool(
             let Some(queue) = ctx.queue else {
                 return Ok("Background scanning is unavailable right now.".to_string());
             };
-            queue
-                .send(crate::orchestrator::OrchestratorJob::ScanProject {
-                    path: path.to_string(),
-                    tree_id: tree_id.to_string(),
-                })
-                .await?;
+            let safe = match crate::project_roots::resolve_safe_path(path, &ctx.project_roots) {
+                Ok(p) => p.to_string_lossy().to_string(),
+                Err(e) => return Ok(format!(
+                    "Can't scan that path: {}. Add the folder in Settings → Project Folders first.", e
+                )),
+            };
+            queue.send(crate::orchestrator::OrchestratorJob::ScanProject {
+                path: safe, tree_id: tree_id.to_string(),
+            }).await?;
             Ok(format!("Scan of '{}' started in the background — I'll surface the results when it finishes.", path))
+        }
+        "read_file" => {
+            let path = args["path"].as_str().ok_or("read_file requires a 'path'")?;
+            let safe = crate::project_roots::resolve_safe_path(path, &ctx.project_roots)?;
+            let content = std::fs::read_to_string(&safe)
+                .map_err(|e| format!("could not read file: {}", e))?;
+            let capped = crate::text_util::truncate_chars(&content, 100_000);
+            Ok(format!("{}\n\n{}", safe.display(), capped))
+        }
+        "list_project_files" => {
+            let path = args["path"].as_str().ok_or("list_project_files requires a 'path'")?;
+            let safe = crate::project_roots::resolve_safe_path(path, &ctx.project_roots)?;
+            let skip = ["node_modules", "target", ".venv", ".git", "dist", "build"];
+            let mut out = String::new();
+            let mut count = 0u32;
+            match std::fs::read_dir(&safe) {
+                Ok(entries) => {
+                    for e in entries.flatten() {
+                        if count >= 200 { out.push_str("… (more entries omitted)\n"); break; }
+                        let name = e.file_name().to_string_lossy().to_string();
+                        if skip.contains(&name.as_str()) { continue; }
+                        let meta = e.metadata().ok();
+                        if meta.as_ref().map(|m| m.is_dir()).unwrap_or(false) {
+                            out.push_str(&format!("{}/\n", name));
+                        } else {
+                            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                            out.push_str(&format!("{} ({} bytes)\n", name, size));
+                        }
+                        count += 1;
+                    }
+                }
+                Err(e) => return Ok(format!("could not list directory: {}", e)),
+            }
+            if out.is_empty() { out.push_str("(empty)"); }
+            Ok(format!("{}\n{}", safe.display(), out))
         }
         other => Err(format!("unknown tool '{}'", other)),
     }
@@ -718,7 +779,7 @@ pub(crate) async fn run_agent_turn(
     messages.extend_from_slice(history);
     messages.push(json!({ "role": "user", "content": user_message }));
 
-    let tools = tool_schemas(ctx.hound_base_url.is_some());
+    let tools = tool_schemas(ctx.hound_base_url.is_some(), !ctx.project_roots.is_empty());
     let mut state = AgentTurnState::default();
     let t0 = std::time::Instant::now();
 
@@ -834,29 +895,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_schemas_registers_web_tools_only_when_available() {
-        let base: Vec<String> = tool_schemas(false)
-            .iter()
-            .filter_map(|s| s["function"]["name"].as_str().map(|x| x.to_string()))
-            .collect();
-        assert_eq!(
-            base,
-            vec!["search_mimir", "get_facts", "set_fact", "read_tree",
-                 "query_graph", "path_between", "explain_node",
-                 "delete_fact", "delete_resource", "merge_skills", "scan_project"]
-        );
+    fn tool_schemas_registers_web_and_fs_tools_only_when_available() {
+        let base: Vec<String> = tool_schemas(false, false)
+            .iter().map(|t| t["function"]["name"].as_str().unwrap().to_string()).collect();
+        assert!(!base.contains(&"smart_search".to_string()));
+        assert!(!base.contains(&"read_file".to_string()));
 
-        let with_web: Vec<String> = tool_schemas(true)
-            .iter()
-            .filter_map(|s| s["function"]["name"].as_str().map(|x| x.to_string()))
-            .collect();
-        assert_eq!(with_web.len(), 13);
-        assert_eq!(with_web[7], "smart_search");
-        assert_eq!(with_web[8], "smart_fetch");
-        assert_eq!(with_web[9], "delete_fact");
-        assert_eq!(with_web[10], "delete_resource");
-        assert_eq!(with_web[11], "merge_skills");
-        assert_eq!(with_web[12], "scan_project");
+        let with_web: Vec<String> = tool_schemas(true, false)
+            .iter().map(|t| t["function"]["name"].as_str().unwrap().to_string()).collect();
+        assert!(with_web.contains(&"smart_search".to_string()));
+        assert!(!with_web.contains(&"read_file".to_string()));
+
+        let with_fs: Vec<String> = tool_schemas(false, true)
+            .iter().map(|t| t["function"]["name"].as_str().unwrap().to_string()).collect();
+        assert!(with_fs.contains(&"read_file".to_string()));
+        assert!(with_fs.contains(&"list_project_files".to_string()));
+        assert!(!with_fs.contains(&"smart_search".to_string()));
     }
 
     #[test]

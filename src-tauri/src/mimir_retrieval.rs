@@ -1161,6 +1161,20 @@ pub async fn mimir_chat(
          the user themself states."
     );
 
+    let project_roots = crate::project_roots::get_project_roots(&database.pool).await;
+    if !project_roots.is_empty() {
+        let list = project_roots.iter()
+            .map(|r| format!("{} → {}", r.label, r.path))
+            .collect::<Vec<_>>()
+            .join("; ");
+        agent_system_prompt.push_str(&format!(
+            "\n\nYou may read files ONLY in these registered project folders (use absolute paths under them): {}. \
+             read_file reads a file; list_project_files lists a folder's entries. \
+             Refuse to read anything outside these folders.",
+            list
+        ));
+    }
+
     // 6b. Run the agent; fall back to classic one-shot synthesis on any failure.
     let agent_enabled = std::env::var("MIMIR_AGENT_ENABLED")
         .map(|v| v != "false")
@@ -1192,6 +1206,7 @@ pub async fn mimir_chat(
                     app: Some(app.clone()),
                     turn_id: turn_id.clone(),
                     queue: Some(&queue),
+                    project_roots: project_roots.clone(),
                 };
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(120),
