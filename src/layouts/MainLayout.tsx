@@ -1,7 +1,7 @@
 // src/layouts/MainLayout.tsx
 import { ReactNode, useEffect, useState } from "react";
 import { NavLink } from "react-router-dom";
-import { TreePine, Home, CalendarDays, Library, Briefcase, ClipboardList, Lightbulb, FileText, Sparkles } from "lucide-react";
+import { TreePine, Home, CalendarDays, Library, Briefcase, ClipboardList, Lightbulb, FileText, Sparkles, Settings } from "lucide-react";
 import MimirChat from "../components/MimirChat";
 import { useMimirContext } from "../contexts/MimirContext";
 
@@ -43,6 +43,7 @@ export default function MainLayout({ children }: MainLayoutProps) {
           <SidebarLink to="/ideas" icon={<Lightbulb className="w-4 h-4" />} label="Ideas" />
           <SidebarLink to="/resume" icon={<FileText className="w-4 h-4" />} label="Resume" />
           <SidebarLink to="/skills" icon={<Sparkles className="w-4 h-4" />} label="Skills" />
+          <SidebarLink to="/settings" icon={<Settings className="w-4 h-4" />} label="Settings" />
         </nav>
 
         <div className="px-4 py-3 text-xs text-slate-600 border-t border-slate-800">

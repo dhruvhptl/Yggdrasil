@@ -11,6 +11,7 @@ import JobsPage from "./pages/JobsPage";
 import IdeasPage from "./pages/IdeasPage";
 import ResumePage from "./pages/ResumePage";
 import SkillsPage from "./pages/SkillsPage";
+import SettingsPage from "./pages/SettingsPage";
 import ProjectTreePage from "./pages/ProjectTreePage";
 
 export default function App() {
@@ -28,6 +29,7 @@ export default function App() {
           <Route path="/ideas" element={<IdeasPage />} />
           <Route path="/resume" element={<ResumePage />} />
           <Route path="/skills" element={<SkillsPage />} />
+          <Route path="/settings" element={<SettingsPage />} />
           <Route path="/project/:projectId" element={<ProjectTreePage />} />
         </Routes>
       </MainLayout>
