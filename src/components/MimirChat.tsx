@@ -121,6 +121,7 @@ export default function MimirChat({
   const [nodeContext, setNodeContext] = useState<NodeChatContext | null>(null);
   const [suggestionTapped, setSuggestionTapped] = useState(false);
   const [shouldAutoSend, setShouldAutoSend] = useState(false);
+  const [scanStatus, setScanStatus] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const loadedSessionKey = useRef<string | null>(null);
@@ -143,6 +144,29 @@ export default function MimirChat({
       setTimeout(() => textareaRef.current?.focus(), 200);
     }
   }, [open]);
+
+  // Listen for background scan progress and completion events
+  useEffect(() => {
+    let unsubP: (() => void) | undefined;
+    let unsubC: (() => void) | undefined;
+    (async () => {
+      unsubP = await listen<{ status: string; path: string }>("ygg-scan-progress", ({ payload }) => {
+        setScanStatus(`Scanning ${payload.path}…`);
+      });
+      unsubC = await listen<{ filesScanned?: number; nodesAdded?: number; edgesAdded?: number; error?: string }>(
+        "ygg-scan-complete",
+        ({ payload }) => {
+          setScanStatus(
+            payload.error
+              ? `Scan failed: ${payload.error}`
+              : `Scan complete — ${payload.filesScanned ?? 0} files, ${payload.nodesAdded ?? 0} concepts, ${payload.edgesAdded ?? 0} links.`
+          );
+          setTimeout(() => setScanStatus(null), 8000);
+        }
+      );
+    })();
+    return () => { unsubP?.(); unsubC?.(); };
+  }, []);
 
   // Load session history when panel opens or context changes
   const sessionKey = treeId && nodeId ? `${treeId}:${nodeId}` : null;
@@ -918,6 +942,9 @@ export default function MimirChat({
             flexShrink: 0,
           }}
         >
+          {scanStatus && (
+            <div className="px-3 py-1 text-xs opacity-70 border-t border-white/10">🗂️ {scanStatus}</div>
+          )}
           <div
             style={{
               display: "flex",
