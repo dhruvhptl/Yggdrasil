@@ -36,6 +36,7 @@ mod mimir_memory;
 mod mimir_agent;
 mod text_util;
 mod project_roots;
+mod auto_librarian;
 
 use database::Database;
 use tauri::Manager;
@@ -78,6 +79,7 @@ fn main() {
                 app_handle.manage(database);
                 let http_client = reqwest::Client::new();
                 let queue = orchestrator::start_worker(pool.clone(), app_handle.clone(), http_client.clone());
+                crate::auto_librarian::start_auto_librarian(pool.clone(), app_handle.clone(), queue.clone());
                 app_handle.manage(http_client.clone());
                 let hound_status = hound_client::check_health(&http_client).await;
                 app_handle.manage(hound_status);
