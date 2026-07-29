@@ -387,7 +387,7 @@ async fn resolve_or_create_graph(pool: &PgPool, tree_id: &str) -> Result<String,
     Ok(id)
 }
 
-pub(crate) async fn scan_project(pool: &PgPool, path: &str, tree_id: &str) -> Result<ScanResult, String> {
+pub(crate) async fn scan_project_inner(pool: &PgPool, path: &str, tree_id: &str) -> Result<ScanResult, String> {
     let root = std::path::Path::new(path);
     if !root.exists() {
         return Err(format!("Directory not found: {}", path));
@@ -475,5 +475,41 @@ mod tests {
         assert!(jn.iter().any(|n| n.title == "render"));
         let (tn, _) = extract_from_file("api.ts", "interface Provider {}\nfunction fetchIt() {}\n");
         assert!(tn.iter().any(|n| n.title == "fetchIt"));
+    }
+}
+
+/// Background wrapper: emits a started event, runs the scan, emits a complete
+/// event carrying the full ScanResult. Errors are emitted as a complete event
+/// with an `error` field (never panics).
+pub(crate) async fn scan_project_with_events(
+    pool: &sqlx::PgPool,
+    app: &tauri::AppHandle,
+    path: &str,
+    tree_id: &str,
+) {
+    use tauri::Emitter;
+    let _ = app.emit("ygg-scan-progress", serde_json::json!({
+        "treeId": tree_id, "status": "started", "path": path,
+    }));
+    match scan_project_inner(pool, path, tree_id).await {
+        Ok(r) => {
+            let _ = app.emit("ygg-scan-complete", serde_json::json!({
+                "treeId": tree_id,
+                "filesScanned": r.files_scanned,
+                "filesSkipped": r.files_skipped,
+                "nodesAdded": r.nodes_added,
+                "nodesEnriched": r.nodes_enriched,
+                "edgesAdded": r.edges_added,
+                "errors": r.errors,
+            }));
+            println!("📡 [scan] complete: {} files, {} nodes, {} edges (tree={})",
+                r.files_scanned, r.nodes_added, r.edges_added, tree_id);
+        }
+        Err(e) => {
+            let _ = app.emit("ygg-scan-complete", serde_json::json!({
+                "treeId": tree_id, "error": e,
+            }));
+            println!("⚠️  [scan] failed (tree={}): {}", tree_id, e);
+        }
     }
 }

@@ -664,7 +664,7 @@ pub(crate) async fn execute_tool(
             let Some(tree_id) = ctx.tree_id.as_deref() else {
                 return Ok("No active tree to scan into — open a tree first.".to_string());
             };
-            let r = crate::project_scanner::scan_project(ctx.pool, path, tree_id).await?;
+            let r = crate::project_scanner::scan_project_inner(ctx.pool, path, tree_id).await?;
             let mut msg = format!(
                 "Scanned {} files ({} skipped). Added {} new concepts, enriched {} existing, added {} edges.",
                 r.files_scanned, r.files_skipped, r.nodes_added, r.nodes_enriched, r.edges_added

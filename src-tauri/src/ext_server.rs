@@ -553,7 +553,7 @@ async fn create_library_handler(
         let lp = lp.clone();
         let tid = tid.clone();
         tokio::spawn(async move {
-            match crate::project_scanner::scan_project(&pool, &lp, &tid).await {
+            match crate::project_scanner::scan_project_inner(&pool, &lp, &tid).await {
                 Ok(r) => println!("📡 [ext] auto-scan: {} files, {} nodes, {} edges", r.files_scanned, r.nodes_added, r.edges_added),
                 Err(e) => println!("⚠️  [ext] auto-scan failed: {}", e),
             }
