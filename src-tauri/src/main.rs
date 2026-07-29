@@ -35,6 +35,7 @@ mod project_scanner;
 mod mimir_memory;
 mod mimir_agent;
 mod text_util;
+mod project_roots;
 
 use database::Database;
 use tauri::Manager;
@@ -250,6 +251,9 @@ fn main() {
             daily_commands::remove_from_day,
             daily_commands::toggle_task_complete,
             hitl::execute_destructive_action_cmd,
+            project_roots::get_project_roots_cmd,
+            project_roots::add_project_root_cmd,
+            project_roots::remove_project_root_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
