@@ -49,6 +49,16 @@ pub(crate) fn requires_approval(name: &str, args: &serde_json::Value) -> Option<
                 params: args.clone(),
             })
         }
+        "complete_checkpoint" => {
+            let node = args["node_title"].as_str()
+                .or_else(|| args["node_id"].as_str())
+                .unwrap_or("(unspecified)");
+            Some(ActionProposal {
+                action_type: "complete_checkpoint".into(),
+                summary: format!("mark the checkpoint '{}' complete", node),
+                params: args.clone(),
+            })
+        }
         _ => None,
     }
 }
@@ -63,8 +73,12 @@ pub async fn execute_destructive_action_cmd(
     action_type: String,
     params: serde_json::Value,
     tree_id: Option<String>,
+    app: tauri::AppHandle,
+    client: State<'_, reqwest::Client>,
+    queue: State<'_, crate::orchestrator::JobQueue>,
     database: State<'_, Database>,
 ) -> Result<String, String> {
+    let _ = &client; // consumed by the ingest_resource arm (added in Step 4 Task 3)
     match action_type.as_str() {
         "delete_fact" => {
             let fact_key = params["fact_key"].as_str().unwrap_or("").trim().to_string();
@@ -136,6 +150,30 @@ pub async fn execute_destructive_action_cmd(
                 .map_err(|e| e.to_string())?;
             Ok(format!("Merged skill '{}' into '{}'.", source, target))
         }
+        "complete_checkpoint" => {
+            let Some(tree_id) = tree_id.as_deref().filter(|s| !s.is_empty()) else {
+                return Ok("No active tree — open a tree first.".to_string());
+            };
+            let node_id = if let Some(nid) = params["node_id"].as_str().filter(|s| !s.is_empty()) {
+                nid.to_string()
+            } else {
+                let title = params["node_title"].as_str().unwrap_or("").trim().to_string();
+                if title.is_empty() {
+                    return Err("complete_checkpoint requires node_title or node_id".into());
+                }
+                let row = sqlx::query(
+                    "SELECT id FROM tree_nodes WHERE tree_id = $1 AND type = 'leaf' AND title ILIKE $2 LIMIT 1"
+                )
+                .bind(tree_id).bind(&title)
+                .fetch_optional(&database.pool).await.map_err(|e| e.to_string())?;
+                let Some(row) = row else {
+                    return Ok(format!("No checkpoint titled '{}' in this tree — nothing done.", title));
+                };
+                row.try_get::<String, _>("id").map_err(|e| e.to_string())?
+            };
+            crate::tree_commands::complete_checkpoint_inner(&database.pool, &app, &queue, &node_id, tree_id).await?;
+            Ok("Checkpoint marked complete — progress cascaded.".to_string())
+        }
         other => Err(format!("unknown destructive action '{}'", other)),
     }
 }
@@ -177,12 +215,16 @@ mod tests {
         let m = requires_approval("merge_skills", &json!({ "source": "SQL", "target": "Databases" })).unwrap();
         assert_eq!(m.action_type, "merge_skills");
         assert_eq!(m.summary, "merge skill 'SQL' into 'Databases'");
+
+        let c = requires_approval("complete_checkpoint", &json!({ "node_title": "Learn RRF" })).unwrap();
+        assert_eq!(c.action_type, "complete_checkpoint");
+        assert!(c.summary.contains("Learn RRF"));
     }
 
     #[test]
     fn readonly_tools_yield_none() {
         for n in ["search_mimir", "get_facts", "set_fact", "read_tree", "query_graph",
-                  "path_between", "explain_node", "smart_search", "smart_fetch"] {
+                  "path_between", "explain_node", "smart_search", "smart_fetch", "suggest_next"] {
             assert!(requires_approval(n, &json!({})).is_none(), "{} should not require approval", n);
         }
     }

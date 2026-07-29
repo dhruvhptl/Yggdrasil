@@ -252,6 +252,24 @@ pub(crate) fn tool_schemas(hound_available: bool, fs_tools_available: bool) -> V
             }
         }));
     }
+    schemas.push(json!({
+        "type": "function",
+        "function": {
+            "name": "complete_checkpoint",
+            "description": "Mark a checkpoint (leaf node) in the current tree as complete. Requires user approval.",
+            "parameters": { "type": "object", "properties": {
+                "node_title": { "type": "string", "description": "Title of the checkpoint to complete." }
+            }, "required": ["node_title"] }
+        }
+    }));
+    schemas.push(json!({
+        "type": "function",
+        "function": {
+            "name": "suggest_next",
+            "description": "Recommend what the user should learn next, weighted by their saved job requirements. Read-only.",
+            "parameters": { "type": "object", "properties": {} }
+        }
+    }));
     schemas
 }
 
@@ -680,7 +698,7 @@ pub(crate) async fn execute_tool(
             let body: String = fetched.content.chars().take(8000).collect();
             Ok(format!("{}{}", header, body))
         }
-        "delete_fact" | "delete_resource" | "merge_skills" => {
+        "delete_fact" | "delete_resource" | "merge_skills" | "complete_checkpoint" => {
             Err(format!("{} requires user approval and cannot execute directly", name))
         }
         "scan_project" => {
@@ -736,6 +754,19 @@ pub(crate) async fn execute_tool(
             }
             if out.is_empty() { out.push_str("(empty)"); }
             Ok(format!("{}\n{}", safe.display(), out))
+        }
+        "suggest_next" => {
+            let targets = crate::read_models::get_growth_recommendations_inner(ctx.pool, None)
+                .await
+                .unwrap_or_default();
+            if targets.is_empty() {
+                Ok("No growth recommendations yet — add some job applications so I can weight suggestions by demand.".to_string())
+            } else {
+                let lines: Vec<String> = targets.iter().take(5)
+                    .map(|t| format!("- {}: {}", t.skill_name, t.rationale))
+                    .collect();
+                Ok(format!("Suggested next skills to focus on:\n{}", lines.join("\n")))
+            }
         }
         other => Err(format!("unknown tool '{}'", other)),
     }
