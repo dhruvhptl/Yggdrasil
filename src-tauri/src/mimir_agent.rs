@@ -265,6 +265,17 @@ pub(crate) fn tool_schemas(hound_available: bool, fs_tools_available: bool) -> V
     schemas.push(json!({
         "type": "function",
         "function": {
+            "name": "ingest_resource",
+            "description": "Add a URL to the user's resource library (fetches + indexes it). Requires user approval.",
+            "parameters": { "type": "object", "properties": {
+                "url": { "type": "string", "description": "The URL to add." },
+                "title": { "type": "string", "description": "Optional title." }
+            }, "required": ["url"] }
+        }
+    }));
+    schemas.push(json!({
+        "type": "function",
+        "function": {
             "name": "suggest_next",
             "description": "Recommend what the user should learn next, weighted by their saved job requirements. Read-only.",
             "parameters": { "type": "object", "properties": {} }
@@ -698,7 +709,7 @@ pub(crate) async fn execute_tool(
             let body: String = fetched.content.chars().take(8000).collect();
             Ok(format!("{}{}", header, body))
         }
-        "delete_fact" | "delete_resource" | "merge_skills" | "complete_checkpoint" => {
+        "delete_fact" | "delete_resource" | "merge_skills" | "complete_checkpoint" | "ingest_resource" => {
             Err(format!("{} requires user approval and cannot execute directly", name))
         }
         "scan_project" => {

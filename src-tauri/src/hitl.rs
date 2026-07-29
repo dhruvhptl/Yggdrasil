@@ -59,6 +59,14 @@ pub(crate) fn requires_approval(name: &str, args: &serde_json::Value) -> Option<
                 params: args.clone(),
             })
         }
+        "ingest_resource" => {
+            let url = args["url"].as_str().unwrap_or("(unspecified)");
+            Some(ActionProposal {
+                action_type: "ingest_resource".into(),
+                summary: format!("add '{}' to your library", url),
+                params: args.clone(),
+            })
+        }
         _ => None,
     }
 }
@@ -78,7 +86,6 @@ pub async fn execute_destructive_action_cmd(
     queue: State<'_, crate::orchestrator::JobQueue>,
     database: State<'_, Database>,
 ) -> Result<String, String> {
-    let _ = &client; // consumed by the ingest_resource arm (added in Step 4 Task 3)
     match action_type.as_str() {
         "delete_fact" => {
             let fact_key = params["fact_key"].as_str().unwrap_or("").trim().to_string();
@@ -174,6 +181,15 @@ pub async fn execute_destructive_action_cmd(
             crate::tree_commands::complete_checkpoint_inner(&database.pool, &app, &queue, &node_id, tree_id).await?;
             Ok("Checkpoint marked complete — progress cascaded.".to_string())
         }
+        "ingest_resource" => {
+            let url = params["url"].as_str().unwrap_or("").trim().to_string();
+            if url.is_empty() { return Err("ingest_resource requires url".into()); }
+            let title = params["title"].as_str().filter(|s| !s.is_empty());
+            crate::mimir_ingest::ingest_url_inner(
+                &database.pool, &client, &queue, &app, &url, title, false, None,
+            ).await?;
+            Ok(format!("Added '{}' to your library — tagging + matching will run in the background.", url))
+        }
         other => Err(format!("unknown destructive action '{}'", other)),
     }
 }
@@ -219,6 +235,10 @@ mod tests {
         let c = requires_approval("complete_checkpoint", &json!({ "node_title": "Learn RRF" })).unwrap();
         assert_eq!(c.action_type, "complete_checkpoint");
         assert!(c.summary.contains("Learn RRF"));
+
+        let ir = requires_approval("ingest_resource", &json!({ "url": "https://example.com/post" })).unwrap();
+        assert_eq!(ir.action_type, "ingest_resource");
+        assert!(ir.summary.contains("example.com"));
     }
 
     #[test]

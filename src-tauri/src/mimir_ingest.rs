@@ -537,21 +537,21 @@ async fn fetch_page_title(client: &reqwest::Client, url: &str) -> String {
 
 // ─── Tauri commands ─────────────────────────────────────────────────────────
 
-#[tauri::command]
-pub async fn ingest_mimir_url(
-    url: String,
-    title: Option<String>,
-    force_dynamic: Option<bool>,
-    parent_id: Option<String>,
-    app: tauri::AppHandle,
-    client: tauri::State<'_, reqwest::Client>,
-    database: State<'_, Database>,
-    queue: tauri::State<'_, crate::orchestrator::JobQueue>,
+/// Core URL ingestion logic, reusable by the Tauri command and the HITL agent executor.
+pub(crate) async fn ingest_url_inner(
+    pool: &sqlx::PgPool,
+    client: &reqwest::Client,
+    queue: &crate::orchestrator::JobQueue,
+    app: &tauri::AppHandle,
+    url: &str,
+    title: Option<&str>,
+    force_dynamic: bool,
+    parent_id: Option<&str>,
 ) -> Result<IngestResult, String> {
     // Duplicate check by URL
     let dup = sqlx::query("SELECT id, title, transcript_source FROM mimir_resources WHERE url = $1 LIMIT 1")
-        .bind(&url)
-        .fetch_optional(&database.pool)
+        .bind(url)
+        .fetch_optional(pool)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -580,7 +580,7 @@ pub async fn ingest_mimir_url(
             )
             .bind(&job_id)
             .bind(&existing_id)
-            .execute(&database.pool)
+            .execute(pool)
             .await;
 
             let _ = queue.send(crate::orchestrator::OrchestratorJob::FetchTranscript {
@@ -599,9 +599,9 @@ pub async fn ingest_mimir_url(
     if is_youtube {
         // YouTube: store resource immediately with pending transcript job,
         // fetch transcript asynchronously to avoid blocking the UI.
-        let page_title = match title.as_ref().filter(|t| !t.trim().is_empty()) {
+        let page_title = match title.filter(|t| !t.trim().is_empty()) {
             Some(t) => t.trim().to_string(),
-            None => fetch_page_title(&*client, &url).await,
+            None => fetch_page_title(client, url).await,
         };
 
         println!("  [youtube] title: \"{}\" — deferring transcript fetch", page_title);
@@ -615,11 +615,11 @@ pub async fn ingest_mimir_url(
         )
         .bind(&resource_id)
         .bind(&page_title)
-        .bind(&url)
+        .bind(url)
         .bind("webpage")
         .bind("read")
         .bind("none")
-        .execute(&database.pool)
+        .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -630,7 +630,7 @@ pub async fn ingest_mimir_url(
         )
         .bind(&job_id)
         .bind(&resource_id)
-        .execute(&database.pool)
+        .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -652,32 +652,32 @@ pub async fn ingest_mimir_url(
         });
     }
 
-    let fetch_result = fetch_url_content(&*client, &url, force_dynamic.unwrap_or(false)).await?;
+    let fetch_result = fetch_url_content(client, url, force_dynamic).await?;
 
     if fetch_result.text.len() < 50 {
         return Err("Could not extract meaningful text from URL".to_string());
     }
 
     // Derive title
-    let page_title = match title.as_ref().filter(|t| !t.trim().is_empty()) {
+    let page_title = match title.filter(|t| !t.trim().is_empty()) {
         Some(t) => t.trim().to_string(),
-        None => fetch_page_title(&*client, &url).await,
+        None => fetch_page_title(client, url).await,
     };
 
     println!("  title: \"{}\"", page_title);
 
     let resource_id = uuid::Uuid::new_v4().to_string();
 
-    let mut tx = database.pool.begin().await.map_err(|e| e.to_string())?;
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
 
-    if let Some(ref pid) = parent_id {
+    if let Some(pid) = parent_id {
         sqlx::query(
             "INSERT INTO mimir_resources (id, title, url, type, status, parent_id) \
              VALUES ($1, $2, $3, $4, $5, $6)"
         )
         .bind(&resource_id)
         .bind(&page_title)
-        .bind(&url)
+        .bind(url)
         .bind("webpage")
         .bind("read")
         .bind(pid)
@@ -691,7 +691,7 @@ pub async fn ingest_mimir_url(
         )
         .bind(&resource_id)
         .bind(&page_title)
-        .bind(&url)
+        .bind(url)
         .bind("webpage")
         .bind("read")
         .execute(&mut *tx)
@@ -699,13 +699,13 @@ pub async fn ingest_mimir_url(
         .map_err(|e| e.to_string())?;
     }
 
-    store_chunks_and_embeddings(&mut tx, &*client, &resource_id, &fetch_result.text).await?;
+    store_chunks_and_embeddings(&mut tx, client, &resource_id, &fetch_result.text).await?;
 
     tx.commit().await.map_err(|e| e.to_string())?;
 
     println!("✅ Ingested URL: \"{}\" ({})", page_title, resource_id);
 
-    crate::orchestrator::on_resource_ingested_async(&database.pool, &app, &*client, &resource_id, &queue).await;
+    crate::orchestrator::on_resource_ingested_async(pool, app, client, &resource_id, queue).await;
 
     Ok(IngestResult {
         id: resource_id,
@@ -713,6 +713,23 @@ pub async fn ingest_mimir_url(
         page_type: fetch_result.page_type,
         external_links: fetch_result.external_links,
     })
+}
+
+#[tauri::command]
+pub async fn ingest_mimir_url(
+    url: String,
+    title: Option<String>,
+    force_dynamic: Option<bool>,
+    parent_id: Option<String>,
+    app: tauri::AppHandle,
+    client: tauri::State<'_, reqwest::Client>,
+    database: State<'_, Database>,
+    queue: tauri::State<'_, crate::orchestrator::JobQueue>,
+) -> Result<IngestResult, String> {
+    ingest_url_inner(
+        &database.pool, &client, &queue, &app,
+        &url, title.as_deref(), force_dynamic.unwrap_or(false), parent_id.as_deref(),
+    ).await
 }
 
 #[tauri::command]
