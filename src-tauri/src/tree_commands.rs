@@ -222,6 +222,25 @@ pub async fn update_tree_node(
     Ok(())
 }
 
+/// Mark a leaf checkpoint 100% and run the unlock/skill cascade. Shared by the
+/// update_tree_node command path and the agent's complete_checkpoint action.
+pub(crate) async fn complete_checkpoint_inner(
+    pool: &sqlx::PgPool,
+    app: &tauri::AppHandle,
+    queue: &crate::orchestrator::JobQueue,
+    node_id: &str,
+    tree_id: &str,
+) -> Result<(), String> {
+    sqlx::query("UPDATE tree_nodes SET progress = 100 WHERE id = $1 AND tree_id = $2")
+        .bind(node_id)
+        .bind(tree_id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    crate::orchestrator::on_checkpoint_completed(pool, app, node_id, tree_id, queue).await;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn create_tree_edge(
     tree_id: String,

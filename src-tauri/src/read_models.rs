@@ -1153,7 +1153,13 @@ pub async fn get_growth_recommendations(
     season: Option<String>,
     database: State<'_, Database>,
 ) -> Result<Vec<GrowthTarget>, String> {
-    let pool = &database.pool;
+    get_growth_recommendations_inner(&database.pool, season).await
+}
+
+pub(crate) async fn get_growth_recommendations_inner(
+    pool: &sqlx::PgPool,
+    season: Option<String>,
+) -> Result<Vec<GrowthTarget>, String> {
 
     // 1. Load job skill demand (filtered by season)
     let job_rows = if let Some(ref s) = season {
