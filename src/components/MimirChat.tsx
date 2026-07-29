@@ -245,15 +245,20 @@ export default function MimirChat({
         const target = prev[idx];
         const calls = [...(target.toolCalls ?? [])];
         const at = calls.findIndex((c) => c.callIndex === payload.callIndex);
+        const existing = at >= 0 ? calls[at] : undefined;
+        // The "running" event carries `input`; the "success"/"error" event that
+        // follows does not. Fall back to the previously recorded value for any
+        // field the current payload omits, so the done event doesn't clobber
+        // input (or other fields) with `undefined` via object spread.
         const rec: LiveToolCall = {
           callIndex: payload.callIndex,
           toolName: payload.toolName,
           status: payload.status,
-          input: payload.input,
-          output: payload.output,
-          durationMs: payload.durationMs,
+          input: payload.input ?? existing?.input,
+          output: payload.output ?? existing?.output,
+          durationMs: payload.durationMs ?? existing?.durationMs,
         };
-        if (at >= 0) calls[at] = { ...calls[at], ...rec };
+        if (at >= 0) calls[at] = rec;
         else calls.push(rec);
         const next = [...prev];
         next[idx] = { ...target, toolCalls: calls };
