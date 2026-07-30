@@ -20,9 +20,12 @@ pub(crate) struct AgentModelConfig {
 impl AgentModelConfig {
     /// Resolve from env with Groq defaults. Model-agnostic: point
     /// MIMIR_AGENT_BASE_URL at any OpenAI-compatible endpoint.
-    pub(crate) fn from_env() -> Result<Self, String> {
-        let model = std::env::var("MIMIR_AGENT_MODEL")
-            .unwrap_or_else(|_| "llama-3.3-70b-versatile".to_string());
+    pub(crate) async fn from_env(pool: &sqlx::PgPool) -> Result<Self, String> {
+        let model = crate::settings::get_setting(pool, "agent_model")
+            .await
+            .filter(|m| !m.is_empty())
+            .or_else(|| std::env::var("MIMIR_AGENT_MODEL").ok())
+            .unwrap_or_else(|| "llama-3.3-70b-versatile".to_string());
         let base_url = std::env::var("MIMIR_AGENT_BASE_URL")
             .unwrap_or_else(|_| crate::constants::GROQ_API_URL.to_string());
         let api_key = match std::env::var("MIMIR_AGENT_API_KEY") {

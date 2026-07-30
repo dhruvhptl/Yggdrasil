@@ -1187,7 +1187,7 @@ pub async fn mimir_chat(
 
     let mut agent_outcome: Option<crate::mimir_agent::AgentTurnResult> = None;
     if agent_enabled {
-        match crate::mimir_agent::AgentModelConfig::from_env() {
+        match crate::mimir_agent::AgentModelConfig::from_env(&database.pool).await {
             Ok(agent_cfg) => {
                 let hound_base_url = match hound.inner() {
                     crate::hound_client::HoundStatus::Available { base_url } => Some(base_url.clone()),
