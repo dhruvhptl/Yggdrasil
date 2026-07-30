@@ -495,6 +495,9 @@ export default function ResourcesPage() {
   const [expandedParents, setExpandedParents] = useState<Set<string>>(new Set());
   const initialExpandDone = useRef(false);
 
+  // Librarian note state
+  const [librarianNote, setLibrarianNote] = useState<string | null>(null);
+
   async function loadResources() {
     try {
       const raw = await invoke('get_mimir_resources');
@@ -748,6 +751,22 @@ export default function ResourcesPage() {
   useEffect(() => {
     if (showStudyMap) loadStudyMap();
   }, [showStudyMap, studyMapFrontier, studyMapTreeFilter]);
+
+  useEffect(() => {
+    let unsub: (() => void) | undefined;
+    (async () => {
+      unsub = await listen<{ untagged: number; unmatched: number; queued: number }>(
+        "ygg-library-suggestion",
+        ({ payload }) => {
+          setLibrarianNote(
+            `🧹 Auto-librarian queued ${payload.queued} resource(s) — ${payload.untagged} to tag, ${payload.unmatched} to match.`
+          );
+          setTimeout(() => setLibrarianNote(null), 12000);
+        }
+      );
+    })();
+    return () => { unsub?.(); };
+  }, []);
 
   async function handleAdd() {
     if (adding) return;
@@ -1188,6 +1207,11 @@ export default function ResourcesPage() {
 
   return (
     <div className="p-6 max-w-3xl mx-auto flex flex-col gap-6">
+      {librarianNote && (
+        <div className="mb-3 rounded-md border border-white/10 bg-white/5 px-3 py-2 text-sm opacity-80">
+          {librarianNote}
+        </div>
+      )}
       {/* Header */}
       <div>
         <div className="flex items-center gap-3">
