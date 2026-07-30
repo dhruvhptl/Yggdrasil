@@ -37,6 +37,7 @@ mod mimir_agent;
 mod text_util;
 mod project_roots;
 mod auto_librarian;
+mod settings;
 
 use database::Database;
 use tauri::Manager;
@@ -256,6 +257,8 @@ fn main() {
             project_roots::get_project_roots_cmd,
             project_roots::add_project_root_cmd,
             project_roots::remove_project_root_cmd,
+            settings::get_agent_config_cmd,
+            settings::set_agent_config_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
