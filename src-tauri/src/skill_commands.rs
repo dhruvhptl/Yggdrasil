@@ -226,8 +226,10 @@ pub(crate) async fn upsert_skill(
 // ─── Inner sync functions (take &PgPool directly) ───────────────────────────
 
 pub(crate) async fn sync_resume_inner(pool: &PgPool) -> Result<SyncResult, String> {
+    // Active-first, newest as fallback — mirrors get_resume so seeding degrades
+    // the same way the UI does if the single-active invariant ever drifts.
     let row = sqlx::query(
-        "SELECT skills FROM resume_profile WHERE is_active = TRUE ORDER BY created_at DESC LIMIT 1"
+        "SELECT skills FROM resume_profile ORDER BY is_active DESC, created_at DESC LIMIT 1"
     )
     .fetch_optional(pool)
     .await

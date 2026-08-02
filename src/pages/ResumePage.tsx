@@ -138,7 +138,7 @@ export default function ResumePage() {
       headers={headers}
       projects={projects}
       onNewVersion={() => setForceNew(true)}
-      onRefresh={() => { loadResume(); loadProjects(); }}
+      onRefresh={() => Promise.all([loadResume(), loadProjects()])}
     />
   );
 }
@@ -376,7 +376,7 @@ function LoadedState({
   headers: ResumeHeader[];
   projects: YggProject[];
   onNewVersion: () => void;
-  onRefresh: () => void;
+  onRefresh: () => void | Promise<unknown>;
 }) {
   const navigate = useNavigate();
   const [expandedSections, setExpandedSections] = useState<Set<string>>(
@@ -402,7 +402,7 @@ function LoadedState({
     setSwitching(true);
     try {
       await invoke("set_active_resume_cmd", { id });
-      onRefresh();
+      await onRefresh();
     } catch (e) {
       console.error("Failed to switch resume:", e);
     } finally {
