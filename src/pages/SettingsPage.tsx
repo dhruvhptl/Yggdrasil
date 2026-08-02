@@ -13,6 +13,7 @@ export default function SettingsPage() {
   // ── Agent model ──
   const [model, setModel] = useState<string>("");
   const [modelSaved, setModelSaved] = useState(false);
+  const [modelError, setModelError] = useState<string | null>(null);
   // ── Project folders ──
   const [roots, setRoots] = useState<ProjectRoot[]>([]);
   const [label, setLabel] = useState("");
@@ -30,18 +31,22 @@ export default function SettingsPage() {
   }, []);
 
   const changeModel = async (id: string) => {
+    const prev = model;
     setModel(id);
     setModelSaved(false);
+    setModelError(null);
     try {
       await invoke("set_agent_config_cmd", { model: id });
       setModelSaved(true);
       setTimeout(() => setModelSaved(false), 2500);
-    } catch (e) { setError(String(e)); }
+    } catch (e) { setModel(prev); setModelError(String(e)); }
   };
 
   const browse = async () => {
-    const folder = await open({ directory: true, title: "Select project folder" });
-    if (typeof folder === "string") setPath(folder);
+    try {
+      const folder = await open({ directory: true, title: "Select project folder" });
+      if (typeof folder === "string") setPath(folder);
+    } catch (e) { setError(String(e)); }
   };
 
   const add = async () => {
@@ -83,6 +88,7 @@ export default function SettingsPage() {
           </select>
           {modelSaved && <span className="text-xs text-green-400 flex items-center gap-1"><Check className="w-3.5 h-3.5" /> saved</span>}
         </div>
+        {modelError && <p className="mt-2 text-sm text-red-400">{modelError}</p>}
       </section>
 
       {/* Section 2 — Project Folders */}
