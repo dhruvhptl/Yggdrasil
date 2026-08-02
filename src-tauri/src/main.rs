@@ -69,6 +69,7 @@ fn load_env_file() {
 fn main() {
     load_env_file();
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let app_handle = app.handle().clone();
             tauri::async_runtime::block_on(async move {
