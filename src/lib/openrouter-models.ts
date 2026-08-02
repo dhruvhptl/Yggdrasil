@@ -1,0 +1,30 @@
+export interface OpenRouterModel { id: string; name: string; context: number; provider: string; }
+
+// Validated against OpenRouter's live catalog on 2026-07-30.
+export const OPENROUTER_MODELS: OpenRouterModel[] = [
+  { id: "deepseek/deepseek-v4-flash", name: "DeepSeek V4 Flash", context: 1048576, provider: "DeepSeek" },
+  { id: "deepseek/deepseek-v4-pro", name: "DeepSeek V4 Pro", context: 1048576, provider: "DeepSeek" },
+  { id: "deepseek/deepseek-v3.2", name: "DeepSeek V3.2", context: 163840, provider: "DeepSeek" },
+  { id: "google/gemini-3.6-flash", name: "Gemini 3.6 Flash", context: 1048576, provider: "Google" },
+  { id: "google/gemini-3.5-flash", name: "Gemini 3.5 Flash", context: 1048576, provider: "Google" },
+  { id: "google/gemini-3.5-flash-lite", name: "Gemini 3.5 Flash Lite", context: 1048576, provider: "Google" },
+  { id: "anthropic/claude-sonnet-5", name: "Claude Sonnet 5", context: 1000000, provider: "Anthropic" },
+  { id: "anthropic/claude-opus-5", name: "Claude Opus 5", context: 1000000, provider: "Anthropic" },
+  { id: "anthropic/claude-opus-4.8", name: "Claude Opus 4.8", context: 1000000, provider: "Anthropic" },
+  { id: "meta-llama/llama-4-maverick", name: "Llama 4 Maverick", context: 1048576, provider: "Meta" },
+  { id: "meta-llama/llama-4-scout", name: "Llama 4 Scout", context: 1310720, provider: "Meta" },
+  { id: "meta-llama/llama-3.3-70b-instruct", name: "Llama 3.3 70B Instruct", context: 131072, provider: "Meta" },
+  { id: "openai/gpt-5.5-pro", name: "GPT-5.5 Pro", context: 1050000, provider: "OpenAI" },
+  { id: "openai/gpt-5-mini", name: "GPT-5 Mini", context: 400000, provider: "OpenAI" },
+  { id: "openai/o4-mini", name: "o4 Mini", context: 200000, provider: "OpenAI" },
+  { id: "mistralai/mistral-medium-3-5", name: "Mistral Medium 3.5", context: 262144, provider: "Mistral" },
+  { id: "mistralai/mistral-large-2512", name: "Mistral Large 3", context: 262144, provider: "Mistral" },
+  { id: "mistralai/codestral-2508", name: "Codestral 2508", context: 256000, provider: "Mistral" },
+  { id: "qwen/qwen3.7-flash", name: "Qwen3.7 Flash", context: 1000000, provider: "Qwen" },
+  { id: "qwen/qwen3.7-max", name: "Qwen3.7 Max", context: 1000000, provider: "Qwen" },
+  { id: "cohere/command-a", name: "Command A", context: 256000, provider: "Cohere" },
+  { id: "x-ai/grok-4.3", name: "Grok 4.3", context: 1000000, provider: "xAI" },
+  { id: "x-ai/grok-4.5", name: "Grok 4.5", context: 500000, provider: "xAI" },
+  { id: "amazon/nova-2-lite-v1", name: "Nova 2 Lite", context: 1000000, provider: "Amazon" },
+  { id: "amazon/nova-pro-v1", name: "Nova Pro", context: 300000, provider: "Amazon" },
+];
