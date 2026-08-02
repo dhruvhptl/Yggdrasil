@@ -56,6 +56,20 @@ pub struct ResumeProfile {
     pub work_experience: Vec<WorkExperience>,
     pub skills: Vec<String>,
     pub projects: Vec<ResumeProject>,
+    pub label: String,
+    pub is_active: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Lightweight row for the resume-version switcher (no heavy fields).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeHeader {
+    pub id: String,
+    pub label: String,
+    pub name: Option<String>,
+    pub is_active: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -152,6 +166,7 @@ async fn call_groq(client: &reqwest::Client, api_key: &str, system_prompt: &str,
 #[tauri::command]
 pub async fn parse_resume(
     text: String,
+    label: String,
     app: tauri::AppHandle,
     client: State<'_, reqwest::Client>,
     database: State<'_, Database>,
@@ -206,12 +221,6 @@ pub async fn parse_resume(
 
     // ── Save to database ────────────────────────────────────────────────────────
 
-    // Delete any existing resume (single-profile model)
-    sqlx::query("DELETE FROM resume_profile")
-        .execute(&database.pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
     let profile_id = Uuid::new_v4().to_string();
     let education_json = serde_json::to_value(&profile.education.unwrap_or_default())
         .map_err(|e| format!("Failed to serialize education: {}", e))?;
@@ -220,9 +229,17 @@ pub async fn parse_resume(
     let skills_json = serde_json::to_value(&profile.skills.unwrap_or_default())
         .map_err(|e| format!("Failed to serialize skills: {}", e))?;
 
+    // Flip the current active off and insert the new profile as active, in one
+    // transaction so a crash mid-flip can't leave zero active resumes. Every new
+    // parse becomes the active resume; older versions are kept as history.
+    let mut tx = database.pool.begin().await.map_err(|e| e.to_string())?;
+    sqlx::query("UPDATE resume_profile SET is_active = FALSE WHERE is_active")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
     sqlx::query(
-        "INSERT INTO resume_profile (id, raw_text, name, email, education, work_experience, skills) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7)"
+        "INSERT INTO resume_profile (id, raw_text, name, email, education, work_experience, skills, label, is_active) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE)"
     )
     .bind(&profile_id)
     .bind(&text)
@@ -231,9 +248,11 @@ pub async fn parse_resume(
     .bind(&education_json)
     .bind(&work_exp_json)
     .bind(&skills_json)
-    .execute(&database.pool)
+    .bind(&label)
+    .execute(&mut *tx)
     .await
     .map_err(|e| format!("Failed to save resume profile: {}", e))?;
+    tx.commit().await.map_err(|e| e.to_string())?;
 
     println!("✅ Saved resume profile: {}", profile_id);
 
@@ -291,6 +310,8 @@ pub async fn parse_resume(
         work_experience,
         skills,
         projects: saved_projects,
+        label,
+        is_active: true,
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
     })
@@ -302,9 +323,10 @@ pub async fn get_resume(
 ) -> Result<Option<ResumeProfile>, String> {
     use sqlx::Row;
 
+    // Active-first, newest as fallback — robust even if no row is flagged active.
     let profile_row = sqlx::query(
-        "SELECT id, raw_text, name, email, education, work_experience, skills, created_at, updated_at \
-         FROM resume_profile ORDER BY created_at DESC LIMIT 1"
+        "SELECT id, raw_text, name, email, education, work_experience, skills, label, is_active, created_at, updated_at \
+         FROM resume_profile ORDER BY is_active DESC, created_at DESC LIMIT 1"
     )
     .fetch_optional(&database.pool)
     .await
@@ -369,6 +391,8 @@ pub async fn get_resume(
         work_experience,
         skills,
         projects,
+        label: row.try_get("label").map_err(|e| e.to_string())?,
+        is_active: row.try_get("is_active").map_err(|e| e.to_string())?,
         created_at: row.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")
             .map(|d| d.to_rfc3339())
             .map_err(|e| e.to_string())?,
@@ -416,13 +440,107 @@ pub async fn unlink_resume_project(
 
 #[tauri::command]
 pub async fn delete_resume(
+    id: String,
+    app: tauri::AppHandle,
     database: State<'_, Database>,
 ) -> Result<(), String> {
-    sqlx::query("DELETE FROM resume_profile")
+    // Delete the target profile (resume_projects cascade via FK). If it was the
+    // active one, promote the newest remaining resume so there's always an active.
+    let mut tx = database.pool.begin().await.map_err(|e| e.to_string())?;
+    sqlx::query("DELETE FROM resume_profile WHERE id = $1")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query(
+        "UPDATE resume_profile SET is_active = TRUE \
+         WHERE id = (SELECT id FROM resume_profile ORDER BY created_at DESC LIMIT 1) \
+           AND NOT EXISTS (SELECT 1 FROM resume_profile WHERE is_active)"
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+    tx.commit().await.map_err(|e| e.to_string())?;
+
+    // Seed skills follow the (possibly newly promoted) active resume.
+    crate::orchestrator::on_resume_parsed(&database.pool, &app).await;
+
+    println!("🗑️ Deleted resume profile {}", id);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn list_resumes(
+    database: State<'_, Database>,
+) -> Result<Vec<ResumeHeader>, String> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT id, label, name, is_active, created_at, updated_at \
+         FROM resume_profile ORDER BY created_at DESC"
+    )
+    .fetch_all(&database.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        out.push(ResumeHeader {
+            id: r.try_get("id").map_err(|e| e.to_string())?,
+            label: r.try_get("label").map_err(|e| e.to_string())?,
+            name: r.try_get("name").map_err(|e| e.to_string())?,
+            is_active: r.try_get("is_active").map_err(|e| e.to_string())?,
+            created_at: r.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")
+                .map(|d| d.to_rfc3339()).map_err(|e| e.to_string())?,
+            updated_at: r.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at")
+                .map(|d| d.to_rfc3339()).map_err(|e| e.to_string())?,
+        });
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+pub async fn set_active_resume_cmd(
+    id: String,
+    app: tauri::AppHandle,
+    database: State<'_, Database>,
+) -> Result<(), String> {
+    // Flip active in one transaction: on failure the rollback restores the old
+    // active, so we never strand the app with zero active resumes.
+    let mut tx = database.pool.begin().await.map_err(|e| e.to_string())?;
+    sqlx::query("UPDATE resume_profile SET is_active = FALSE WHERE is_active")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    let res = sqlx::query("UPDATE resume_profile SET is_active = TRUE WHERE id = $1")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    if res.rows_affected() == 0 {
+        return Err(format!("No resume with id {}", id));
+    }
+    tx.commit().await.map_err(|e| e.to_string())?;
+
+    // Re-seed skills from the newly active resume + emit ygg-skills-updated.
+    crate::orchestrator::on_resume_parsed(&database.pool, &app).await;
+
+    println!("⭐ Active resume → {}", id);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn update_resume_label_cmd(
+    id: String,
+    label: String,
+    database: State<'_, Database>,
+) -> Result<(), String> {
+    sqlx::query("UPDATE resume_profile SET label = $1 WHERE id = $2")
+        .bind(&label)
+        .bind(&id)
         .execute(&database.pool)
         .await
         .map_err(|e| e.to_string())?;
 
-    println!("🗑️ Deleted resume profile");
+    println!("🏷️ Renamed resume {} → {:?}", id, label);
     Ok(())
 }

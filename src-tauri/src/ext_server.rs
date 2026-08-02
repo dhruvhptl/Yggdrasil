@@ -97,7 +97,8 @@ async fn tailored_for_job(pool: &PgPool, job_id: &str) -> Vec<ExtProject> {
         "SELECT rp.name, rp.description, rp.tech_stack, rp.github_url
          FROM resume_projects rp
          JOIN resume_profile rprofile ON rp.resume_id = rprofile.id
-         ORDER BY rprofile.created_at DESC, rp.created_at
+         WHERE rprofile.is_active = TRUE
+         ORDER BY rp.created_at
          LIMIT 100",
     )
     .fetch_all(pool)

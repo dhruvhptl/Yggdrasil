@@ -1,11 +1,10 @@
 // src/pages/ResumePage.tsx
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { warn } from '../lib/logger';
 import { useNavigate } from "react-router-dom";
 import {
   FileText, Upload, Loader2, ExternalLink, TreePine, Link2, Unlink,
-  GraduationCap, Briefcase, ChevronDown, ChevronRight, Trash2,
+  GraduationCap, Briefcase, ChevronDown, ChevronRight, Trash2, Plus,
 } from "lucide-react";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -45,8 +44,23 @@ interface ResumeProfile {
   workExperience: WorkExperience[];
   skills: string[];
   projects: ResumeProject[];
+  label: string;
+  isActive: boolean;
   createdAt: string;
   updatedAt: string;
+}
+
+interface ResumeHeader {
+  id: string;
+  label: string;
+  name: string | null;
+  isActive: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+function headerLabel(h: ResumeHeader): string {
+  return h.label?.trim() || h.name || `Resume ${new Date(h.createdAt).toLocaleDateString()}`;
 }
 
 interface YggProject {
@@ -64,13 +78,19 @@ interface YggProject {
 
 export default function ResumePage() {
   const [resume, setResume] = useState<ResumeProfile | null>(null);
+  const [headers, setHeaders] = useState<ResumeHeader[]>([]);
   const [loading, setLoading] = useState(true);
   const [projects, setProjects] = useState<YggProject[]>([]);
+  const [forceNew, setForceNew] = useState(false);
 
   async function loadResume() {
     try {
-      const r = await invoke<ResumeProfile | null>("get_resume");
+      const [r, hs] = await Promise.all([
+        invoke<ResumeProfile | null>("get_resume"),
+        invoke<ResumeHeader[]>("list_resumes"),
+      ]);
       setResume(r);
+      setHeaders(hs);
     } catch (e) {
       console.error("Failed to load resume:", e);
     } finally {
@@ -100,14 +120,24 @@ export default function ResumePage() {
     );
   }
 
-  if (!resume) {
-    return <EmptyState onParsed={(r) => { setResume(r); loadProjects(); }} />;
+  // Show the parser when there's no resume yet, or when the user explicitly
+  // chose to add a new version (which becomes the active one on parse).
+  if (forceNew || !resume) {
+    return (
+      <EmptyState
+        canCancel={!!resume}
+        onCancel={() => setForceNew(false)}
+        onParsed={() => { setForceNew(false); loadResume(); loadProjects(); }}
+      />
+    );
   }
 
   return (
     <LoadedState
       resume={resume}
+      headers={headers}
       projects={projects}
+      onNewVersion={() => setForceNew(true)}
       onRefresh={() => { loadResume(); loadProjects(); }}
     />
   );
@@ -115,8 +145,17 @@ export default function ResumePage() {
 
 // ─── Empty State ────────────────────────────────────────────────────────────
 
-function EmptyState({ onParsed }: { onParsed: (r: ResumeProfile) => void }) {
+function EmptyState({
+  onParsed,
+  canCancel,
+  onCancel,
+}: {
+  onParsed: () => void;
+  canCancel: boolean;
+  onCancel: () => void;
+}) {
   const [mode, setMode] = useState<"text" | "pdf">("text");
+  const [label, setLabel] = useState("");
   const [text, setText] = useState("");
   const [parsing, setParsing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -165,12 +204,13 @@ function EmptyState({ onParsed }: { onParsed: (r: ResumeProfile) => void }) {
     setParsing(true);
     setError(null);
     try {
-      const result = await invoke<ResumeProfile>("parse_resume", {
+      await invoke<ResumeProfile>("parse_resume", {
         text: resumeText,
+        label: label.trim() || `Resume ${new Date().toLocaleDateString()}`,
       });
-      onParsed(result);
-      // Sync resume skills to universal skills (fire-and-forget)
-      invoke('sync_skills_from_resume').catch(warn);
+      // parse_resume already re-seeds skills (on_resume_parsed) for the new
+      // active version, so no separate sync call is needed here.
+      onParsed();
     } catch (e) {
       setError(String(e));
     } finally {
@@ -191,6 +231,25 @@ function EmptyState({ onParsed }: { onParsed: (r: ResumeProfile) => void }) {
             skills, and experience — then link them to your Yggdrasil skill
             trees.
           </p>
+          {canCancel && (
+            <button
+              onClick={onCancel}
+              className="mt-3 text-xs text-slate-500 hover:text-slate-300 transition-colors"
+            >
+              ← Back to current resume
+            </button>
+          )}
+        </div>
+
+        {/* Version label */}
+        <div className="mb-4">
+          <label className="block text-xs text-slate-500 mb-1">Version label (optional)</label>
+          <input
+            value={label}
+            onChange={(e) => setLabel(e.target.value)}
+            placeholder={`Resume ${new Date().toLocaleDateString()}`}
+            className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 placeholder-slate-600 focus:outline-none focus:border-emerald-500/50"
+          />
         </div>
 
         {/* Mode toggle */}
@@ -308,11 +367,15 @@ function EmptyState({ onParsed }: { onParsed: (r: ResumeProfile) => void }) {
 
 function LoadedState({
   resume,
+  headers,
   projects,
+  onNewVersion,
   onRefresh,
 }: {
   resume: ResumeProfile;
+  headers: ResumeHeader[];
   projects: YggProject[];
+  onNewVersion: () => void;
   onRefresh: () => void;
 }) {
   const navigate = useNavigate();
@@ -320,6 +383,11 @@ function LoadedState({
     new Set(["projects", "experience", "education"])
   );
   const [deleting, setDeleting] = useState(false);
+  const [switching, setSwitching] = useState(false);
+  const [labelDraft, setLabelDraft] = useState(resume.label);
+
+  // Reset the label draft whenever the active resume changes (switch/delete).
+  useEffect(() => { setLabelDraft(resume.label); }, [resume.id, resume.label]);
 
   function toggleSection(s: string) {
     setExpandedSections((prev) => {
@@ -329,11 +397,34 @@ function LoadedState({
     });
   }
 
+  async function switchTo(id: string) {
+    if (id === resume.id) return;
+    setSwitching(true);
+    try {
+      await invoke("set_active_resume_cmd", { id });
+      onRefresh();
+    } catch (e) {
+      console.error("Failed to switch resume:", e);
+    } finally {
+      setSwitching(false);
+    }
+  }
+
+  async function saveLabel() {
+    if (labelDraft.trim() === resume.label) return;
+    try {
+      await invoke("update_resume_label_cmd", { id: resume.id, label: labelDraft.trim() });
+      onRefresh();
+    } catch (e) {
+      console.error("Failed to rename resume:", e);
+    }
+  }
+
   async function handleDelete() {
-    if (!confirm("Delete your parsed resume? This cannot be undone.")) return;
+    if (!confirm("Delete this resume version? This cannot be undone.")) return;
     setDeleting(true);
     try {
-      await invoke("delete_resume");
+      await invoke("delete_resume", { id: resume.id });
       onRefresh();
     } finally {
       setDeleting(false);
@@ -343,6 +434,47 @@ function LoadedState({
   return (
     <div className="h-full overflow-auto">
       <div className="max-w-4xl mx-auto p-8">
+        {/* Version toolbar */}
+        <div className="flex flex-wrap items-center gap-2 mb-6 pb-4 border-b border-slate-800">
+          <span className="text-xs text-slate-500 uppercase tracking-wider">Version</span>
+          <select
+            value={resume.id}
+            onChange={(e) => switchTo(e.target.value)}
+            disabled={switching}
+            className="bg-slate-800 border border-slate-700 rounded text-xs text-slate-200 py-1.5 px-2 focus:outline-none focus:border-emerald-500/50 disabled:opacity-50"
+          >
+            {headers.map((h) => (
+              <option key={h.id} value={h.id}>
+                {headerLabel(h)}{h.isActive ? " • active" : ""}
+              </option>
+            ))}
+          </select>
+          {switching && <Loader2 className="w-3.5 h-3.5 text-emerald-400 animate-spin" />}
+
+          <div className="flex-1 min-w-[1rem]" />
+
+          <input
+            value={labelDraft}
+            onChange={(e) => setLabelDraft(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") saveLabel(); }}
+            placeholder="Label this version"
+            className="bg-slate-900 border border-slate-700 rounded text-xs text-slate-200 placeholder-slate-600 py-1.5 px-2 w-48 focus:outline-none focus:border-emerald-500/50"
+          />
+          <button
+            onClick={saveLabel}
+            disabled={labelDraft.trim() === resume.label}
+            className="px-2.5 py-1.5 text-xs font-medium bg-slate-700 hover:bg-slate-600 disabled:opacity-40 disabled:hover:bg-slate-700 text-slate-200 rounded transition-colors"
+          >
+            Rename
+          </button>
+          <button
+            onClick={onNewVersion}
+            className="px-2.5 py-1.5 text-xs font-medium bg-emerald-600 hover:bg-emerald-500 text-white rounded transition-colors flex items-center gap-1"
+          >
+            <Plus className="w-3 h-3" /> New version
+          </button>
+        </div>
+
         {/* Profile Header */}
         <div className="flex items-start justify-between mb-8">
           <div>
@@ -378,7 +510,7 @@ function LoadedState({
             onClick={handleDelete}
             disabled={deleting}
             className="text-slate-500 hover:text-red-400 transition-colors p-2"
-            title="Delete resume and re-parse"
+            title="Delete this version"
           >
             <Trash2 className="w-4 h-4" />
           </button>
