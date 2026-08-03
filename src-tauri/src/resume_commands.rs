@@ -201,15 +201,21 @@ pub async fn parse_resume(
     // ── Call 2: Extract projects ────────────────────────────────────────────────
     println!("Calling Groq API — Call 2: project extraction…");
     let projects_prompt = format!(
-        "Extract ALL projects from this resume. Include personal projects, course projects, \
-        hackathon projects, open source contributions, and any other project work mentioned.\n\
+        "Extract projects from this resume, but ONLY the ones explicitly listed under a \
+        dedicated projects section — a heading such as \"Projects\", \"Project Experience\", \
+        \"Personal Projects\", \"Academic Projects\", or the like.\n\
         Return ONLY a JSON object with this exact shape:\n\
         {{\n  \"projects\": [\n    {{\n      \"name\": \"Project Name\",\n      \
         \"description\": \"What the project does and key accomplishments\",\n      \
         \"tech_stack\": [\"React\", \"Python\", \"etc\"],\n      \
         \"github_url\": \"https://github.com/... or null\"\n    }}\n  ]\n}}\n\
-        Extract EVERY project mentioned anywhere in the resume. Be thorough — check \
-        the projects section, work experience bullet points, and education section.\n\
+        STRICT RULES:\n\
+        - Include a project ONLY if it appears as its own entry under a projects-style heading.\n\
+        - Do NOT extract anything from Work Experience, Employment, or Internship sections. \
+        Bullet points inside a job description are job responsibilities/sub-tasks, NOT standalone \
+        projects — ignore them even when they describe building, shipping, or launching something.\n\
+        - Do NOT invent projects from the summary, skills, or education sections.\n\
+        - If the resume has no dedicated projects section, return an empty array: {{\"projects\": []}}.\n\
         Return ONLY the JSON, nothing else.\n\nResume:\n{}",
         text
     );
