@@ -42,6 +42,62 @@ struct CoverageResponse {
     verdicts: Vec<LlmVerdict>,
 }
 
+/// One reconciled row, ready to upsert into `project_coverage`.
+#[derive(Debug, Clone, PartialEq)]
+struct CoverageRow {
+    checkpoint_node_id: String,
+    checkpoint_title: String,
+    status: &'static str,
+    evidence_node_id: Option<String>,
+    reason: String,
+}
+
+fn normalize_status(s: &str) -> &'static str {
+    match s {
+        "covered" => "covered",
+        "partial" => "partial",
+        _ => "gap",
+    }
+}
+
+/// Pure reconciliation: `checkpoints` (id, title) is the source of truth, never
+/// `verdicts`. Verdicts whose `checkpoint_id` doesn't match a real checkpoint
+/// (hallucinated) are dropped. Checkpoints with no matching verdict (the LLM
+/// omitted them) get a synthesized default `gap` row. Guarantees exactly one
+/// row per checkpoint, `total == checkpoints.len()`, and
+/// `covered + partial + gap == total` — no silently shrinking counts, no
+/// garbage rows from invented ids.
+fn reconcile(checkpoints: &[(String, String)], verdicts: Vec<LlmVerdict>) -> (Vec<CoverageRow>, CoverageSummary) {
+    let known_ids: std::collections::HashSet<&str> = checkpoints.iter().map(|(id, _)| id.as_str()).collect();
+    let mut verdict_by_id: std::collections::HashMap<String, LlmVerdict> = verdicts
+        .into_iter()
+        .filter(|v| known_ids.contains(v.checkpoint_id.as_str()))
+        .map(|v| (v.checkpoint_id.clone(), v))
+        .collect();
+
+    let mut sum = CoverageSummary { covered: 0, partial: 0, gap: 0, total: checkpoints.len() as u32 };
+    let mut rows = Vec::with_capacity(checkpoints.len());
+    for (id, title) in checkpoints {
+        let (status, evidence_node_id, reason) = match verdict_by_id.remove(id) {
+            Some(v) => (normalize_status(&v.status), v.evidence_node_id, v.reason),
+            None => ("gap", None, "not classified this run".to_string()),
+        };
+        match status {
+            "covered" => sum.covered += 1,
+            "partial" => sum.partial += 1,
+            _ => sum.gap += 1,
+        }
+        rows.push(CoverageRow {
+            checkpoint_node_id: id.clone(),
+            checkpoint_title: title.clone(),
+            status,
+            evidence_node_id,
+            reason,
+        });
+    }
+    (rows, sum)
+}
+
 /// Gather the tree's skill checkpoints, ANN-match each against the project's
 /// scanned code graph for evidence candidates, then classify all of them in one
 /// batched LLM call. Upserts `project_coverage` rows and returns tallied counts.
@@ -66,6 +122,18 @@ pub(crate) async fn coverage_for_project(
     if checkpoints.is_empty() {
         return Ok(CoverageSummary { covered: 0, partial: 0, gap: 0, total: 0 });
     }
+
+    // Source of truth for reconciliation (Step 4) — built once, up front, so a
+    // checkpoint the LLM drops or hallucinates can never silently skew the count.
+    let checkpoint_pairs: Vec<(String, String)> = checkpoints
+        .iter()
+        .map(|c| {
+            (
+                c.try_get::<String, _>("id").unwrap_or_default(),
+                c.try_get::<String, _>("title").unwrap_or_default(),
+            )
+        })
+        .collect();
 
     let Some(graph_id) = crate::concept_graph::graph_id_for_project(pool, project_root_id).await?
     else {
@@ -159,24 +227,12 @@ pub(crate) async fn coverage_for_project(
         .map_err(|e| format!("coverage parse: {} raw: {}", e, crate::text_util::truncate_chars(json, 200)))?
         .verdicts;
 
-    // 4. Upsert + tally.
-    let mut sum = CoverageSummary { covered: 0, partial: 0, gap: 0, total: verdicts.len() as u32 };
-    let title_by_id: std::collections::HashMap<String, String> = checkpoints
-        .iter()
-        .map(|c| {
-            (
-                c.try_get::<String, _>("id").unwrap_or_default(),
-                c.try_get::<String, _>("title").unwrap_or_default(),
-            )
-        })
-        .collect();
-    for v in &verdicts {
-        let status = if v.status == "covered" || v.status == "partial" { v.status.as_str() } else { "gap" };
-        match status {
-            "covered" => sum.covered += 1,
-            "partial" => sum.partial += 1,
-            _ => sum.gap += 1,
-        }
+    // 4. Reconcile against checkpoints (source of truth) — drops hallucinated
+    //    ids, synthesizes a `gap` row for any checkpoint the LLM omitted.
+    //    Guarantees one row per checkpoint and covered+partial+gap == total.
+    let (rows, sum) = reconcile(&checkpoint_pairs, verdicts);
+
+    for row in &rows {
         sqlx::query(
             "INSERT INTO project_coverage (id, project_root_id, tree_id, checkpoint_node_id, checkpoint_title, status, evidence_node_id, reason) \
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8) \
@@ -186,11 +242,11 @@ pub(crate) async fn coverage_for_project(
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(project_root_id)
         .bind(tree_id)
-        .bind(&v.checkpoint_id)
-        .bind(title_by_id.get(&v.checkpoint_id).cloned().unwrap_or_default())
-        .bind(status)
-        .bind(&v.evidence_node_id)
-        .bind(&v.reason)
+        .bind(&row.checkpoint_node_id)
+        .bind(&row.checkpoint_title)
+        .bind(row.status)
+        .bind(&row.evidence_node_id)
+        .bind(&row.reason)
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -232,5 +288,59 @@ mod tests {
         assert_eq!(parsed.verdicts[0].reason, "matches UNet class");
         assert_eq!(parsed.verdicts[1].checkpoint_id, "c2");
         assert_eq!(parsed.verdicts[1].evidence_node_id, None);
+    }
+
+    fn verdict(checkpoint_id: &str, status: &str, evidence_node_id: Option<&str>, reason: &str) -> LlmVerdict {
+        LlmVerdict {
+            checkpoint_id: checkpoint_id.to_string(),
+            status: status.to_string(),
+            evidence_node_id: evidence_node_id.map(|s| s.to_string()),
+            reason: reason.to_string(),
+        }
+    }
+
+    /// checkpoints (never verdicts) are the source of truth: a checkpoint the
+    /// LLM drops still gets a row (synthesized gap, "not classified this run");
+    /// a hallucinated checkpoint_id the LLM invents is dropped entirely; the
+    /// tally always reconciles to exactly one row per real checkpoint.
+    #[test]
+    fn reconcile_uses_checkpoints_as_source_of_truth() {
+        let checkpoints = vec![
+            ("c1".to_string(), "Skill One".to_string()),
+            ("c2".to_string(), "Skill Two".to_string()),
+            ("c3".to_string(), "Skill Three".to_string()),
+        ];
+        let verdicts = vec![
+            verdict("c1", "covered", Some("n1"), "found it"),
+            // c2 intentionally missing — the LLM dropped it from its response
+            verdict("c3", "partial", None, "half done"),
+            verdict("ghost", "covered", Some("nX"), "hallucinated checkpoint id"),
+        ];
+
+        let (rows, summary) = reconcile(&checkpoints, verdicts);
+
+        // One row per real checkpoint — the hallucinated "ghost" id never appears.
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| r.checkpoint_node_id != "ghost"));
+
+        // Missing checkpoint (c2) synthesizes a default gap row.
+        let c2 = rows.iter().find(|r| r.checkpoint_node_id == "c2").expect("c2 row present");
+        assert_eq!(c2.status, "gap");
+        assert_eq!(c2.reason, "not classified this run");
+        assert_eq!(c2.evidence_node_id, None);
+        assert_eq!(c2.checkpoint_title, "Skill Two");
+
+        // Known verdicts still map through correctly.
+        let c1 = rows.iter().find(|r| r.checkpoint_node_id == "c1").expect("c1 row present");
+        assert_eq!(c1.status, "covered");
+        assert_eq!(c1.evidence_node_id.as_deref(), Some("n1"));
+
+        // Counts always reconcile: total == checkpoints.len(), and the three
+        // buckets sum back to total (no silent shrink, no orphaned tallies).
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.covered + summary.partial + summary.gap, summary.total);
+        assert_eq!(summary.covered, 1);
+        assert_eq!(summary.partial, 1);
+        assert_eq!(summary.gap, 1);
     }
 }
