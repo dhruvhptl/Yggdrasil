@@ -37,6 +37,11 @@ pub(crate) fn is_denied(canon: &Path) -> bool {
     false
 }
 
+/// True when `child` is inside `root` (both already canonicalized).
+pub(crate) fn path_contains(root: &Path, child: &Path) -> bool {
+    child.starts_with(root)
+}
+
 /// Canonicalize (resolving symlinks) → denylist → allowlist. Any failure → Err;
 /// never returns a path outside a registered root.
 pub(crate) fn resolve_safe_path(requested: &str, roots: &[ProjectRoot]) -> Result<PathBuf, String> {
@@ -82,6 +87,17 @@ pub(crate) async fn get_project_roots(pool: &PgPool) -> Vec<ProjectRoot> {
             path: strip_verbatim(&r.try_get::<String, _>("path").unwrap_or_default()),
         })
         .collect()
+}
+
+/// The registered root **id** whose canonical path contains `path`, else `None`.
+pub(crate) async fn resolve_project_root_id(pool: &PgPool, path: &str) -> Option<String> {
+    let canon = std::fs::canonicalize(path).ok()?;
+    for r in get_project_roots(pool).await {
+        if let Ok(rc) = std::fs::canonicalize(&r.path) {
+            if path_contains(&rc, &canon) { return Some(r.id); }
+        }
+    }
+    None
 }
 
 pub(crate) async fn add_project_root(pool: &PgPool, label: &str, path: &str) -> Result<ProjectRoot, String> {
@@ -157,6 +173,14 @@ mod tests {
         // Non-verbatim paths pass through unchanged.
         assert_eq!(strip_verbatim(r"C:\Users\dhruv\projects\kelvin"), r"C:\Users\dhruv\projects\kelvin");
         assert_eq!(strip_verbatim("/home/user/proj"), "/home/user/proj");
+    }
+
+    #[test]
+    fn path_contains_matches_nested_and_rejects_siblings() {
+        let root = Path::new(r"C:\Users\dhruv\projects\kelvin");
+        assert!(path_contains(root, Path::new(r"C:\Users\dhruv\projects\kelvin\src\main.py")));
+        assert!(path_contains(root, root));
+        assert!(!path_contains(root, Path::new(r"C:\Users\dhruv\projects\other")));
     }
 
     #[test]
