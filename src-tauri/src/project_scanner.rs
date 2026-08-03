@@ -486,15 +486,23 @@ pub(crate) async fn scan_project_with_events(
     app: &tauri::AppHandle,
     path: &str,
     tree_id: &str,
+    node_id: Option<&str>,
 ) {
     use tauri::Emitter;
+    let display = crate::project_roots::strip_verbatim(path);
+    let name = std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "project".to_string());
     let _ = app.emit("ygg-scan-progress", serde_json::json!({
-        "treeId": tree_id, "status": "started", "path": path,
+        "treeId": tree_id, "status": "started", "path": display,
     }));
     match scan_project_inner(pool, path, tree_id).await {
         Ok(r) => {
             let _ = app.emit("ygg-scan-complete", serde_json::json!({
                 "treeId": tree_id,
+                "nodeId": node_id,
+                "project": name,
                 "filesScanned": r.files_scanned,
                 "filesSkipped": r.files_skipped,
                 "nodesAdded": r.nodes_added,
@@ -502,14 +510,51 @@ pub(crate) async fn scan_project_with_events(
                 "edgesAdded": r.edges_added,
                 "errors": r.errors,
             }));
+            let summary = format!(
+                "🗂️ Scan complete — {}: {} files scanned, {} concepts added, {} links added.",
+                name, r.files_scanned, r.nodes_added, r.edges_added
+            );
+            post_scan_message(pool, tree_id, node_id, &summary).await;
             println!("📡 [scan] complete: {} files, {} nodes, {} edges (tree={})",
                 r.files_scanned, r.nodes_added, r.edges_added, tree_id);
         }
         Err(e) => {
             let _ = app.emit("ygg-scan-complete", serde_json::json!({
-                "treeId": tree_id, "error": e,
+                "treeId": tree_id, "nodeId": node_id, "project": name, "error": e,
             }));
+            let summary = format!("🗂️ Scan of {} failed: {}", name, e);
+            post_scan_message(pool, tree_id, node_id, &summary).await;
             println!("⚠️  [scan] failed (tree={}): {}", tree_id, e);
         }
     }
+}
+
+/// Persist the scan outcome as a Mimir message in the node's chat session, so it
+/// stays in the conversation and the agent sees it as prior context next turn.
+/// No-ops when there's no node context (falls back to the UI banner only).
+async fn post_scan_message(pool: &sqlx::PgPool, tree_id: &str, node_id: Option<&str>, content: &str) {
+    use sqlx::Row;
+    let Some(nid) = node_id else { return; };
+    let session_id = match sqlx::query(
+        "INSERT INTO mimir_chat_sessions (id, tree_id, node_id) VALUES ($1, $2, $3) \
+         ON CONFLICT (tree_id, node_id) DO UPDATE SET updated_at = NOW() RETURNING id"
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(tree_id)
+    .bind(nid)
+    .fetch_one(pool)
+    .await
+    {
+        Ok(row) => match row.try_get::<String, _>("id") { Ok(s) => s, Err(_) => return },
+        Err(e) => { println!("⚠️  [scan] could not open chat session: {}", e); return; }
+    };
+    let _ = sqlx::query(
+        "INSERT INTO mimir_chat_messages (id, session_id, role, content) \
+         VALUES ($1, $2, 'assistant', $3)"
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(&session_id)
+    .bind(content)
+    .execute(pool)
+    .await;
 }

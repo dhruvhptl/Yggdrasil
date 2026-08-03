@@ -125,6 +125,10 @@ export default function MimirChat({
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const loadedSessionKey = useRef<string | null>(null);
+  // Refs so the (once-mounted) scan listener can read the current context.
+  const treeIdRef = useRef(treeId);
+  const nodeIdRef = useRef(nodeId);
+  useEffect(() => { treeIdRef.current = treeId; nodeIdRef.current = nodeId; }, [treeId, nodeId]);
 
   // Auto-scroll to bottom on new messages
   useEffect(() => {
@@ -153,15 +157,21 @@ export default function MimirChat({
       unsubP = await listen<{ status: string; path: string }>("ygg-scan-progress", ({ payload }) => {
         setScanStatus(`Scanning ${payload.path}…`);
       });
-      unsubC = await listen<{ filesScanned?: number; nodesAdded?: number; edgesAdded?: number; error?: string }>(
+      unsubC = await listen<{ treeId?: string; nodeId?: string | null; project?: string; filesScanned?: number; nodesAdded?: number; edgesAdded?: number; error?: string }>(
         "ygg-scan-complete",
         ({ payload }) => {
-          setScanStatus(
-            payload.error
-              ? `Scan failed: ${payload.error}`
-              : `Scan complete — ${payload.filesScanned ?? 0} files, ${payload.nodesAdded ?? 0} concepts, ${payload.edgesAdded ?? 0} links.`
-          );
-          setTimeout(() => setScanStatus(null), 8000);
+          setScanStatus(null);
+          const proj = payload.project ? `${payload.project}: ` : "";
+          const summary = payload.error
+            ? `🗂️ Scan of ${payload.project ?? "project"} failed: ${payload.error}`
+            : `🗂️ Scan complete — ${proj}${payload.filesScanned ?? 0} files scanned, ${payload.nodesAdded ?? 0} concepts added, ${payload.edgesAdded ?? 0} links added.`;
+          // The result is persisted to this node's chat session server-side (so the
+          // agent sees it next turn). Mirror it into the open panel when it matches
+          // the current context so it "pops up" immediately.
+          const sameCtx = payload.treeId === treeIdRef.current && (payload.nodeId ?? null) === (nodeIdRef.current ?? null);
+          if (sameCtx) {
+            setMessages((prev) => [...prev, { role: "mimir", content: summary, createdAt: new Date().toISOString() }]);
+          }
         }
       );
     })();

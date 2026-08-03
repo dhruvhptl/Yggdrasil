@@ -55,6 +55,20 @@ pub(crate) fn resolve_safe_path(requested: &str, roots: &[ProjectRoot]) -> Resul
     Err("path is outside your registered project folders".to_string())
 }
 
+/// Strip Windows' verbatim `\\?\` prefix for display/storage. `\\?\C:\x` → `C:\x`,
+/// `\\?\UNC\server\share` → `\\server\share`. Non-verbatim paths pass through.
+/// std::fs::canonicalize emits verbatim paths on Windows; they're valid for FS
+/// ops but ugly to show the user, so we normalize before storing/displaying.
+pub(crate) fn strip_verbatim(p: &str) -> String {
+    if let Some(rest) = p.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{}", rest)
+    } else if let Some(rest) = p.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        p.to_string()
+    }
+}
+
 pub(crate) async fn get_project_roots(pool: &PgPool) -> Vec<ProjectRoot> {
     let rows = sqlx::query("SELECT id, label, path FROM project_roots ORDER BY created_at ASC")
         .fetch_all(pool)
@@ -64,7 +78,8 @@ pub(crate) async fn get_project_roots(pool: &PgPool) -> Vec<ProjectRoot> {
         .map(|r| ProjectRoot {
             id: r.try_get("id").unwrap_or_default(),
             label: r.try_get("label").unwrap_or_default(),
-            path: r.try_get("path").unwrap_or_default(),
+            // Normalize away any legacy \\?\ prefix stored before this cleanup.
+            path: strip_verbatim(&r.try_get::<String, _>("path").unwrap_or_default()),
         })
         .collect()
 }
@@ -77,7 +92,9 @@ pub(crate) async fn add_project_root(pool: &PgPool, label: &str, path: &str) -> 
     if is_denied(&canon) {
         return Err("That folder is blocked (secret-adjacent).".to_string());
     }
-    let canon_str = canon.to_string_lossy().to_string();
+    // Store the human-readable path (no \\?\ prefix); canonicalize still gates
+    // access at resolve time, so this is purely for clean storage/display.
+    let canon_str = strip_verbatim(&canon.to_string_lossy());
     let label = if label.trim().is_empty() {
         canon.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "Project".to_string())
     } else {
@@ -131,6 +148,15 @@ mod tests {
     }
     fn root_of(p: &Path) -> ProjectRoot {
         ProjectRoot { id: "1".into(), label: "t".into(), path: p.to_string_lossy().into() }
+    }
+
+    #[test]
+    fn strip_verbatim_normalizes_windows_prefixes() {
+        assert_eq!(strip_verbatim(r"\\?\C:\Users\dhruv\projects\kelvin"), r"C:\Users\dhruv\projects\kelvin");
+        assert_eq!(strip_verbatim(r"\\?\UNC\server\share\proj"), r"\\server\share\proj");
+        // Non-verbatim paths pass through unchanged.
+        assert_eq!(strip_verbatim(r"C:\Users\dhruv\projects\kelvin"), r"C:\Users\dhruv\projects\kelvin");
+        assert_eq!(strip_verbatim("/home/user/proj"), "/home/user/proj");
     }
 
     #[test]

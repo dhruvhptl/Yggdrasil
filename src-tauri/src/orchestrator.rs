@@ -26,7 +26,7 @@ pub(crate) enum OrchestratorJob {
     FetchTranscript { resource_id: String },
     ExtractSkillsFromResource { resource_id: String },
     ConsolidateSession { session_id: String },
-    ScanProject { path: String, tree_id: String },
+    ScanProject { path: String, tree_id: String, node_id: Option<String> },
 }
 
 // ─── JobQueue (managed Tauri state) ──────────────────────────────────────────
@@ -124,8 +124,8 @@ pub fn start_worker(pool: PgPool, app: AppHandle, client: reqwest::Client) -> Jo
                         Err(e) => println!("⚠️  [orch] consolidate_session failed: {}", e),
                     }
                 }
-                OrchestratorJob::ScanProject { path, tree_id } => {
-                    run_scan_project(&pool, &app, &path, &tree_id).await;
+                OrchestratorJob::ScanProject { path, tree_id, node_id } => {
+                    run_scan_project(&pool, &app, &path, &tree_id, node_id.as_deref()).await;
                 }
             }
         }
@@ -210,8 +210,8 @@ pub async fn enqueue_infer_deps(
 
 // ─── Job implementations ──────────────────────────────────────────────────────
 
-async fn run_scan_project(pool: &PgPool, app: &AppHandle, path: &str, tree_id: &str) {
-    crate::project_scanner::scan_project_with_events(pool, app, path, tree_id).await;
+async fn run_scan_project(pool: &PgPool, app: &AppHandle, path: &str, tree_id: &str, node_id: Option<&str>) {
+    crate::project_scanner::scan_project_with_events(pool, app, path, tree_id, node_id).await;
 }
 
 async fn run_rematch_all_nodes(pool: &PgPool, app: &AppHandle, client: &reqwest::Client, tree_id: &str) {

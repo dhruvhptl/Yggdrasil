@@ -730,9 +730,10 @@ pub(crate) async fn execute_tool(
                 )),
             };
             queue.send(crate::orchestrator::OrchestratorJob::ScanProject {
-                path: safe, tree_id: tree_id.to_string(),
+                path: safe, tree_id: tree_id.to_string(), node_id: ctx.node_id.clone(),
             }).await?;
-            Ok(format!("Scan of '{}' started in the background — I'll surface the results when it finishes.", path))
+            let display = crate::project_roots::strip_verbatim(path);
+            Ok(format!("Scanning '{}' in the background. I'll post the results right here in the chat as soon as it finishes.", display))
         }
         "read_file" => {
             let path = args["path"].as_str().ok_or("read_file requires a 'path'")?;

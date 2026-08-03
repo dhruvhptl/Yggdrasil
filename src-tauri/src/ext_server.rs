@@ -553,6 +553,7 @@ async fn create_library_handler(
         let _ = state.queue.send(crate::orchestrator::OrchestratorJob::ScanProject {
             path: lp.clone(),
             tree_id: tid.clone(),
+            node_id: None,
         }).await;
     }
 
