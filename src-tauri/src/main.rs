@@ -38,6 +38,7 @@ mod text_util;
 mod project_roots;
 mod auto_librarian;
 mod settings;
+mod project_coverage;
 
 use database::Database;
 use tauri::Manager;
@@ -264,6 +265,7 @@ fn main() {
             project_scanner::backfill_scan_embeddings_cmd,
             settings::get_agent_config_cmd,
             settings::set_agent_config_cmd,
+            project_coverage::run_project_coverage_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -122,6 +122,7 @@ export default function MimirChat({
   const [suggestionTapped, setSuggestionTapped] = useState(false);
   const [shouldAutoSend, setShouldAutoSend] = useState(false);
   const [scanStatus, setScanStatus] = useState<string | null>(null);
+  const [coverage, setCoverage] = useState<{ covered: number; partial: number; gap: number; total: number } | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const loadedSessionKey = useRef<string | null>(null);
@@ -179,6 +180,27 @@ export default function MimirChat({
       unsubP = p; unsubC = c;
     })();
     return () => { cancelled = true; unsubP?.(); unsubC?.(); };
+  }, []);
+
+  // Listen for the tree-vs-repo coverage pass (auto-run inline after a scan
+  // completes; also fired by a manual re-run). Same cancel-guarded pattern as
+  // the scan listener above — a bare async effect would double-subscribe
+  // under StrictMode.
+  useEffect(() => {
+    let unsub: (() => void) | undefined;
+    let cancelled = false;
+    (async () => {
+      const u = await listen<{ projectRootId?: string; treeId?: string; covered: number; partial: number; gap: number; total: number }>(
+        "ygg-project-coverage",
+        ({ payload }) => {
+          if (payload.treeId !== treeIdRef.current) return;
+          setCoverage({ covered: payload.covered, partial: payload.partial, gap: payload.gap, total: payload.total });
+        }
+      );
+      if (cancelled) { u(); return; }
+      unsub = u;
+    })();
+    return () => { cancelled = true; unsub?.(); };
   }, []);
 
   // Load session history when panel opens or context changes
@@ -957,6 +979,11 @@ export default function MimirChat({
         >
           {scanStatus && (
             <div className="px-3 py-1 text-xs opacity-70 border-t border-white/10">🗂️ {scanStatus}</div>
+          )}
+          {coverage && (
+            <div className="px-3 py-1 text-xs opacity-70 border-t border-white/10">
+              🧭 {coverage.covered}/{coverage.total} covered · {coverage.partial} partial · {coverage.gap} gaps
+            </div>
           )}
           <div
             style={{

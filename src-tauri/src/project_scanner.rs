@@ -586,6 +586,12 @@ pub(crate) async fn scan_project_with_events(
             post_scan_message(pool, tree_id, node_id, &summary).await;
             println!("📡 [scan] complete: {} files, {} nodes, {} edges (tree={})",
                 r.files_scanned, r.nodes_added, r.edges_added, tree_id);
+
+            // Run the tree-vs-repo coverage pass inline (no ProjectCoverage job —
+            // the orchestrator worker holds no JobQueue sender, see orchestrator.rs's
+            // sequential consolidate->extract-facts chain for the same reason).
+            // Non-fatal: a coverage failure never fails the scan itself.
+            run_coverage_after_scan(pool, app, client, path, tree_id).await;
         }
         Err(e) => {
             let _ = app.emit("ygg-scan-complete", serde_json::json!({
@@ -595,6 +601,54 @@ pub(crate) async fn scan_project_with_events(
             post_scan_message(pool, tree_id, node_id, &summary).await;
             println!("⚠️  [scan] failed (tree={}): {}", tree_id, e);
         }
+    }
+}
+
+/// Resolve the project root for `path` and, if this tree has at least one
+/// checkpoint, run the coverage pass and emit `ygg-project-coverage`.
+/// Best-effort: any failure is logged, never propagated (the scan already
+/// completed successfully by the time this runs).
+async fn run_coverage_after_scan(
+    pool: &sqlx::PgPool,
+    app: &tauri::AppHandle,
+    client: &reqwest::Client,
+    path: &str,
+    tree_id: &str,
+) {
+    use tauri::Emitter;
+    let Some(project_root_id) = crate::project_roots::resolve_project_root_id(pool, path).await else {
+        return; // scan path isn't inside a registered project root — nothing to grade against
+    };
+
+    let has_checkpoints = sqlx::query(
+        "SELECT 1 FROM tree_nodes n \
+         JOIN tree_nodes parent ON n.parent_id = parent.id \
+         WHERE n.tree_id = $1 AND n.type = 'branch' AND parent.type = 'branch' LIMIT 1"
+    )
+    .bind(tree_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .is_some();
+    if !has_checkpoints {
+        return;
+    }
+
+    match crate::project_coverage::coverage_for_project(pool, client, &project_root_id, tree_id).await {
+        Ok(summary) => {
+            let _ = app.emit("ygg-project-coverage", serde_json::json!({
+                "projectRootId": project_root_id,
+                "treeId": tree_id,
+                "covered": summary.covered,
+                "partial": summary.partial,
+                "gap": summary.gap,
+                "total": summary.total,
+            }));
+            println!("📡 [coverage] {} covered / {} partial / {} gap (of {}) — tree={}",
+                summary.covered, summary.partial, summary.gap, summary.total, tree_id);
+        }
+        Err(e) => println!("⚠️  [coverage] pass failed for tree {}: {}", tree_id, e),
     }
 }
 
