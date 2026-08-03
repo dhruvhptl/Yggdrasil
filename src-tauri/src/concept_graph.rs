@@ -232,6 +232,18 @@ pub(crate) async fn graph_id_for_tree(
     Ok(row.and_then(|r| r.try_get::<String, _>("id").ok()))
 }
 
+pub(crate) async fn graph_id_for_project(
+    pool: &PgPool,
+    project_root_id: &str,
+) -> Result<Option<String>, String> {
+    let row = sqlx::query("SELECT id FROM concept_graphs WHERE project_root_id = $1 ORDER BY created_at DESC LIMIT 1")
+        .bind(project_root_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(row.and_then(|r| r.try_get::<String, _>("id").ok()))
+}
+
 /// Keyword search over the tree's concept graph. Embedding fallback is dormant
 /// (Phase 1 leaves node embeddings NULL). Empty subgraph when nothing matches.
 pub(crate) async fn query_graph(

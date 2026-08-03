@@ -387,12 +387,37 @@ async fn resolve_or_create_graph(pool: &PgPool, tree_id: &str) -> Result<String,
     Ok(id)
 }
 
+/// Resolve (or create) the project's concept graph id. When the scan path is
+/// inside a registered project root, one graph is shared across all trees
+/// scanned from that root: existing project graph → adopt this tree's
+/// pre-existing (tree-only) graph so re-scan migrates it in place → create new.
+/// Falls back to the legacy tree-only resolver when there is no registered root.
+async fn resolve_or_create_project_graph(pool: &PgPool, project_root_id: Option<&str>, tree_id: &str) -> Result<String, String> {
+    let Some(pr) = project_root_id else {
+        return resolve_or_create_graph(pool, tree_id).await; // legacy: tree-only
+    };
+    if let Some(id) = crate::concept_graph::graph_id_for_project(pool, pr).await? {
+        return Ok(id);
+    }
+    // Adopt this tree's pre-existing (tree-only) graph so re-scan migrates in place.
+    if let Some(id) = crate::concept_graph::graph_id_for_tree(pool, tree_id).await? {
+        sqlx::query("UPDATE concept_graphs SET project_root_id = $1 WHERE id = $2")
+            .bind(pr).bind(&id).execute(pool).await.map_err(|e| e.to_string())?;
+        return Ok(id);
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO concept_graphs (id, tree_id, project_root_id) VALUES ($1, $2, $3)")
+        .bind(&id).bind(tree_id).bind(pr).execute(pool).await.map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
 pub(crate) async fn scan_project_inner(pool: &PgPool, path: &str, tree_id: &str) -> Result<ScanResult, String> {
     let root = std::path::Path::new(path);
     if !root.exists() {
         return Err(format!("Directory not found: {}", path));
     }
-    let graph_id = resolve_or_create_graph(pool, tree_id).await?;
+    let project_root_id = crate::project_roots::resolve_project_root_id(pool, path).await;
+    let graph_id = resolve_or_create_project_graph(pool, project_root_id.as_deref(), tree_id).await?;
 
     let mut result = ScanResult::default();
     let mut all_nodes: Vec<ExtractedNode> = Vec::new();
