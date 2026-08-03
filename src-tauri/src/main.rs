@@ -261,6 +261,7 @@ fn main() {
             project_roots::get_project_roots_cmd,
             project_roots::add_project_root_cmd,
             project_roots::remove_project_root_cmd,
+            project_scanner::backfill_scan_embeddings_cmd,
             settings::get_agent_config_cmd,
             settings::set_agent_config_cmd,
         ])

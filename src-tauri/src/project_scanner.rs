@@ -411,7 +411,39 @@ async fn resolve_or_create_project_graph(pool: &PgPool, project_root_id: Option<
     Ok(id)
 }
 
-pub(crate) async fn scan_project_inner(pool: &PgPool, path: &str, tree_id: &str) -> Result<ScanResult, String> {
+/// Build the text embedded per extracted node: title, description, file path.
+fn embed_text(title: &str, description: &str, file_path: &str) -> String {
+    format!("{} :: {} :: {}", title, description, file_path)
+}
+
+/// Embed every extracted node in this graph that still has NULL embedding.
+/// Batch failures degrade gracefully (Err surfaces to the caller, which pushes
+/// it to ScanResult.errors — the scan still completes without vectors).
+async fn embed_graph_nodes(pool: &PgPool, client: &reqwest::Client, graph_id: &str) -> Result<usize, String> {
+    let rows = sqlx::query(
+        "SELECT id, title, description, file_path FROM concept_graph_nodes \
+         WHERE graph_id = $1 AND embedding IS NULL"
+    ).bind(graph_id).fetch_all(pool).await.map_err(|e| e.to_string())?;
+    let mut done = 0usize;
+    for chunk in rows.chunks(50) {
+        let texts: Vec<String> = chunk.iter().map(|r| embed_text(
+            &r.try_get::<String,_>("title").unwrap_or_default(),
+            &r.try_get::<String,_>("description").unwrap_or_default(),
+            &r.try_get::<Option<String>,_>("file_path").ok().flatten().unwrap_or_default(),
+        )).collect();
+        let vecs = crate::mimir_ingest::get_embeddings_batch(client, &texts).await?;
+        for (r, v) in chunk.iter().zip(vecs.iter()) {
+            let id: String = r.try_get("id").unwrap_or_default();
+            sqlx::query("UPDATE concept_graph_nodes SET embedding = $1::vector WHERE id = $2")
+                .bind(crate::mimir_ingest::vector_str(v)).bind(&id)
+                .execute(pool).await.map_err(|e| e.to_string())?;
+            done += 1;
+        }
+    }
+    Ok(done)
+}
+
+pub(crate) async fn scan_project_inner(pool: &PgPool, client: &reqwest::Client, path: &str, tree_id: &str) -> Result<ScanResult, String> {
     let root = std::path::Path::new(path);
     if !root.exists() {
         return Err(format!("Directory not found: {}", path));
@@ -455,6 +487,11 @@ pub(crate) async fn scan_project_inner(pool: &PgPool, path: &str, tree_id: &str)
     result.nodes_added = merged.added;
     result.nodes_enriched = merged.enriched;
     result.edges_added = merged.edges;
+
+    if let Err(e) = embed_graph_nodes(pool, client, &graph_id).await {
+        result.errors.push(format!("embedding: {}", e));
+    }
+
     Ok(result)
 }
 
@@ -501,6 +538,12 @@ mod tests {
         let (tn, _) = extract_from_file("api.ts", "interface Provider {}\nfunction fetchIt() {}\n");
         assert!(tn.iter().any(|n| n.title == "fetchIt"));
     }
+
+    #[test]
+    fn embed_text_joins_title_desc_path() {
+        assert_eq!(embed_text("UNet", "", "kelvin/models/unet.py"), "UNet ::  :: kelvin/models/unet.py");
+        assert_eq!(embed_text("rrf", "merge", "s.py"), "rrf :: merge :: s.py");
+    }
 }
 
 /// Background wrapper: emits a started event, runs the scan, emits a complete
@@ -509,6 +552,7 @@ mod tests {
 pub(crate) async fn scan_project_with_events(
     pool: &sqlx::PgPool,
     app: &tauri::AppHandle,
+    client: &reqwest::Client,
     path: &str,
     tree_id: &str,
     node_id: Option<&str>,
@@ -522,7 +566,7 @@ pub(crate) async fn scan_project_with_events(
     let _ = app.emit("ygg-scan-progress", serde_json::json!({
         "treeId": tree_id, "status": "started", "path": display,
     }));
-    match scan_project_inner(pool, path, tree_id).await {
+    match scan_project_inner(pool, client, path, tree_id).await {
         Ok(r) => {
             let _ = app.emit("ygg-scan-complete", serde_json::json!({
                 "treeId": tree_id,
@@ -582,4 +626,20 @@ async fn post_scan_message(pool: &sqlx::PgPool, tree_id: &str, node_id: Option<&
     .bind(content)
     .execute(pool)
     .await;
+}
+
+/// Backfill embeddings for every scanned graph node still missing one — covers
+/// concept graphs that were scanned before node embedding was wired in.
+#[tauri::command]
+pub async fn backfill_scan_embeddings_cmd(
+    client: tauri::State<'_, reqwest::Client>,
+    database: tauri::State<'_, crate::database::Database>,
+) -> Result<usize, String> {
+    let graph_ids: Vec<String> = sqlx::query(
+        "SELECT DISTINCT graph_id FROM concept_graph_nodes WHERE embedding IS NULL"
+    ).fetch_all(&database.pool).await.map_err(|e| e.to_string())?
+     .iter().filter_map(|r| r.try_get::<String,_>("graph_id").ok()).collect();
+    let mut total = 0usize;
+    for gid in graph_ids { total += embed_graph_nodes(&database.pool, &client, &gid).await?; }
+    Ok(total)
 }
