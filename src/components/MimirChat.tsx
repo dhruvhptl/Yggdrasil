@@ -153,18 +153,19 @@ export default function MimirChat({
   useEffect(() => {
     let unsubP: (() => void) | undefined;
     let unsubC: (() => void) | undefined;
+    let cancelled = false;
     (async () => {
-      unsubP = await listen<{ status: string; path: string }>("ygg-scan-progress", ({ payload }) => {
+      const p = await listen<{ status: string; path: string }>("ygg-scan-progress", ({ payload }) => {
         setScanStatus(`Scanning ${payload.path}…`);
       });
-      unsubC = await listen<{ treeId?: string; nodeId?: string | null; project?: string; filesScanned?: number; nodesAdded?: number; edgesAdded?: number; error?: string }>(
+      const c = await listen<{ treeId?: string; nodeId?: string | null; project?: string; filesScanned?: number; nodesAdded?: number; nodesEnriched?: number; edgesAdded?: number; error?: string }>(
         "ygg-scan-complete",
         ({ payload }) => {
           setScanStatus(null);
           const proj = payload.project ? `${payload.project}: ` : "";
           const summary = payload.error
             ? `🗂️ Scan of ${payload.project ?? "project"} failed: ${payload.error}`
-            : `🗂️ Scan complete — ${proj}${payload.filesScanned ?? 0} files scanned, ${payload.nodesAdded ?? 0} concepts added, ${payload.edgesAdded ?? 0} links added.`;
+            : `🗂️ Scan complete — ${proj}${payload.filesScanned ?? 0} files scanned, ${payload.nodesAdded ?? 0} new concepts, ${payload.nodesEnriched ?? 0} refreshed, ${payload.edgesAdded ?? 0} links.`;
           // The result is persisted to this node's chat session server-side (so the
           // agent sees it next turn). Mirror it into the open panel when it matches
           // the current context so it "pops up" immediately.
@@ -174,8 +175,10 @@ export default function MimirChat({
           }
         }
       );
+      if (cancelled) { p(); c(); return; }
+      unsubP = p; unsubC = c;
     })();
-    return () => { unsubP?.(); unsubC?.(); };
+    return () => { cancelled = true; unsubP?.(); unsubC?.(); };
   }, []);
 
   // Load session history when panel opens or context changes

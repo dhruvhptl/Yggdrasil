@@ -511,8 +511,8 @@ pub(crate) async fn scan_project_with_events(
                 "errors": r.errors,
             }));
             let summary = format!(
-                "🗂️ Scan complete — {}: {} files scanned, {} concepts added, {} links added.",
-                name, r.files_scanned, r.nodes_added, r.edges_added
+                "🗂️ Scan complete — {}: {} files scanned, {} new concepts, {} refreshed, {} links.",
+                name, r.files_scanned, r.nodes_added, r.nodes_enriched, r.edges_added
             );
             post_scan_message(pool, tree_id, node_id, &summary).await;
             println!("📡 [scan] complete: {} files, {} nodes, {} edges (tree={})",
