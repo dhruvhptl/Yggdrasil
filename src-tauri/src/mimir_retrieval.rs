@@ -1277,12 +1277,10 @@ pub async fn mimir_chat(
                     queue: Some(&queue),
                     project_roots: project_roots.clone(),
                     project_root_id: project_root_id.clone(),
-                    mode: agent_mode,
-                    plan: agent_plan.clone(),
                     session_id: session_id_opt.clone(),
                 };
                 let loop_cfg = agent_mode.loop_config();
-                let safety = std::time::Duration::from_secs(loop_cfg.timeout_secs + 30);
+                let safety = std::time::Duration::from_secs(loop_cfg.timeout_secs + 90);
                 match tokio::time::timeout(
                     safety,
                     crate::mimir_agent::run_agent_turn(

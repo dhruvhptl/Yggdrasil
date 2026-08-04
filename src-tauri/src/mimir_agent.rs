@@ -498,8 +498,6 @@ pub(crate) struct ToolCtx<'a> {
     pub queue: Option<&'a crate::orchestrator::JobQueue>,
     pub project_roots: Vec<crate::project_roots::ProjectRoot>,
     pub project_root_id: Option<String>,
-    pub mode: AgentMode,
-    pub plan: Option<String>,
     pub session_id: Option<String>,
 }
 
@@ -911,7 +909,7 @@ pub(crate) async fn execute_tool(
             if let (Some(s), Some(e)) = (start, end) {
                 let body = std::fs::read_to_string(&safe)
                     .map_err(|err| format!("could not read file: {}", err))?;
-                return Ok(format!("{} [lines {}-{}]:\n{}", display, s, e, slice_lines(&body, s, e)));
+                return Ok(format!("{} [lines {}-{}]:\n{}", display, s, e, crate::text_util::truncate_chars(&slice_lines(&body, s, e), 100_000)));
             }
             let content = std::fs::read_to_string(&safe)
                 .map_err(|e| format!("could not read file: {}", e))?;
@@ -955,7 +953,7 @@ pub(crate) async fn execute_tool(
                     .standard_filters(true)
                     .filter_entry(move |e| {
                         let n = e.file_name().to_string_lossy();
-                        !skip.contains(&n.as_ref())
+                        !skip.contains(&n.as_ref()) && !crate::project_roots::is_denied(e.path())
                     })
                     .build();
                 for entry in walker.flatten() {
@@ -1002,6 +1000,7 @@ pub(crate) async fn execute_tool(
                 .filter_entry(|e| {
                     let n = e.file_name().to_string_lossy();
                     !matches!(n.as_ref(), "node_modules" | "target" | "venv" | "__pycache__" | ".git")
+                        && !crate::project_roots::is_denied(e.path())
                 }).build();
 
             let mut hits: Vec<String> = Vec::new();
@@ -1014,6 +1013,9 @@ pub(crate) async fn execute_tool(
                     let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
                     if !matches_glob(&name, g) { continue; }
                 }
+                // Defense-in-depth: re-check the denylist right before reading, in
+                // case an entry slips past filter_entry (e.g. a symlink race).
+                if crate::project_roots::is_denied(p) { continue; }
                 let text = match std::fs::read_to_string(p) { Ok(t) => t, Err(_) => continue }; // skips binaries
                 let rel = p.strip_prefix(&safe).unwrap_or(p).to_string_lossy();
                 let lines: Vec<&str> = text.lines().collect();
@@ -1574,6 +1576,17 @@ mod tests {
         assert!(msg.contains("auth.rs"));           // finding surfaced
         assert!(msg.contains("timeout"));           // reason surfaced
         assert!(msg.to_lowercase().contains("cut short"));
+    }
+
+    #[test]
+    fn repo_tools_denylist_blocks_secret_shaped_filenames() {
+        // Fix 1: search_in_project / list_project_files must prune the same
+        // secret files read_file already blocks (id_rsa, *.key, credentials*, ...).
+        assert!(crate::project_roots::is_denied(std::path::Path::new("/x/id_rsa")));
+        assert!(crate::project_roots::is_denied(std::path::Path::new("/x/server.key")));
+        assert!(crate::project_roots::is_denied(std::path::Path::new("/x/credentials.json")));
+        assert!(crate::project_roots::is_denied(std::path::Path::new("/x/.env")));
+        assert!(!crate::project_roots::is_denied(std::path::Path::new("/x/main.rs")));
     }
 
     #[test]
