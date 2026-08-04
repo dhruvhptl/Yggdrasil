@@ -132,6 +132,9 @@ export default function MimirChat({
   const nodeIdRef = useRef(nodeId);
   useEffect(() => { treeIdRef.current = treeId; nodeIdRef.current = nodeId; }, [treeId, nodeId]);
 
+  // Clear a stale coverage chip when the tree/node/project context changes.
+  useEffect(() => { setCoverage(null); }, [treeId, nodeId, projectRootId]);
+
   // Auto-scroll to bottom on new messages
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
