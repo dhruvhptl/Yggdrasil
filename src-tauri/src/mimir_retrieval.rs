@@ -967,7 +967,8 @@ pub(crate) async fn resolve_session_id(
     if let Some(pr) = project_root_id {
         let row = sqlx::query(
             "INSERT INTO mimir_chat_sessions (id, project_root_id) VALUES ($1, $2) \
-             ON CONFLICT (project_root_id) DO UPDATE SET updated_at = NOW() RETURNING id"
+             ON CONFLICT (project_root_id) WHERE project_root_id IS NOT NULL \
+             DO UPDATE SET updated_at = NOW() RETURNING id"
         ).bind(uuid::Uuid::new_v4().to_string()).bind(pr)
          .fetch_one(pool).await.map_err(|e| e.to_string())?;
         return Ok(row.try_get("id").ok());
