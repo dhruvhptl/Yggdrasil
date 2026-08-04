@@ -991,6 +991,7 @@ pub async fn mimir_chat(
     tree_id: Option<String>,
     node_id: Option<String>,
     project_root_id: Option<String>,
+    mode: Option<String>,
     node_title: Option<String>,
     project_name: Option<String>,
     tree_name: Option<String>,
@@ -1152,6 +1153,8 @@ pub async fn mimir_chat(
         None => String::new(),
     };
 
+    let agent_mode = crate::mimir_agent::AgentMode::from_param(mode.as_deref());
+
     let mut agent_system_prompt = build_system_prompt(&PromptInputs {
         node_title: node_title.as_deref(),
         node_description: node_description.as_deref(),
@@ -1207,6 +1210,14 @@ pub async fn mimir_chat(
         }
     }
 
+    if agent_mode == crate::mimir_agent::AgentMode::Dive {
+        agent_system_prompt.push_str(
+            "\n\nYou are in DIVE mode — explore the project deeply before answering: \
+             orient, use the graph, grep, read files, and cite file:line. Maintain a working plan \
+             with set_plan. Prefer an honest partial answer over a shallow one."
+        );
+    }
+
     // 6b. Run the agent; fall back to classic one-shot synthesis on any failure.
     let agent_enabled = std::env::var("MIMIR_AGENT_ENABLED")
         .map(|v| v != "false")
@@ -1240,8 +1251,9 @@ pub async fn mimir_chat(
                     queue: Some(&queue),
                     project_roots: project_roots.clone(),
                     project_root_id: project_root_id.clone(),
+                    mode: agent_mode,
                 };
-                let loop_cfg = crate::mimir_agent::AgentLoopConfig::chat(); // Task 2: from mode
+                let loop_cfg = agent_mode.loop_config();
                 let safety = std::time::Duration::from_secs(loop_cfg.timeout_secs + 30);
                 match tokio::time::timeout(
                     safety,

@@ -109,7 +109,7 @@ export default function MimirChat({
 }) {
   const location = useLocation();
   const navigate = useNavigate();
-  const { treeId, nodeId, nodeTitle, projectName, treeName, projectRootId, projectLabel, setMimirContext } = useMimirContext();
+  const { treeId, nodeId, nodeTitle, projectName, treeName, projectRootId, projectLabel, mode, setMimirContext } = useMimirContext();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [resumed, setResumed] = useState(false);
   const [input, setInput] = useState("");
@@ -396,6 +396,7 @@ export default function MimirChat({
         treeId,
         nodeId,
         projectRootId: hasTreeScope ? null : projectRootId,
+        mode,
         nodeTitle,
         projectName,
         treeName,
@@ -660,6 +661,40 @@ export default function MimirChat({
               <option key={r.id} value={r.id}>{r.label}</option>
             ))}
           </select>
+          <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+            <button
+              onClick={() => setMimirContext({ mode: "chat" })}
+              title="Chat mode — quick answers, smaller tool budget"
+              style={{
+                background: mode === "chat" ? "rgba(16,185,129,0.15)" : "none",
+                border: mode === "chat" ? "1px solid rgba(16,185,129,0.4)" : "1px solid #334155",
+                color: mode === "chat" ? "#10b981" : "#64748b",
+                cursor: "pointer",
+                padding: "3px 8px",
+                borderRadius: 6,
+                fontSize: 10,
+                fontWeight: 600,
+              }}
+            >
+              Chat
+            </button>
+            <button
+              onClick={() => setMimirContext({ mode: "dive" })}
+              title="Dive mode — deeper exploration, bigger tool budget"
+              style={{
+                background: mode === "dive" ? "rgba(16,185,129,0.15)" : "none",
+                border: mode === "dive" ? "1px solid rgba(16,185,129,0.4)" : "1px solid #334155",
+                color: mode === "dive" ? "#10b981" : "#64748b",
+                cursor: "pointer",
+                padding: "3px 8px",
+                borderRadius: 6,
+                fontSize: 10,
+                fontWeight: 600,
+              }}
+            >
+              Dive
+            </button>
+          </div>
         </div>
 
         {/* Model logs popover — dev only */}

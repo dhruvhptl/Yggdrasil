@@ -445,6 +445,7 @@ pub(crate) struct ToolCtx<'a> {
     pub queue: Option<&'a crate::orchestrator::JobQueue>,
     pub project_roots: Vec<crate::project_roots::ProjectRoot>,
     pub project_root_id: Option<String>,
+    pub mode: AgentMode,
 }
 
 /// Prefer the project's concept graph over the tree's, so a project-scoped
@@ -871,6 +872,23 @@ impl AgentLoopConfig {
     pub fn dive() -> Self { Self { max_tool_calls: 20, max_iterations: 24, timeout_secs: 240 } }
 }
 
+/// Chat/dive mode selection — chosen per-turn from the `mode` param, session-
+/// persisted client-side, and swappable mid-thread. Selects the loop budget
+/// (`AgentLoopConfig`) and, for dive, an extra system-prompt framing block.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum AgentMode { Chat, Dive }
+impl AgentMode {
+    pub fn from_param(s: Option<&str>) -> Self {
+        match s.map(|v| v.trim().to_lowercase()).as_deref() {
+            Some("dive") => AgentMode::Dive,
+            _ => AgentMode::Chat,
+        }
+    }
+    pub fn loop_config(&self) -> AgentLoopConfig {
+        match self { AgentMode::Dive => AgentLoopConfig::dive(), AgentMode::Chat => AgentLoopConfig::chat() }
+    }
+}
+
 /// Mechanical (no-LLM) summary returned when the loop is cut short, so the
 /// richest path degrades to an honest partial — never a silent tool-less answer.
 fn honest_partial_answer(state: &AgentTurnState, reason: &str) -> String {
@@ -1201,6 +1219,16 @@ mod tests {
         assert_eq!((c.max_tool_calls, c.max_iterations, c.timeout_secs), (10, 14, 120));
         let d = AgentLoopConfig::dive();
         assert_eq!((d.max_tool_calls, d.max_iterations, d.timeout_secs), (20, 24, 240));
+    }
+
+    #[test]
+    fn agent_mode_parses_and_maps_budget() {
+        assert!(matches!(AgentMode::from_param(Some("dive")), AgentMode::Dive));
+        assert!(matches!(AgentMode::from_param(Some("DIVE")), AgentMode::Dive)); // case-insensitive
+        assert!(matches!(AgentMode::from_param(Some("garbage")), AgentMode::Chat));
+        assert!(matches!(AgentMode::from_param(None), AgentMode::Chat));
+        assert_eq!(AgentMode::Dive.loop_config().max_tool_calls, 20);
+        assert_eq!(AgentMode::Chat.loop_config().max_tool_calls, 10);
     }
 
     #[test]

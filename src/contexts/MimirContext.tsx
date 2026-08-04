@@ -8,7 +8,8 @@ interface MimirContextValue {
   treeName: string | null;
   projectRootId: string | null;
   projectLabel: string | null;
-  setMimirContext: (ctx: { treeId?: string | null; nodeId?: string | null; nodeTitle?: string | null; projectName?: string | null; treeName?: string | null; projectRootId?: string | null; projectLabel?: string | null }) => void;
+  mode: 'chat' | 'dive';
+  setMimirContext: (ctx: { treeId?: string | null; nodeId?: string | null; nodeTitle?: string | null; projectName?: string | null; treeName?: string | null; projectRootId?: string | null; projectLabel?: string | null; mode?: 'chat' | 'dive' }) => void;
   openMimir: () => void;
   registerOpenMimir: (fn: () => void) => void;
 }
@@ -21,6 +22,7 @@ const MimirContext = createContext<MimirContextValue>({
   treeName: null,
   projectRootId: null,
   projectLabel: null,
+  mode: 'chat',
   setMimirContext: () => {},
   openMimir: () => {},
   registerOpenMimir: () => {},
@@ -34,9 +36,10 @@ export function MimirProvider({ children }: { children: ReactNode }) {
   const [treeName, setTreeName] = useState<string | null>(null);
   const [projectRootId, setProjectRootId] = useState<string | null>(null);
   const [projectLabel, setProjectLabel] = useState<string | null>(null);
+  const [mode, setMode] = useState<'chat' | 'dive'>('chat');
   const openMimirRef = useRef<() => void>(() => {});
 
-  function setMimirContext(ctx: { treeId?: string | null; nodeId?: string | null; nodeTitle?: string | null; projectName?: string | null; treeName?: string | null; projectRootId?: string | null; projectLabel?: string | null }) {
+  function setMimirContext(ctx: { treeId?: string | null; nodeId?: string | null; nodeTitle?: string | null; projectName?: string | null; treeName?: string | null; projectRootId?: string | null; projectLabel?: string | null; mode?: 'chat' | 'dive' }) {
     if (ctx.treeId !== undefined) setTreeId(ctx.treeId);
     if (ctx.nodeId !== undefined) setNodeId(ctx.nodeId);
     if (ctx.nodeTitle !== undefined) setNodeTitle(ctx.nodeTitle);
@@ -44,6 +47,7 @@ export function MimirProvider({ children }: { children: ReactNode }) {
     if (ctx.treeName !== undefined) setTreeName(ctx.treeName);
     if (ctx.projectRootId !== undefined) setProjectRootId(ctx.projectRootId);
     if (ctx.projectLabel !== undefined) setProjectLabel(ctx.projectLabel);
+    if (ctx.mode !== undefined) setMode(ctx.mode);
   }
 
   function openMimir() {
@@ -55,7 +59,7 @@ export function MimirProvider({ children }: { children: ReactNode }) {
   }
 
   return (
-    <MimirContext.Provider value={{ treeId, nodeId, nodeTitle, projectName, treeName, projectRootId, projectLabel, setMimirContext, openMimir, registerOpenMimir }}>
+    <MimirContext.Provider value={{ treeId, nodeId, nodeTitle, projectName, treeName, projectRootId, projectLabel, mode, setMimirContext, openMimir, registerOpenMimir }}>
       {children}
     </MimirContext.Provider>
   );
