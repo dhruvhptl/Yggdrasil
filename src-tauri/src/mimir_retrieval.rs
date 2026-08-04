@@ -1233,10 +1233,13 @@ pub async fn mimir_chat(
                     project_roots: project_roots.clone(),
                     project_root_id: project_root_id.clone(),
                 };
+                let loop_cfg = crate::mimir_agent::AgentLoopConfig::chat(); // Task 2: from mode
+                let safety = std::time::Duration::from_secs(loop_cfg.timeout_secs + 30);
                 match tokio::time::timeout(
-                    std::time::Duration::from_secs(120),
+                    safety,
                     crate::mimir_agent::run_agent_turn(
                         &agent_cfg,
+                        loop_cfg,
                         &tool_ctx,
                         &agent_system_prompt,
                         &history_slice,
@@ -1246,9 +1249,9 @@ pub async fn mimir_chat(
                 )
                 .await
                 {
-                    Ok(Ok(r)) => agent_outcome = Some(r),
-                    Ok(Err(e)) => println!("⚠️  [agent] loop failed — falling back to classic synthesis: {}", e),
-                    Err(_) => println!("⚠️  [agent] turn exceeded 120s — falling back to classic synthesis"),
+                    Ok(Ok(r)) => agent_outcome = Some(r), // includes honest-partial now
+                    Ok(Err(e)) => println!("⚠️  [agent] genuine failure — classic synthesis: {}", e),
+                    Err(_) => println!("⚠️  [agent] hard hang past safety timeout — classic synthesis"),
                 }
             }
             Err(e) => println!("⚠️  [agent] config unavailable — classic path: {}", e),

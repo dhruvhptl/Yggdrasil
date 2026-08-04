@@ -856,13 +856,64 @@ fn emit_agent_event<S: serde::Serialize>(ctx: &ToolCtx, event: &str, payload: &S
     }
 }
 
-const MAX_TOOL_CALLS: u32 = 6;
-const MAX_ITERATIONS: u32 = 8;
+/// Cap on repo-tool observations pushed into the message history — these can
+/// be large, and an uncapped one would blow the context window over a long walk.
+const MAX_REPO_OBSERVATION_CHARS: usize = 6000;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AgentLoopConfig {
+    pub max_tool_calls: u32,
+    pub max_iterations: u32,
+    pub timeout_secs: u64,
+}
+impl AgentLoopConfig {
+    pub fn chat() -> Self { Self { max_tool_calls: 10, max_iterations: 14, timeout_secs: 120 } }
+    pub fn dive() -> Self { Self { max_tool_calls: 20, max_iterations: 24, timeout_secs: 240 } }
+}
+
+/// Mechanical (no-LLM) summary returned when the loop is cut short, so the
+/// richest path degrades to an honest partial — never a silent tool-less answer.
+fn honest_partial_answer(state: &AgentTurnState, reason: &str) -> String {
+    const FILE_TOOLS: [&str; 4] =
+        ["read_file", "search_in_project", "list_project_files", "project_git_log"];
+    let files_touched = state.tool_calls.iter()
+        .filter(|c| FILE_TOOLS.contains(&c.tool_name.as_str()))
+        .count();
+    let titles: Vec<String> = state.sources.iter().take(5).map(|s| s.title.clone()).collect();
+    let found = if titles.is_empty() {
+        "I haven't assembled a full answer yet".to_string()
+    } else {
+        format!("So far I found: {}", titles.join("; "))
+    };
+    format!(
+        "I explored {} file(s) across {} tool call(s). {}. The walk was cut short ({}) \
+         — ask me to continue and I'll pick up where I left off.",
+        files_touched, state.tool_calls_made, found, reason
+    )
+}
+
+/// Build the honest-partial `AgentTurnResult` for a loop that got cut short
+/// (internal timeout or iteration cap) — shared by both exhaustion exit points.
+fn exhausted_result(state: &mut AgentTurnState, reason: &str) -> AgentTurnResult {
+    let answer = honest_partial_answer(state, reason);
+    let reasoning = if state.reasoning.is_empty() { None } else { Some(state.reasoning.join("\n\n")) };
+    AgentTurnResult {
+        answer,
+        sources: dedup_sources(std::mem::take(&mut state.sources)),
+        stats: std::mem::take(&mut state.stats),
+        tool_calls_made: state.tool_calls_made,
+        pending_approval: None,
+        tool_calls: std::mem::take(&mut state.tool_calls),
+        reasoning,
+    }
+}
 
 /// Think → act → observe loop. Tool errors become observations; hard failures
-/// return Err so the caller can fall back to classic synthesis.
+/// return Err so the caller can fall back to classic synthesis. Exhaustion
+/// (iteration cap or internal timeout) returns Ok with an honest-partial answer.
 pub(crate) async fn run_agent_turn(
     cfg: &AgentModelConfig,
+    loop_cfg: AgentLoopConfig,
     ctx: &ToolCtx<'_>,
     system_prompt: &str,
     history: &[serde_json::Value],
@@ -878,8 +929,21 @@ pub(crate) async fn run_agent_turn(
     let mut state = AgentTurnState::default();
     let t0 = std::time::Instant::now();
 
-    for _iteration in 0..MAX_ITERATIONS {
-        let force_answer = state.tool_calls_made >= MAX_TOOL_CALLS;
+    for _iteration in 0..loop_cfg.max_iterations {
+        if t0.elapsed().as_secs() >= loop_cfg.timeout_secs {
+            crate::brain::log_prompt_call(
+                pool_for_log,
+                "mimir_agent_turn",
+                &cfg.model,
+                "mimir_agent_v1",
+                t0.elapsed().as_millis() as i64,
+                false,
+                Some("cut short: timeout".to_string()),
+                None,
+            );
+            return Ok(exhausted_result(&mut state, "timeout"));
+        }
+        let force_answer = state.tool_calls_made >= loop_cfg.max_tool_calls;
         let (step, assistant_msg) =
             call_agent_llm(ctx.client, cfg, &messages, &tools, force_answer).await?;
 
@@ -936,17 +1000,17 @@ pub(crate) async fn run_agent_turn(
                             reasoning,
                         });
                     }
-                    if state.tool_calls_made >= MAX_TOOL_CALLS {
+                    if state.tool_calls_made >= loop_cfg.max_tool_calls {
                         messages.push(json!({
                             "role": "tool",
                             "tool_call_id": call.id,
-                            "content": "Tool budget exhausted — answer now with what you already have."
+                            "content": "Tool budget reached — synthesize an answer now from what you've gathered."
                         }));
                         continue;
                     }
                     state.tool_calls_made += 1;
                     let call_index = state.tool_calls_made;
-                    println!("🛠  [agent] tool call {}/{}: {}", call_index, MAX_TOOL_CALLS, call.name);
+                    println!("🛠  [agent] tool call {}/{}: {}", call_index, loop_cfg.max_tool_calls, call.name);
                     emit_agent_event(ctx, "ygg-agent-tool", &json!({
                         "turnId": ctx.turn_id, "callIndex": call_index, "toolName": call.name.clone(),
                         "status": "running", "input": call.arguments.clone(),
@@ -967,7 +1031,14 @@ pub(crate) async fn run_agent_turn(
                         call_index, tool_name: call.name.clone(), status: status.to_string(),
                         input: call.arguments.clone(), output: Some(output_preview), duration_ms: Some(duration_ms),
                     });
-                    messages.push(json!({ "role": "tool", "tool_call_id": call.id, "content": observation }));
+                    // Repo-tool output can be large; cap it so a long walk stays context-sane.
+                    // Other tools (graph verbs, search_mimir, smart_fetch, ...) already self-cap.
+                    let obs_for_msg = if matches!(call.name.as_str(), "search_in_project" | "project_git_log") {
+                        crate::text_util::truncate_chars(&observation, MAX_REPO_OBSERVATION_CHARS)
+                    } else {
+                        observation.clone()
+                    };
+                    messages.push(json!({ "role": "tool", "tool_call_id": call.id, "content": obs_for_msg }));
                 }
             }
         }
@@ -979,10 +1050,10 @@ pub(crate) async fn run_agent_turn(
         "mimir_agent_v1",
         t0.elapsed().as_millis() as i64,
         false,
-        Some("max iterations without answer".to_string()),
+        Some("cut short: reached the step limit".to_string()),
         None,
     );
-    Err("agent loop exceeded max iterations without an answer".to_string())
+    Ok(exhausted_result(&mut state, "reached the step limit"))
 }
 
 #[cfg(test)]
@@ -1122,5 +1193,37 @@ mod tests {
 
         let empty_url = vec![crate::hound_client::SearchResult { url: "".into(), ..Default::default() }];
         assert_eq!(web_results_to_sources(&empty_url)[0].url, None);
+    }
+
+    #[test]
+    fn loop_config_presets_have_expected_budgets() {
+        let c = AgentLoopConfig::chat();
+        assert_eq!((c.max_tool_calls, c.max_iterations, c.timeout_secs), (10, 14, 120));
+        let d = AgentLoopConfig::dive();
+        assert_eq!((d.max_tool_calls, d.max_iterations, d.timeout_secs), (20, 24, 240));
+    }
+
+    #[test]
+    fn honest_partial_answer_reports_files_and_findings() {
+        let mut state = AgentTurnState::default();
+        state.tool_calls_made = 3;
+        state.tool_calls.push(ToolCallRecord {
+            call_index: 1, tool_name: "read_file".into(), status: "success".into(),
+            input: serde_json::json!({"path": "a.rs"}), output: None, duration_ms: None,
+        });
+        state.sources.push(crate::mimir::MimirChatSource {
+            title: "auth.rs".into(),
+            url: None,
+            chunk: String::new(),
+            score: 1.0,
+            section_title: None,
+            page_start: None,
+            page_end: None,
+        });
+        let msg = honest_partial_answer(&state, "timeout");
+        assert!(msg.contains("1 file"));            // one file-touching tool call
+        assert!(msg.contains("auth.rs"));           // finding surfaced
+        assert!(msg.contains("timeout"));           // reason surfaced
+        assert!(msg.to_lowercase().contains("cut short"));
     }
 }
