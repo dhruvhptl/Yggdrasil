@@ -867,7 +867,10 @@ pub(crate) async fn execute_tool(
             };
             let safe = crate::project_roots::resolve_safe_path(&raw_root, &ctx.project_roots)?;
             let glob = args["glob"].as_str().map(|s| s.to_lowercase());
-            let ctx_lines: usize = args["context_lines"].as_u64().unwrap_or(0) as usize;
+            // Groq LLaMA sometimes sends a stringified number ("3"); accept either.
+            let ctx_lines: usize = args["context_lines"].as_u64()
+                .or_else(|| args["context_lines"].as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                .unwrap_or(0) as usize;
             let re = if has_regex_meta(&pattern) { regex::Regex::new(&pattern).ok() } else { None };
 
             let walker = ignore::WalkBuilder::new(&safe).standard_filters(true)
