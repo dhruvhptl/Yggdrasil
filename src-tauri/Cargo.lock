@@ -5789,6 +5789,7 @@ dependencies = [
  "hex",
  "ignore",
  "pdf-extract",
+ "regex",
  "reqwest",
  "scraper",
  "serde",

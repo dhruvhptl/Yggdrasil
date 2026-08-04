@@ -37,6 +37,7 @@ tree-sitter-rust = "0.23"
 tree-sitter-go = "0.23"
 ignore = "0.4"
 streaming-iterator = "0.1"
+regex = "1"
 
 # Reduce debuginfo on dev builds to avoid MSVC linker OOM (STATUS_STACK_BUFFER_OVERRUN).
 # Line-tables-only is enough for backtraces and covers 95% of dev debugging needs.

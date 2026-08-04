@@ -268,6 +268,21 @@ pub(crate) fn tool_schemas(hound_available: bool, fs_tools_available: bool) -> V
                 }
             }
         }));
+        schemas.push(json!({
+            "type": "function",
+            "function": {
+                "name": "search_in_project",
+                "description": "Grep the registered project for a pattern. Substring match by default; \
+                    regex when the pattern contains metacharacters. Returns file:line: matches. Use this to \
+                    locate code, then read_file to verify and cite.",
+                "parameters": { "type": "object", "properties": {
+                    "pattern": { "type": "string", "description": "Text or regex to find." },
+                    "path": { "type": "string", "description": "Optional folder to search under (defaults to the active project root)." },
+                    "glob": { "type": "string", "description": "Optional file filter, e.g. '*.rs' or 'auth' (extension or name substring)." },
+                    "context_lines": { "type": ["number","string"], "description": "Optional lines of surrounding context (default 0)." }
+                }, "required": ["pattern"] }
+            }
+        }));
     }
     schemas.push(json!({
         "type": "function",
@@ -490,6 +505,20 @@ pub(crate) fn dedup_sources(
         }
     }
     out
+}
+
+/// True if `p` contains regex metacharacters — used to decide whether
+/// `search_in_project` should compile it as a regex or match it as a plain
+/// substring (the common case for code searches like `resolve_safe_path`).
+fn has_regex_meta(p: &str) -> bool {
+    p.chars().any(|c| matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '*' | '+' | '?' | '|' | '^' | '$' | '\\' | '.'))
+}
+
+/// Match one line against `pattern`: regex if `re` is `Some` (compiled by the
+/// caller when `has_regex_meta` was true and compilation succeeded), else a
+/// plain substring check.
+fn line_matches(line: &str, pattern: &str, re: &Option<regex::Regex>) -> bool {
+    match re { Some(r) => r.is_match(line), None => line.contains(pattern) }
 }
 
 /// Execute one tool call. Errors are returned as Err — the loop converts them
@@ -820,6 +849,71 @@ pub(crate) async fn execute_tool(
             if out.is_empty() { out.push_str("(empty)"); }
             Ok(format!("{}\n{}", safe.display(), out))
         }
+        "search_in_project" => {
+            let pattern = args["pattern"].as_str().unwrap_or("").to_string();
+            if pattern.trim().is_empty() { return Err("search_in_project requires 'pattern'".into()); }
+            // Resolve a search root within the allowlist.
+            let raw_root = match args["path"].as_str() {
+                Some(p) if !p.is_empty() => p.to_string(),
+                _ => {
+                    let by_id = ctx.project_root_id.as_deref()
+                        .and_then(|id| ctx.project_roots.iter().find(|r| r.id == id))
+                        .map(|r| r.path.clone());
+                    match by_id.or_else(|| ctx.project_roots.first().map(|r| r.path.clone())) {
+                        Some(p) => p,
+                        None => return Ok("No registered project folder to search.".into()),
+                    }
+                }
+            };
+            let safe = crate::project_roots::resolve_safe_path(&raw_root, &ctx.project_roots)?;
+            let glob = args["glob"].as_str().map(|s| s.to_lowercase());
+            let ctx_lines: usize = args["context_lines"].as_u64().unwrap_or(0) as usize;
+            let re = if has_regex_meta(&pattern) { regex::Regex::new(&pattern).ok() } else { None };
+
+            let walker = ignore::WalkBuilder::new(&safe).standard_filters(true)
+                .filter_entry(|e| {
+                    let n = e.file_name().to_string_lossy();
+                    !matches!(n.as_ref(), "node_modules" | "target" | "venv" | "__pycache__" | ".git")
+                }).build();
+
+            let mut hits: Vec<String> = Vec::new();
+            let mut files_with_hits = 0usize;
+            let mut total = 0usize;
+            'outer: for entry in walker.flatten() {
+                if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) { continue; }
+                let p = entry.path();
+                if let Some(g) = &glob {
+                    let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                    let matches_glob = g.strip_prefix("*.")
+                        .map(|ext| name.ends_with(&format!(".{}", ext)))
+                        .unwrap_or_else(|| name.contains(g.trim_start_matches('*')));
+                    if !matches_glob { continue; }
+                }
+                let text = match std::fs::read_to_string(p) { Ok(t) => t, Err(_) => continue }; // skips binaries
+                let rel = p.strip_prefix(&safe).unwrap_or(p).to_string_lossy();
+                let lines: Vec<&str> = text.lines().collect();
+                let mut file_hit = false;
+                for (i, line) in lines.iter().enumerate() {
+                    if line_matches(line, &pattern, &re) {
+                        file_hit = true; total += 1;
+                        let trimmed = crate::text_util::truncate_chars(line.trim(), 160);
+                        hits.push(format!("{}:{}: {}", rel, i + 1, trimmed));
+                        for c in 1..=ctx_lines {
+                            if let Some(l) = lines.get(i + c) {
+                                hits.push(format!("{}:{}| {}", rel, i + 1 + c, crate::text_util::truncate_chars(l.trim(), 160)));
+                            }
+                        }
+                        if hits.len() >= 200 { if file_hit { files_with_hits += 1; } break 'outer; }
+                    }
+                }
+                if file_hit { files_with_hits += 1; }
+            }
+            if hits.is_empty() { return Ok(format!("No matches for '{}'.", pattern)); }
+            let capped = total > 200 || hits.len() >= 200;
+            let mut out = hits.join("\n");
+            if capped { out.push_str(&format!("\n… capped at 200 matches across {} file(s).", files_with_hits)); }
+            Ok(out)
+        }
         "suggest_next" => {
             let targets = crate::read_models::get_growth_recommendations_inner(ctx.pool, None)
                 .await
@@ -1096,7 +1190,28 @@ mod tests {
         assert!(with_fs.contains(&"read_file".to_string()));
         assert!(with_fs.contains(&"list_project_files".to_string()));
         assert!(with_fs.contains(&"graph_semantic_search".to_string()));
+        assert!(with_fs.contains(&"search_in_project".to_string()));
         assert!(!with_fs.contains(&"smart_search".to_string()));
+        assert!(!base.contains(&"search_in_project".to_string()));
+    }
+
+    #[test]
+    fn has_regex_meta_detects_metacharacters() {
+        assert!(!has_regex_meta("resolve_safe_path"));   // plain substring
+        assert!(has_regex_meta("fn\\s+\\w+"));
+        assert!(has_regex_meta("foo|bar"));
+        assert!(has_regex_meta("read_.*"));
+    }
+
+    #[test]
+    fn line_matches_substring_then_regex() {
+        // substring path (no regex compiled)
+        assert!(line_matches("  let x = resolve_safe_path(p);", "resolve_safe_path", &None));
+        assert!(!line_matches("nothing here", "resolve_safe_path", &None));
+        // regex path
+        let re = Some(regex::Regex::new(r"fn\s+\w+").unwrap());
+        assert!(line_matches("pub fn run_agent_turn(", "fn\\s+\\w+", &re));
+        assert!(!line_matches("let y = 2;", "fn\\s+\\w+", &re));
     }
 
     #[test]
