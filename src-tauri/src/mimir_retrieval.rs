@@ -958,6 +958,31 @@ pub(crate) fn build_system_prompt(inp: &PromptInputs) -> String {
 
 // ─── Chat (RAG) ─────────────────────────────────────────────────────────────
 
+/// Resolve (upserting if needed) the chat session id for whichever scope the
+/// caller has: a project (project_root_id) or a tree node (tree_id + node_id).
+/// Project scope takes priority. Returns Ok(None) when neither scope is present.
+pub(crate) async fn resolve_session_id(
+    pool: &sqlx::PgPool, project_root_id: Option<&str>, tree_id: Option<&str>, node_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(pr) = project_root_id {
+        let row = sqlx::query(
+            "INSERT INTO mimir_chat_sessions (id, project_root_id) VALUES ($1, $2) \
+             ON CONFLICT (project_root_id) DO UPDATE SET updated_at = NOW() RETURNING id"
+        ).bind(uuid::Uuid::new_v4().to_string()).bind(pr)
+         .fetch_one(pool).await.map_err(|e| e.to_string())?;
+        return Ok(row.try_get("id").ok());
+    }
+    if let (Some(tid), Some(nid)) = (tree_id, node_id) {
+        let row = sqlx::query(
+            "INSERT INTO mimir_chat_sessions (id, tree_id, node_id) VALUES ($1, $2, $3) \
+             ON CONFLICT (tree_id, node_id) DO UPDATE SET updated_at = NOW() RETURNING id"
+        ).bind(uuid::Uuid::new_v4().to_string()).bind(tid).bind(nid)
+         .fetch_one(pool).await.map_err(|e| e.to_string())?;
+        return Ok(row.try_get("id").ok());
+    }
+    Ok(None)
+}
+
 #[tauri::command]
 pub async fn mimir_chat(
     message: String,
@@ -1003,25 +1028,15 @@ pub async fn mimir_chat(
 
     // 7. Load session history (if tree_id + node_id both present) — moved up:
     // no dependency on retrieval, and the agent path needs history before it runs.
-    let session_id_opt: Option<String> = match (&tree_id, &node_id) {
-        (Some(tid), Some(nid)) => {
-            let new_session_id = uuid::Uuid::new_v4().to_string();
-            let row = sqlx::query(
-                "INSERT INTO mimir_chat_sessions (id, tree_id, node_id) \
-                 VALUES ($1, $2, $3) \
-                 ON CONFLICT (tree_id, node_id) DO UPDATE SET updated_at = NOW() \
-                 RETURNING id"
-            )
-            .bind(&new_session_id)
-            .bind(tid)
-            .bind(nid)
-            .fetch_one(&database.pool)
-            .await
-            .map_err(|e| e.to_string())?;
-            Some(row.try_get("id").map_err(|e| e.to_string())?)
-        }
-        _ => None,
-    };
+    // Task 7 will thread a real project_root_id through mimir_chat's params;
+    // until then this stays None and the roster line below never fires.
+    let project_root_id: Option<String> = None;
+    let session_id_opt: Option<String> = resolve_session_id(
+        &database.pool,
+        project_root_id.as_deref(),
+        tree_id.as_deref(),
+        node_id.as_deref(),
+    ).await?;
 
     let mut history_messages: Vec<serde_json::Value> = Vec::new();
     if let Some(ref sid) = session_id_opt {
@@ -1175,9 +1190,6 @@ pub async fn mimir_chat(
         ));
     }
 
-    // Task 7 will thread a real project_root_id through mimir_chat's params;
-    // until then this stays None and the roster line below never fires.
-    let project_root_id: Option<String> = None;
     if let Some(prid) = project_root_id.as_ref() {
         if let Some(root) = project_roots.iter().find(|r| &r.id == prid) {
             agent_system_prompt.push_str(&format!(
@@ -1543,21 +1555,10 @@ pub async fn get_chat_session(
     database: State<'_, Database>,
 ) -> Result<Vec<StoredChatMessage>, String> {
     // Upsert session
-    let new_sid = uuid::Uuid::new_v4().to_string();
-    let session_row = sqlx::query(
-        "INSERT INTO mimir_chat_sessions (id, tree_id, node_id) \
-         VALUES ($1, $2, $3) \
-         ON CONFLICT (tree_id, node_id) DO UPDATE SET updated_at = NOW() \
-         RETURNING id"
-    )
-    .bind(&new_sid)
-    .bind(&tree_id)
-    .bind(&node_id)
-    .fetch_one(&database.pool)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let session_id: String = session_row.try_get("id").map_err(|e| e.to_string())?;
+    // Task 7 adds a project_root_id param here; until then this call is tree/node scoped only.
+    let session_id: String = resolve_session_id(&database.pool, None, Some(tree_id.as_str()), Some(node_id.as_str()))
+        .await?
+        .ok_or("could not resolve chat session")?;
 
     let rows = sqlx::query(
         "SELECT id, role, content, sources, tool_calls, reasoning, \

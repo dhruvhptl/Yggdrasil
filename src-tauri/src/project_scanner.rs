@@ -656,19 +656,10 @@ async fn run_coverage_after_scan(
 /// stays in the conversation and the agent sees it as prior context next turn.
 /// No-ops when there's no node context (falls back to the UI banner only).
 async fn post_scan_message(pool: &sqlx::PgPool, tree_id: &str, node_id: Option<&str>, content: &str) {
-    use sqlx::Row;
     let Some(nid) = node_id else { return; };
-    let session_id = match sqlx::query(
-        "INSERT INTO mimir_chat_sessions (id, tree_id, node_id) VALUES ($1, $2, $3) \
-         ON CONFLICT (tree_id, node_id) DO UPDATE SET updated_at = NOW() RETURNING id"
-    )
-    .bind(uuid::Uuid::new_v4().to_string())
-    .bind(tree_id)
-    .bind(nid)
-    .fetch_one(pool)
-    .await
-    {
-        Ok(row) => match row.try_get::<String, _>("id") { Ok(s) => s, Err(_) => return },
+    let session_id = match crate::mimir_retrieval::resolve_session_id(pool, None, Some(tree_id), Some(nid)).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return,
         Err(e) => { println!("⚠️  [scan] could not open chat session: {}", e); return; }
     };
     let _ = sqlx::query(
