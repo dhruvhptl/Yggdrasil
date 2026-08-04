@@ -990,6 +990,7 @@ pub async fn mimir_chat(
     page: String,
     tree_id: Option<String>,
     node_id: Option<String>,
+    project_root_id: Option<String>,
     node_title: Option<String>,
     project_name: Option<String>,
     tree_name: Option<String>,
@@ -1029,9 +1030,6 @@ pub async fn mimir_chat(
 
     // 7. Load session history (if tree_id + node_id both present) — moved up:
     // no dependency on retrieval, and the agent path needs history before it runs.
-    // Task 7 will thread a real project_root_id through mimir_chat's params;
-    // until then this stays None and the roster line below never fires.
-    let project_root_id: Option<String> = None;
     let session_id_opt: Option<String> = resolve_session_id(
         &database.pool,
         project_root_id.as_deref(),
@@ -1551,13 +1549,18 @@ pub async fn mimir_chat(
 
 #[tauri::command]
 pub async fn get_chat_session(
-    tree_id: String,
-    node_id: String,
+    tree_id: Option<String>,
+    node_id: Option<String>,
+    project_root_id: Option<String>,
     database: State<'_, Database>,
 ) -> Result<Vec<StoredChatMessage>, String> {
     // Upsert session
-    // Task 7 adds a project_root_id param here; until then this call is tree/node scoped only.
-    let session_id: String = resolve_session_id(&database.pool, None, Some(tree_id.as_str()), Some(node_id.as_str()))
+    let session_id: String = resolve_session_id(
+        &database.pool,
+        project_root_id.as_deref(),
+        tree_id.as_deref(),
+        node_id.as_deref(),
+    )
         .await?
         .ok_or("could not resolve chat session")?;
 
@@ -1593,22 +1596,40 @@ pub async fn get_chat_session(
 
 #[tauri::command]
 pub async fn clear_chat_session(
-    tree_id: String,
-    node_id: String,
+    tree_id: Option<String>,
+    node_id: Option<String>,
+    project_root_id: Option<String>,
     database: State<'_, Database>,
 ) -> Result<(), String> {
-    sqlx::query(
-        "DELETE FROM mimir_chat_messages \
-         WHERE session_id = ( \
-           SELECT id FROM mimir_chat_sessions \
-           WHERE tree_id = $1 AND node_id = $2 \
-         )"
-    )
-    .bind(&tree_id)
-    .bind(&node_id)
-    .execute(&database.pool)
-    .await
-    .map_err(|e| e.to_string())?;
+    if let Some(prid) = project_root_id.as_ref() {
+        sqlx::query(
+            "DELETE FROM mimir_chat_messages \
+             WHERE session_id = ( \
+               SELECT id FROM mimir_chat_sessions \
+               WHERE project_root_id = $1 \
+             )"
+        )
+        .bind(prid)
+        .execute(&database.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    if let (Some(tid), Some(nid)) = (tree_id.as_ref(), node_id.as_ref()) {
+        sqlx::query(
+            "DELETE FROM mimir_chat_messages \
+             WHERE session_id = ( \
+               SELECT id FROM mimir_chat_sessions \
+               WHERE tree_id = $1 AND node_id = $2 \
+             )"
+        )
+        .bind(tid)
+        .bind(nid)
+        .execute(&database.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
     Ok(())
 }
 

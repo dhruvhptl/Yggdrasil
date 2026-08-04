@@ -109,7 +109,7 @@ export default function MimirChat({
 }) {
   const location = useLocation();
   const navigate = useNavigate();
-  const { treeId, nodeId, nodeTitle, projectName, treeName } = useMimirContext();
+  const { treeId, nodeId, nodeTitle, projectName, treeName, projectRootId, projectLabel, setMimirContext } = useMimirContext();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [resumed, setResumed] = useState(false);
   const [input, setInput] = useState("");
@@ -123,6 +123,7 @@ export default function MimirChat({
   const [shouldAutoSend, setShouldAutoSend] = useState(false);
   const [scanStatus, setScanStatus] = useState<string | null>(null);
   const [coverage, setCoverage] = useState<{ covered: number; partial: number; gap: number; total: number } | null>(null);
+  const [projectRoots, setProjectRoots] = useState<{ id: string; label: string; path: string }[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const loadedSessionKey = useRef<string | null>(null);
@@ -149,6 +150,16 @@ export default function MimirChat({
       setTimeout(() => textareaRef.current?.focus(), 200);
     }
   }, [open]);
+
+  // Fetch registered project roots for the project picker
+  useEffect(() => {
+    (async () => {
+      try {
+        const roots = await invoke<{ id: string; label: string; path: string }[]>("get_project_roots_cmd");
+        setProjectRoots(roots);
+      } catch { /* best-effort */ }
+    })();
+  }, []);
 
   // Listen for background scan progress and completion events
   useEffect(() => {
@@ -203,45 +214,78 @@ export default function MimirChat({
     return () => { cancelled = true; unsub?.(); };
   }, []);
 
-  // Load session history when panel opens or context changes
-  const sessionKey = treeId && nodeId ? `${treeId}:${nodeId}` : null;
+  // Load session history when panel opens or context changes.
+  // Tree-precedence: a selected tree node always wins over the project picker
+  // (preserves today's behavior exactly); project scope only kicks in when
+  // there's no node selected.
+  const sessionKey = treeId && nodeId ? `${treeId}:${nodeId}` : (projectRootId ? `proj:${projectRootId}` : null);
   const loadSession = useCallback(async () => {
-    if (!treeId || !nodeId) {
-      setMessages([]);
-      setResumed(false);
-      setNodeContext(null);
-      loadedSessionKey.current = null;
+    if (treeId && nodeId) {
+      if (loadedSessionKey.current === sessionKey) return;
+      loadedSessionKey.current = sessionKey;
+
+      // Fetch chat history and node context in parallel
+      const [storedResult, ctxResult] = await Promise.allSettled([
+        invoke<StoredChatMessage[]>("get_chat_session", { treeId, nodeId, projectRootId: null }),
+        invoke<NodeChatContext>("get_node_chat_context", { nodeId }),
+      ]);
+
+      if (ctxResult.status === "fulfilled") {
+        setNodeContext(ctxResult.value);
+      }
+
+      if (storedResult.status === "fulfilled" && storedResult.value.length > 0) {
+        const loaded: ChatMessage[] = storedResult.value.map((m) => ({
+          role: m.role === "user" ? "user" : "mimir",
+          content: m.content,
+          sources: m.sources ?? undefined,
+          createdAt: m.createdAt,
+          toolCalls: m.toolCalls ?? undefined,
+          reasoning: m.reasoning ?? undefined,
+        }));
+        setMessages(loaded);
+        setResumed(true);
+      } else {
+        setMessages([]);
+        setResumed(false);
+      }
       return;
     }
-    if (loadedSessionKey.current === sessionKey) return;
-    loadedSessionKey.current = sessionKey;
 
-    // Fetch chat history and node context in parallel
-    const [storedResult, ctxResult] = await Promise.allSettled([
-      invoke<StoredChatMessage[]>("get_chat_session", { treeId, nodeId }),
-      invoke<NodeChatContext>("get_node_chat_context", { nodeId }),
-    ]);
+    if (projectRootId) {
+      if (loadedSessionKey.current === sessionKey) return;
+      loadedSessionKey.current = sessionKey;
+      setNodeContext(null);
 
-    if (ctxResult.status === "fulfilled") {
-      setNodeContext(ctxResult.value);
+      const storedResult = await invoke<StoredChatMessage[]>("get_chat_session", {
+        treeId: null,
+        nodeId: null,
+        projectRootId,
+      }).catch(() => null);
+
+      if (storedResult && storedResult.length > 0) {
+        const loaded: ChatMessage[] = storedResult.map((m) => ({
+          role: m.role === "user" ? "user" : "mimir",
+          content: m.content,
+          sources: m.sources ?? undefined,
+          createdAt: m.createdAt,
+          toolCalls: m.toolCalls ?? undefined,
+          reasoning: m.reasoning ?? undefined,
+        }));
+        setMessages(loaded);
+        setResumed(true);
+      } else {
+        setMessages([]);
+        setResumed(false);
+      }
+      return;
     }
 
-    if (storedResult.status === "fulfilled" && storedResult.value.length > 0) {
-      const loaded: ChatMessage[] = storedResult.value.map((m) => ({
-        role: m.role === "user" ? "user" : "mimir",
-        content: m.content,
-        sources: m.sources ?? undefined,
-        createdAt: m.createdAt,
-        toolCalls: m.toolCalls ?? undefined,
-        reasoning: m.reasoning ?? undefined,
-      }));
-      setMessages(loaded);
-      setResumed(true);
-    } else {
-      setMessages([]);
-      setResumed(false);
-    }
-  }, [treeId, nodeId, sessionKey]);
+    setMessages([]);
+    setResumed(false);
+    setNodeContext(null);
+    loadedSessionKey.current = null;
+  }, [treeId, nodeId, projectRootId, sessionKey]);
 
   useEffect(() => {
     if (open) loadSession();
@@ -266,9 +310,14 @@ export default function MimirChat({
   }
 
   async function handleClear() {
-    if (!treeId || !nodeId) return;
+    const hasTreeScope = !!(treeId && nodeId);
+    if (!hasTreeScope && !projectRootId) return;
     try {
-      await invoke("clear_chat_session", { treeId, nodeId });
+      await invoke("clear_chat_session", {
+        treeId: hasTreeScope ? treeId : null,
+        nodeId: hasTreeScope ? nodeId : null,
+        projectRootId: hasTreeScope ? null : projectRootId,
+      });
     } catch { /* best-effort */ }
     setMessages([]);
     setResumed(false);
@@ -337,11 +386,13 @@ export default function MimirChat({
     });
 
     try {
+      const hasTreeScope = !!(treeId && nodeId);
       const raw = await invoke("mimir_chat", {
         message: msg,
         page,
         treeId,
         nodeId,
+        projectRootId: hasTreeScope ? null : projectRootId,
         nodeTitle,
         projectName,
         treeName,
@@ -493,7 +544,9 @@ export default function MimirChat({
               Mimir
             </span>
             <span style={{ fontSize: 10, color: "#475569" }}>
-              RAG assistant
+              {!(treeId && nodeId) && projectRootId
+                ? `scoped to ${projectLabel ?? "project"}`
+                : "RAG assistant"}
             </span>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
@@ -533,7 +586,7 @@ export default function MimirChat({
                 </button>
               </>
             )}
-            {treeId && nodeId && messages.length > 0 && (
+            {((treeId && nodeId) || projectRootId) && messages.length > 0 && (
               <button
                 onClick={handleClear}
                 title="Clear history"
@@ -563,6 +616,47 @@ export default function MimirChat({
               <X size={16} />
             </button>
           </div>
+        </div>
+
+        {/* Project picker — scopes chat to a project session when no tree node is active */}
+        <div
+          style={{
+            padding: "6px 16px",
+            borderBottom: "1px solid #1e293b",
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            flexShrink: 0,
+          }}
+        >
+          <span style={{ fontSize: 10, color: "#475569", textTransform: "uppercase", letterSpacing: "0.06em", flexShrink: 0 }}>
+            Project
+          </span>
+          <select
+            value={projectRootId ?? ""}
+            onChange={(e) => {
+              const selectedId = e.target.value || null;
+              const selected = selectedId ? projectRoots.find((r) => r.id === selectedId) ?? null : null;
+              setMimirContext({ projectRootId: selectedId, projectLabel: selected?.label ?? null });
+            }}
+            title={treeId && nodeId ? "Chat is scoped to the active tree node; project scope applies when no node is selected." : undefined}
+            style={{
+              flex: 1,
+              minWidth: 0,
+              background: "#1e293b",
+              border: "1px solid #334155",
+              borderRadius: 6,
+              color: "#e2e8f0",
+              fontSize: 11,
+              padding: "3px 6px",
+              fontFamily: "inherit",
+            }}
+          >
+            <option value="">— none —</option>
+            {projectRoots.map((r) => (
+              <option key={r.id} value={r.id}>{r.label}</option>
+            ))}
+          </select>
         </div>
 
         {/* Model logs popover — dev only */}
