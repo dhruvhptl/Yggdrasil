@@ -98,6 +98,9 @@ interface PromptStats {
   recentErrors: RecentError[];
 }
 
+// Tool names whose `input.path` feeds the exploration-trail strip (Task 6).
+const FILE_TRAIL_TOOL_NAMES = new Set(["read_file", "search_in_project", "list_project_files", "project_git_log"]);
+
 export default function MimirChat({
   open,
   onToggle,
@@ -129,6 +132,10 @@ export default function MimirChat({
   // session (not reset on send); reset when the session/context changes since we
   // don't hydrate a prior plan from the DB on load.
   const [plan, setPlan] = useState<string | null>(null);
+  // Light exploration-trail strip (Task 6) — files touched + current step for
+  // the CURRENT turn only. Reset on every handleSend (unlike `plan`, which
+  // persists across turns).
+  const [trail, setTrail] = useState<{ files: Set<string>; step: string } | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const loadedSessionKey = useRef<string | null>(null);
@@ -346,6 +353,9 @@ export default function MimirChat({
 
     const turnId = crypto.randomUUID();
 
+    // Per-turn state — the trail is scoped to the CURRENT turn only (unlike
+    // `plan`, which is agent-owned and persists across turns).
+    setTrail(null);
     setInput("");
     setMessages((prev) => [
       ...prev,
@@ -392,6 +402,17 @@ export default function MimirChat({
         if (typeof content === "string" && content.trim()) setPlan(content);
       } else if (payload.toolName === "finalize_plan") {
         setPlan(null);
+      }
+      // Light exploration-trail strip (Task 6) — accumulate touched files and
+      // the current step label for repo-reading tools, scoped to this turn.
+      if (FILE_TRAIL_TOOL_NAMES.has(payload.toolName)) {
+        const path = (payload.input as { path?: unknown } | undefined)?.path;
+        const step = `${payload.toolName} ${typeof path === "string" ? path : ""}`.trim();
+        setTrail((prev) => {
+          const files = new Set(prev?.files ?? []);
+          if (typeof path === "string" && path) files.add(path);
+          return { files, step };
+        });
       }
     });
     const unlistenThink = await listen<{ turnId: string; text: string }>("ygg-agent-think", ({ payload }) => {
@@ -1044,6 +1065,13 @@ export default function MimirChat({
                       {msg.sources.map((src, j) => (
                         <SourceCard key={j} index={j + 1} title={src.title} url={src.url} snippet={src.chunk} />
                       ))}
+                    </div>
+                  )}
+                  {/* Exploration trail (Task 6) — light one-line strip of files touched
+                      and the current step, shown only on the active turn's message. */}
+                  {i === lastMimirIdx && loading && trail && (
+                    <div style={{ marginTop: 6, fontSize: 11, color: "#64748b" }}>
+                      📁 {trail.files.size} file(s) · {trail.step}
                     </div>
                   )}
                   {/* Suggestion chips — only on last mimir message, disappear after tap */}
