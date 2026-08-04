@@ -124,6 +124,11 @@ export default function MimirChat({
   const [scanStatus, setScanStatus] = useState<string | null>(null);
   const [coverage, setCoverage] = useState<{ covered: number; partial: number; gap: number; total: number } | null>(null);
   const [projectRoots, setProjectRoots] = useState<{ id: string; label: string; path: string }[]>([]);
+  // Agent-owned working plan (Task 5) — tracked live from ygg-agent-tool set_plan/
+  // update_plan events, cleared on finalize_plan. Persists across turns within a
+  // session (not reset on send); reset when the session/context changes since we
+  // don't hydrate a prior plan from the DB on load.
+  const [plan, setPlan] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const loadedSessionKey = useRef<string | null>(null);
@@ -252,6 +257,7 @@ export default function MimirChat({
         setMessages([]);
         setResumed(false);
       }
+      setPlan(null);
       return;
     }
 
@@ -281,12 +287,14 @@ export default function MimirChat({
         setMessages([]);
         setResumed(false);
       }
+      setPlan(null);
       return;
     }
 
     setMessages([]);
     setResumed(false);
     setNodeContext(null);
+    setPlan(null);
     loadedSessionKey.current = null;
   }, [treeId, nodeId, projectRootId, sessionKey]);
 
@@ -324,6 +332,7 @@ export default function MimirChat({
     } catch { /* best-effort */ }
     setMessages([]);
     setResumed(false);
+    setPlan(null);
     loadedSessionKey.current = null;
     // Keep nodeContext — resources are still relevant after clearing chat
   }
@@ -375,6 +384,15 @@ export default function MimirChat({
         next[idx] = { ...target, toolCalls: calls };
         return next;
       });
+      // Track the agent's working plan (Task 5) — set_plan/update_plan carry the
+      // new plan text in `input.content` (present on the "running" event); clear
+      // it entirely when the agent finalizes.
+      if (payload.toolName === "set_plan" || payload.toolName === "update_plan") {
+        const content = (payload.input as { content?: unknown } | undefined)?.content;
+        if (typeof content === "string" && content.trim()) setPlan(content);
+      } else if (payload.toolName === "finalize_plan") {
+        setPlan(null);
+      }
     });
     const unlistenThink = await listen<{ turnId: string; text: string }>("ygg-agent-think", ({ payload }) => {
       if (payload.turnId !== turnId) return;
@@ -829,6 +847,20 @@ export default function MimirChat({
                 ))}
               </div>
             )}
+          </div>
+        )}
+
+        {/* Agent-owned working plan (Task 5) — persists above the message list
+            for the life of the session; collapsible, styled like ToolCallBlock. */}
+        {plan && (
+          <div style={{ padding: "0 14px", paddingTop: 8 }}>
+            <details className="rounded-md border text-sm border-white/10 bg-white/5">
+              <summary className="cursor-pointer select-none px-2.5 py-1.5 flex items-center gap-2">
+                <span>📋</span>
+                <span className="font-mono text-xs">Plan</span>
+              </summary>
+              <pre className="px-3 pb-2 text-xs opacity-80 whitespace-pre-wrap break-words">{plan}</pre>
+            </details>
           </div>
         )}
 

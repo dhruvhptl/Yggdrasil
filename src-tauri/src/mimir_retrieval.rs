@@ -1038,6 +1038,19 @@ pub async fn mimir_chat(
         node_id.as_deref(),
     ).await?;
 
+    // Agent-owned working plan for this session (Task 5) — loaded now so it's
+    // in scope for both the dive-nudge framing and the ToolCtx build below.
+    let agent_plan: Option<String> = if let Some(sid) = session_id_opt.as_deref() {
+        sqlx::query_scalar::<_, String>("SELECT content FROM agent_plans WHERE session_id = $1")
+            .bind(sid)
+            .fetch_optional(&database.pool)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+
     let mut history_messages: Vec<serde_json::Value> = Vec::new();
     if let Some(ref sid) = session_id_opt {
         let hist_rows = sqlx::query(
@@ -1216,7 +1229,20 @@ pub async fn mimir_chat(
              orient, use the graph, grep, read files, and cite file:line. Maintain a working plan \
              with set_plan. Prefer an honest partial answer over a shallow one."
         );
+        if agent_plan.is_none() {
+            agent_system_prompt.push_str(
+                " You have no plan yet — call set_plan with your first steps before exploring."
+            );
+        }
     }
+
+    // Prepend the working plan (if any) at the very top of the prompt, after
+    // the full prompt (tool map + FS-roots + grounding + dive framing) is assembled.
+    agent_system_prompt = format!(
+        "{}{}",
+        crate::mimir_agent::plan_prelude(agent_plan.as_deref()),
+        agent_system_prompt
+    );
 
     // 6b. Run the agent; fall back to classic one-shot synthesis on any failure.
     let agent_enabled = std::env::var("MIMIR_AGENT_ENABLED")
@@ -1252,6 +1278,8 @@ pub async fn mimir_chat(
                     project_roots: project_roots.clone(),
                     project_root_id: project_root_id.clone(),
                     mode: agent_mode,
+                    plan: agent_plan.clone(),
+                    session_id: session_id_opt.clone(),
                 };
                 let loop_cfg = agent_mode.loop_config();
                 let safety = std::time::Duration::from_secs(loop_cfg.timeout_secs + 30);

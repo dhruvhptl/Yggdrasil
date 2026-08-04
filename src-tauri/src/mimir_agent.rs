@@ -328,6 +328,19 @@ pub(crate) fn tool_schemas(hound_available: bool, fs_tools_available: bool) -> V
             "parameters": { "type": "object", "properties": {} }
         }
     }));
+    // Plan tools are always registered (not gated by fs_tools_available) — the
+    // doctrine tells the model to maintain a working plan on every long walk,
+    // chat or dive alike.
+    for (name, desc, has_content) in [
+        ("set_plan", "Write/replace your working plan for this multi-step task (a short numbered list of steps).", true),
+        ("update_plan", "Replace your working plan with an updated version as you make progress.", true),
+        ("finalize_plan", "Mark the plan complete and clear it once you've answered.", false),
+    ] {
+        let params = if has_content {
+            json!({ "type": "object", "properties": { "content": { "type": "string", "description": "The plan text." } }, "required": ["content"] })
+        } else { json!({ "type": "object", "properties": {}, "required": [] }) };
+        schemas.push(json!({ "type": "function", "function": { "name": name, "description": desc, "parameters": params } }));
+    }
     schemas
 }
 
@@ -460,6 +473,16 @@ pub(crate) async fn call_agent_llm(
 
 // ─── Tool execution ──────────────────────────────────────────────────────────
 
+/// Render the agent's persisted working plan (if any) as a system-prompt
+/// prelude. Empty/whitespace-only plans render as nothing, so a stale blank
+/// row never injects a hollow "Working plan:\n\n" block.
+pub(crate) fn plan_prelude(plan: Option<&str>) -> String {
+    match plan {
+        Some(p) if !p.trim().is_empty() => format!("Working plan:\n{}\n\n", p),
+        _ => String::new(),
+    }
+}
+
 pub(crate) struct ToolCtx<'a> {
     pub pool: &'a sqlx::PgPool,
     pub client: &'a reqwest::Client,
@@ -476,6 +499,8 @@ pub(crate) struct ToolCtx<'a> {
     pub project_roots: Vec<crate::project_roots::ProjectRoot>,
     pub project_root_id: Option<String>,
     pub mode: AgentMode,
+    pub plan: Option<String>,
+    pub session_id: Option<String>,
 }
 
 /// Prefer the project's concept graph over the tree's, so a project-scoped
@@ -1059,6 +1084,22 @@ pub(crate) async fn execute_tool(
                 Ok(format!("Suggested next skills to focus on:\n{}", lines.join("\n")))
             }
         }
+        "set_plan" | "update_plan" => {
+            let content = args["content"].as_str().unwrap_or("").to_string();
+            if content.trim().is_empty() { return Err("plan requires 'content'".into()); }
+            let Some(sid) = ctx.session_id.as_deref() else { return Ok("No active session to attach a plan to.".into()); };
+            sqlx::query("INSERT INTO agent_plans (session_id, content) VALUES ($1, $2) \
+                         ON CONFLICT (session_id) DO UPDATE SET content = $2, updated_at = NOW()")
+                .bind(sid).bind(&content).execute(ctx.pool).await.map_err(|e| e.to_string())?;
+            Ok(format!("Plan saved:\n{}", content))
+        }
+        "finalize_plan" => {
+            if let Some(sid) = ctx.session_id.as_deref() {
+                sqlx::query("DELETE FROM agent_plans WHERE session_id = $1").bind(sid)
+                    .execute(ctx.pool).await.map_err(|e| e.to_string())?;
+            }
+            Ok("Plan finalized.".into())
+        }
         other => Err(format!("unknown tool '{}'", other)),
     }
 }
@@ -1327,6 +1368,12 @@ mod tests {
         assert!(!with_fs.contains(&"smart_search".to_string()));
         assert!(!base.contains(&"search_in_project".to_string()));
         assert!(!base.contains(&"project_git_log".to_string()));
+
+        // Plan tools are ungated — present regardless of fs/web availability.
+        for t in ["set_plan", "update_plan", "finalize_plan"] {
+            assert!(base.contains(&t.to_string()), "expected '{}' in base (ungated)", t);
+            assert!(with_fs.contains(&t.to_string()), "expected '{}' in with_fs (ungated)", t);
+        }
     }
 
     #[test]
@@ -1527,5 +1574,14 @@ mod tests {
         assert!(msg.contains("auth.rs"));           // finding surfaced
         assert!(msg.contains("timeout"));           // reason surfaced
         assert!(msg.to_lowercase().contains("cut short"));
+    }
+
+    #[test]
+    fn plan_prelude_injects_when_present() {
+        assert_eq!(plan_prelude(None), "");
+        let p = plan_prelude(Some("1. read auth.rs\n2. grep for verify"));
+        assert!(p.starts_with("Working plan:\n"));
+        assert!(p.contains("read auth.rs"));
+        assert!(p.ends_with("\n\n"));
     }
 }
