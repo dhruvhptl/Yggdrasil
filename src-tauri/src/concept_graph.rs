@@ -75,6 +75,31 @@ pub(crate) struct NodeDetail {
     pub resources: Vec<LinkedResource>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SemanticHit { pub node_id: String, pub title: String, pub file_path: Option<String>, pub score: f64 }
+
+/// Embedding search over a concept graph's nodes (populated by project scans —
+/// Milestone 1 embeds every extracted symbol). Empty graph_id match → empty Vec.
+pub(crate) async fn graph_semantic_search(
+    pool: &PgPool, client: &reqwest::Client, graph_id: &str, query: &str, top_k: i64,
+) -> Result<Vec<SemanticHit>, String> {
+    let qvec = crate::mimir_ingest::get_embeddings_batch(client, &[query.to_string()]).await?
+        .into_iter().next().ok_or("no query embedding")?;
+    let rows = sqlx::query(
+        "SELECT id, title, file_path, 1 - (embedding <=> $2::vector) AS score \
+         FROM concept_graph_nodes WHERE graph_id = $1 AND embedding IS NOT NULL \
+         ORDER BY embedding <=> $2::vector LIMIT $3"
+    ).bind(graph_id).bind(crate::mimir_ingest::vector_str(&qvec)).bind(top_k)
+     .fetch_all(pool).await.map_err(|e| e.to_string())?;
+    Ok(rows.iter().map(|r| SemanticHit {
+        node_id: r.try_get("id").unwrap_or_default(),
+        title: r.try_get("title").unwrap_or_default(),
+        file_path: r.try_get("file_path").ok(),
+        score: r.try_get("score").unwrap_or(0.0),
+    }).collect())
+}
+
 // ─── Derivation: Vec<Concept> → nodes + edges ────────────────────────────────
 
 pub(crate) struct DerivedGraph {
@@ -254,11 +279,20 @@ pub(crate) async fn query_graph(
     let Some(graph_id) = graph_id_for_tree(pool, tree_id).await? else {
         return Ok(ConceptSubgraph::default());
     };
+    query_graph_by_graph(pool, &graph_id, query).await
+}
+
+/// Keyword search over an already-resolved graph_id (project or tree graph).
+pub(crate) async fn query_graph_by_graph(
+    pool: &PgPool,
+    graph_id: &str,
+    query: &str,
+) -> Result<ConceptSubgraph, String> {
     let tokens = tokenize(query);
     let query_lc = query.trim().to_lowercase();
 
     let rows = sqlx::query("SELECT id, title, description FROM concept_graph_nodes WHERE graph_id = $1")
-        .bind(&graph_id)
+        .bind(graph_id)
         .fetch_all(pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -288,7 +322,7 @@ pub(crate) async fn query_graph(
          WHERE graph_id = $1 AND (source_node_id = ANY($2) OR target_node_id = ANY($2)) \
          LIMIT 100",
     )
-    .bind(&graph_id)
+    .bind(graph_id)
     .bind(&node_ids)
     .fetch_all(pool)
     .await
@@ -366,12 +400,21 @@ pub(crate) async fn resolve_node_by_title(
     let Some(graph_id) = graph_id_for_tree(pool, tree_id).await? else {
         return Ok(None);
     };
-    // exact (case-insensitive) first, then substring
+    resolve_node_by_title_in_graph(pool, &graph_id, title).await
+}
+
+/// Resolve a node id by title within an already-resolved graph_id (project or
+/// tree graph). Exact (case-insensitive) match first, then substring.
+pub(crate) async fn resolve_node_by_title_in_graph(
+    pool: &PgPool,
+    graph_id: &str,
+    title: &str,
+) -> Result<Option<String>, String> {
     let row = sqlx::query(
         "SELECT id FROM concept_graph_nodes \
          WHERE graph_id = $1 AND LOWER(title) = LOWER($2) LIMIT 1",
     )
-    .bind(&graph_id)
+    .bind(graph_id)
     .bind(title)
     .fetch_optional(pool)
     .await
@@ -383,7 +426,7 @@ pub(crate) async fn resolve_node_by_title(
         "SELECT id FROM concept_graph_nodes \
          WHERE graph_id = $1 AND title ILIKE '%' || $2 || '%' LIMIT 1",
     )
-    .bind(&graph_id)
+    .bind(graph_id)
     .bind(title)
     .fetch_optional(pool)
     .await
@@ -400,9 +443,20 @@ pub(crate) async fn path_between(
     let Some(graph_id) = graph_id_for_tree(pool, tree_id).await? else {
         return Ok(vec![]);
     };
+    path_between_by_graph(pool, &graph_id, source_title, target_title).await
+}
+
+/// Shortest prerequisite path within an already-resolved graph_id (project or
+/// tree graph).
+pub(crate) async fn path_between_by_graph(
+    pool: &PgPool,
+    graph_id: &str,
+    source_title: &str,
+    target_title: &str,
+) -> Result<Vec<PathNode>, String> {
     // node id -> title, and prerequisite adjacency (source -> target)
     let node_rows = sqlx::query("SELECT id, title FROM concept_graph_nodes WHERE graph_id = $1")
-        .bind(&graph_id)
+        .bind(graph_id)
         .fetch_all(pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -425,7 +479,7 @@ pub(crate) async fn path_between(
         "SELECT source_node_id, target_node_id FROM concept_graph_edges \
          WHERE graph_id = $1 AND relationship = 'prerequisite'",
     )
-    .bind(&graph_id)
+    .bind(graph_id)
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;

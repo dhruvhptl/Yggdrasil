@@ -254,6 +254,20 @@ pub(crate) fn tool_schemas(hound_available: bool, fs_tools_available: bool) -> V
                 }, "required": ["path"] }
             }
         }));
+        schemas.push(json!({
+            "type": "function",
+            "function": {
+                "name": "graph_semantic_search",
+                "description": "Semantic search over the project's concept graph (symbols extracted from scanned source code). Returns the closest-matching symbols with their file path and similarity score. Prefer this over query_graph when grounding a claim in actual project code.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Concept or phrase to search for, e.g. 'retry backoff logic', 'authentication middleware'" }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }));
     }
     schemas.push(json!({
         "type": "function",
@@ -430,6 +444,21 @@ pub(crate) struct ToolCtx<'a> {
     pub turn_id: String,
     pub queue: Option<&'a crate::orchestrator::JobQueue>,
     pub project_roots: Vec<crate::project_roots::ProjectRoot>,
+    pub project_root_id: Option<String>,
+}
+
+/// Prefer the project's concept graph over the tree's, so a project-scoped
+/// chat with no tree node selected can still ground its verbs.
+async fn graph_for_ctx(ctx: &ToolCtx<'_>) -> Option<String> {
+    if let Some(prid) = ctx.project_root_id.as_deref() {
+        if let Ok(Some(g)) = crate::concept_graph::graph_id_for_project(ctx.pool, prid).await {
+            return Some(g);
+        }
+    }
+    match ctx.tree_id.as_deref() {
+        Some(tid) => crate::concept_graph::graph_id_for_tree(ctx.pool, tid).await.ok().flatten(),
+        None => None,
+    }
 }
 
 #[derive(Default)]
@@ -608,11 +637,11 @@ pub(crate) async fn execute_tool(
             Ok(out)
         }
         "query_graph" => {
-            let Some(tid) = ctx.tree_id.as_deref() else {
-                return Ok("No learning tree is active — the concept graph is per-tree.".to_string());
+            let Some(graph_id) = graph_for_ctx(ctx).await else {
+                return Ok("No concept graph is active — no learning tree or project is selected.".to_string());
             };
             let query = args["query"].as_str().unwrap_or(&ctx.message).to_string();
-            let sub = crate::concept_graph::query_graph(ctx.pool, tid, &query).await?;
+            let sub = crate::concept_graph::query_graph_by_graph(ctx.pool, &graph_id, &query).await?;
             if sub.nodes.is_empty() {
                 return Ok(format!("No concepts in the graph match '{}'.", query));
             }
@@ -634,15 +663,15 @@ pub(crate) async fn execute_tool(
             Ok(out.chars().take(6000).collect())
         }
         "path_between" => {
-            let Some(tid) = ctx.tree_id.as_deref() else {
-                return Ok("No learning tree is active — the concept graph is per-tree.".to_string());
+            let Some(graph_id) = graph_for_ctx(ctx).await else {
+                return Ok("No concept graph is active — no learning tree or project is selected.".to_string());
             };
             let source = args["source"].as_str().unwrap_or("").to_string();
             let target = args["target"].as_str().unwrap_or("").to_string();
             if source.is_empty() || target.is_empty() {
                 return Err("path_between requires 'source' and 'target'".to_string());
             }
-            let path = crate::concept_graph::path_between(ctx.pool, tid, &source, &target).await?;
+            let path = crate::concept_graph::path_between_by_graph(ctx.pool, &graph_id, &source, &target).await?;
             if path.is_empty() {
                 return Ok(format!("No prerequisite path found from '{}' to '{}'.", source, target));
             }
@@ -650,15 +679,15 @@ pub(crate) async fn execute_tool(
             Ok(format!("Prerequisite path: {}", chain.join(" → ")))
         }
         "explain_node" => {
-            let Some(tid) = ctx.tree_id.as_deref() else {
-                return Ok("No learning tree is active — the concept graph is per-tree.".to_string());
+            let Some(graph_id) = graph_for_ctx(ctx).await else {
+                return Ok("No concept graph is active — no learning tree or project is selected.".to_string());
             };
             let title = args["title"].as_str().unwrap_or("").to_string();
             if title.is_empty() {
                 return Err("explain_node requires 'title'".to_string());
             }
-            let Some(node_id) = crate::concept_graph::resolve_node_by_title(ctx.pool, tid, &title).await? else {
-                return Ok(format!("No concept titled '{}' in this tree's graph.", title));
+            let Some(node_id) = crate::concept_graph::resolve_node_by_title_in_graph(ctx.pool, &graph_id, &title).await? else {
+                return Ok(format!("No concept titled '{}' in this graph.", title));
             };
             let d = crate::concept_graph::explain_node(ctx.pool, &node_id).await?;
             let mut out = format!("{}: {}\n", d.node.title, d.node.description);
@@ -673,6 +702,26 @@ pub(crate) async fn execute_tool(
             if !d.resources.is_empty() {
                 let names: Vec<String> = d.resources.iter().map(|r| r.title.clone()).collect();
                 out.push_str(&format!("Your resources: {}\n", names.join(", ")));
+            }
+            Ok(out.chars().take(6000).collect())
+        }
+        "graph_semantic_search" => {
+            let Some(graph_id) = graph_for_ctx(ctx).await else {
+                return Ok("No project graph is available — no learning tree or project is selected.".to_string());
+            };
+            let query = args["query"].as_str().unwrap_or(&ctx.message).to_string();
+            let hits = crate::concept_graph::graph_semantic_search(ctx.pool, ctx.client, &graph_id, &query, 8).await?;
+            if hits.is_empty() {
+                return Ok(format!("No symbols in the graph semantically match '{}'.", query));
+            }
+            let mut out = String::new();
+            for h in &hits {
+                out.push_str(&format!(
+                    "{} — {} ({:.2})\n",
+                    h.title,
+                    h.file_path.as_deref().unwrap_or("?"),
+                    h.score
+                ));
             }
             Ok(out.chars().take(6000).collect())
         }
@@ -946,6 +995,7 @@ mod tests {
             .iter().map(|t| t["function"]["name"].as_str().unwrap().to_string()).collect();
         assert!(!base.contains(&"smart_search".to_string()));
         assert!(!base.contains(&"read_file".to_string()));
+        assert!(!base.contains(&"graph_semantic_search".to_string()));
 
         let with_web: Vec<String> = tool_schemas(true, false)
             .iter().map(|t| t["function"]["name"].as_str().unwrap().to_string()).collect();
@@ -956,6 +1006,7 @@ mod tests {
             .iter().map(|t| t["function"]["name"].as_str().unwrap().to_string()).collect();
         assert!(with_fs.contains(&"read_file".to_string()));
         assert!(with_fs.contains(&"list_project_files".to_string()));
+        assert!(with_fs.contains(&"graph_semantic_search".to_string()));
         assert!(!with_fs.contains(&"smart_search".to_string()));
     }
 

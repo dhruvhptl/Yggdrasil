@@ -1175,6 +1175,19 @@ pub async fn mimir_chat(
         ));
     }
 
+    // Task 7 will thread a real project_root_id through mimir_chat's params;
+    // until then this stays None and the roster line below never fires.
+    let project_root_id: Option<String> = None;
+    if let Some(prid) = project_root_id.as_ref() {
+        if let Some(root) = project_roots.iter().find(|r| &r.id == prid) {
+            agent_system_prompt.push_str(&format!(
+                "\n\nYou are grounded in project \"{}\" at {}. Prefer graph_semantic_search then read_file \
+                 to verify claims, and cite file:line.",
+                root.label, root.path
+            ));
+        }
+    }
+
     // 6b. Run the agent; fall back to classic one-shot synthesis on any failure.
     let agent_enabled = std::env::var("MIMIR_AGENT_ENABLED")
         .map(|v| v != "false")
@@ -1207,6 +1220,7 @@ pub async fn mimir_chat(
                     turn_id: turn_id.clone(),
                     queue: Some(&queue),
                     project_roots: project_roots.clone(),
+                    project_root_id: project_root_id.clone(),
                 };
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(120),
