@@ -238,9 +238,11 @@ pub(crate) fn tool_schemas(hound_available: bool, fs_tools_available: bool) -> V
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read a text file from one of the user's registered project folders. Use an absolute path under a registered folder. Returns file content (capped).",
+                "description": "Read a text file from one of the user's registered project folders. Use an absolute path under a registered folder. Returns file content (capped). Pass start_line/end_line to read a range instead of the whole file.",
                 "parameters": { "type": "object", "properties": {
-                    "path": { "type": "string", "description": "Absolute path to the file, under a registered project folder." }
+                    "path": { "type": "string", "description": "Absolute path to the file, under a registered project folder." },
+                    "start_line": { "type": ["number","string"], "description": "Optional: first line to read (1-based, inclusive). Requires end_line too." },
+                    "end_line": { "type": ["number","string"], "description": "Optional: last line to read (1-based, inclusive). Requires start_line too." }
                 }, "required": ["path"] }
             }
         }));
@@ -248,9 +250,11 @@ pub(crate) fn tool_schemas(hound_available: bool, fs_tools_available: bool) -> V
             "type": "function",
             "function": {
                 "name": "list_project_files",
-                "description": "List the entries (files + subfolders) directly inside a folder within a registered project folder. Use to explore a project's structure.",
+                "description": "List the entries (files + subfolders) inside a folder within a registered project folder. Use to explore a project's structure.",
                 "parameters": { "type": "object", "properties": {
-                    "path": { "type": "string", "description": "Absolute path to the folder, under a registered project folder." }
+                    "path": { "type": "string", "description": "Absolute path to the folder, under a registered project folder." },
+                    "max_depth": { "type": ["number","string"], "description": "Optional: how many levels to recurse (default 0 = this folder only)." },
+                    "glob": { "type": "string", "description": "Optional file filter, e.g. '*.rs' or 'auth' (extension or name substring)." }
                 }, "required": ["path"] }
             }
         }));
@@ -281,6 +285,17 @@ pub(crate) fn tool_schemas(hound_available: bool, fs_tools_available: bool) -> V
                     "glob": { "type": "string", "description": "Optional file filter, e.g. '*.rs' or 'auth' (extension or name substring)." },
                     "context_lines": { "type": ["number","string"], "description": "Optional lines of surrounding context (default 0)." }
                 }, "required": ["pattern"] }
+            }
+        }));
+        schemas.push(json!({
+            "type": "function",
+            "function": {
+                "name": "project_git_log",
+                "description": "Recent git history for a registered project folder (git log --oneline). Use for 'what changed recently' / project history.",
+                "parameters": { "type": "object", "properties": {
+                    "path": { "type": "string", "description": "Project folder (defaults to the active project root)." },
+                    "max": { "type": ["number","string"], "description": "How many commits (default 15)." }
+                }, "required": [] }
             }
         }));
     }
@@ -519,6 +534,49 @@ fn has_regex_meta(p: &str) -> bool {
 /// plain substring check.
 fn line_matches(line: &str, pattern: &str, re: &Option<regex::Regex>) -> bool {
     match re { Some(r) => r.is_match(line), None => line.contains(pattern) }
+}
+
+/// True if `filename_lower` (already lowercased) matches `glob`: `*.ext`
+/// matches by extension, anything else matches as a filename substring.
+/// Shared by `search_in_project` and `list_project_files` so the two repo
+/// browsing tools apply the exact same glob semantics.
+fn matches_glob(filename_lower: &str, glob: &str) -> bool {
+    glob.strip_prefix("*.")
+        .map(|ext| filename_lower.ends_with(&format!(".{}", ext)))
+        .unwrap_or_else(|| filename_lower.contains(glob.trim_start_matches('*')))
+}
+
+/// 1-based inclusive line slice of `body` (used by `read_file`'s optional
+/// start_line/end_line range). `start_line` clamps up to 1; lines beyond
+/// `end_line` (or beyond the file) are simply not present, so `end_line`
+/// effectively clamps to the file length.
+fn slice_lines(body: &str, start_line: usize, end_line: usize) -> String {
+    let start = start_line.max(1);
+    body.lines().enumerate()
+        .filter(|(i, _)| { let n = i + 1; n >= start && n <= end_line })
+        .map(|(_, l)| l).collect::<Vec<_>>().join("\n")
+}
+
+/// Resolve the directory a repo tool should operate on: explicit `path` arg →
+/// active project root (`ctx.project_root_id`) → first registered root. Shared
+/// by `search_in_project` and `project_git_log` so both behave identically for
+/// the no-registered-root case. Returns `Ok(None)` (not an `Err`) when there is
+/// no root to fall back to, so callers can surface the friendly message.
+fn resolve_project_dir(args: &serde_json::Value, ctx: &ToolCtx<'_>) -> Result<Option<std::path::PathBuf>, String> {
+    let raw_root = match args["path"].as_str() {
+        Some(p) if !p.is_empty() => p.to_string(),
+        _ => {
+            let by_id = ctx.project_root_id.as_deref()
+                .and_then(|id| ctx.project_roots.iter().find(|r| r.id == id))
+                .map(|r| r.path.clone());
+            match by_id.or_else(|| ctx.project_roots.first().map(|r| r.path.clone())) {
+                Some(p) => p,
+                None => return Ok(None),
+            }
+        }
+    };
+    let safe = crate::project_roots::resolve_safe_path(&raw_root, &ctx.project_roots)?;
+    Ok(Some(safe))
 }
 
 /// Execute one tool call. Errors are returned as Err — the loop converts them
@@ -817,34 +875,86 @@ pub(crate) async fn execute_tool(
         "read_file" => {
             let path = args["path"].as_str().ok_or("read_file requires a 'path'")?;
             let safe = crate::project_roots::resolve_safe_path(path, &ctx.project_roots)?;
+            let display = safe.display();
+            // Groq LLaMA sometimes sends stringified numbers; accept either.
+            let start = args["start_line"].as_u64()
+                .or_else(|| args["start_line"].as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                .map(|n| n as usize);
+            let end = args["end_line"].as_u64()
+                .or_else(|| args["end_line"].as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                .map(|n| n as usize);
+            if let (Some(s), Some(e)) = (start, end) {
+                let body = std::fs::read_to_string(&safe)
+                    .map_err(|err| format!("could not read file: {}", err))?;
+                return Ok(format!("{} [lines {}-{}]:\n{}", display, s, e, slice_lines(&body, s, e)));
+            }
             let content = std::fs::read_to_string(&safe)
                 .map_err(|e| format!("could not read file: {}", e))?;
             let capped = crate::text_util::truncate_chars(&content, 100_000);
-            Ok(format!("{}\n\n{}", safe.display(), capped))
+            Ok(format!("{}\n\n{}", display, capped))
         }
         "list_project_files" => {
             let path = args["path"].as_str().ok_or("list_project_files requires a 'path'")?;
             let safe = crate::project_roots::resolve_safe_path(path, &ctx.project_roots)?;
             let skip = ["node_modules", "target", ".venv", ".git", "dist", "build"];
+            // Groq LLaMA sometimes sends a stringified number; accept either.
+            let max_depth = args["max_depth"].as_u64()
+                .or_else(|| args["max_depth"].as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                .unwrap_or(0);
+            let glob = args["glob"].as_str().map(|s| s.to_lowercase());
             let mut out = String::new();
             let mut count = 0u32;
-            match std::fs::read_dir(&safe) {
-                Ok(entries) => {
-                    for e in entries.flatten() {
-                        if count >= 200 { out.push_str("… (more entries omitted)\n"); break; }
-                        let name = e.file_name().to_string_lossy().to_string();
-                        if skip.contains(&name.as_str()) { continue; }
-                        let meta = e.metadata().ok();
-                        if meta.as_ref().map(|m| m.is_dir()).unwrap_or(false) {
-                            out.push_str(&format!("{}/\n", name));
-                        } else {
-                            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-                            out.push_str(&format!("{} ({} bytes)\n", name, size));
+            if max_depth == 0 {
+                // Today's exact one-level behavior — unchanged, byte-for-byte.
+                match std::fs::read_dir(&safe) {
+                    Ok(entries) => {
+                        for e in entries.flatten() {
+                            if count >= 200 { out.push_str("… (more entries omitted)\n"); break; }
+                            let name = e.file_name().to_string_lossy().to_string();
+                            if skip.contains(&name.as_str()) { continue; }
+                            let meta = e.metadata().ok();
+                            if meta.as_ref().map(|m| m.is_dir()).unwrap_or(false) {
+                                out.push_str(&format!("{}/\n", name));
+                            } else {
+                                let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                                out.push_str(&format!("{} ({} bytes)\n", name, size));
+                            }
+                            count += 1;
                         }
-                        count += 1;
                     }
+                    Err(e) => return Ok(format!("could not list directory: {}", e)),
                 }
-                Err(e) => return Ok(format!("could not list directory: {}", e)),
+            } else {
+                let walker = ignore::WalkBuilder::new(&safe)
+                    .max_depth(Some(max_depth as usize + 1))
+                    .standard_filters(true)
+                    .filter_entry(move |e| {
+                        let n = e.file_name().to_string_lossy();
+                        !skip.contains(&n.as_ref())
+                    })
+                    .build();
+                for entry in walker.flatten() {
+                    let p = entry.path();
+                    if p == safe { continue; } // the root itself
+                    let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    if let Some(g) = &glob {
+                        // Glob filters files; directories always pass through so the
+                        // tree stays navigable even when hunting for a specific file type.
+                        if !is_dir {
+                            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                            if !matches_glob(&name, g) { continue; }
+                        }
+                    }
+                    if count >= 200 { out.push_str("… (more entries omitted)\n"); break; }
+                    let rel = p.strip_prefix(&safe).unwrap_or(p).to_string_lossy();
+                    if is_dir {
+                        out.push_str(&format!("{}/\n", rel));
+                    } else {
+                        let size = entry.metadata().ok().map(|m| m.len()).unwrap_or(0);
+                        out.push_str(&format!("{} ({} bytes)\n", rel, size));
+                    }
+                    count += 1;
+                }
             }
             if out.is_empty() { out.push_str("(empty)"); }
             Ok(format!("{}\n{}", safe.display(), out))
@@ -853,19 +963,9 @@ pub(crate) async fn execute_tool(
             let pattern = args["pattern"].as_str().unwrap_or("").to_string();
             if pattern.trim().is_empty() { return Err("search_in_project requires 'pattern'".into()); }
             // Resolve a search root within the allowlist.
-            let raw_root = match args["path"].as_str() {
-                Some(p) if !p.is_empty() => p.to_string(),
-                _ => {
-                    let by_id = ctx.project_root_id.as_deref()
-                        .and_then(|id| ctx.project_roots.iter().find(|r| r.id == id))
-                        .map(|r| r.path.clone());
-                    match by_id.or_else(|| ctx.project_roots.first().map(|r| r.path.clone())) {
-                        Some(p) => p,
-                        None => return Ok("No registered project folder to search.".into()),
-                    }
-                }
+            let Some(safe) = resolve_project_dir(args, ctx)? else {
+                return Ok("No registered project folder to search.".into());
             };
-            let safe = crate::project_roots::resolve_safe_path(&raw_root, &ctx.project_roots)?;
             let glob = args["glob"].as_str().map(|s| s.to_lowercase());
             // Groq LLaMA sometimes sends a stringified number ("3"); accept either.
             let ctx_lines: usize = args["context_lines"].as_u64()
@@ -887,10 +987,7 @@ pub(crate) async fn execute_tool(
                 let p = entry.path();
                 if let Some(g) = &glob {
                     let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-                    let matches_glob = g.strip_prefix("*.")
-                        .map(|ext| name.ends_with(&format!(".{}", ext)))
-                        .unwrap_or_else(|| name.contains(g.trim_start_matches('*')));
-                    if !matches_glob { continue; }
+                    if !matches_glob(&name, g) { continue; }
                 }
                 let text = match std::fs::read_to_string(p) { Ok(t) => t, Err(_) => continue }; // skips binaries
                 let rel = p.strip_prefix(&safe).unwrap_or(p).to_string_lossy();
@@ -916,6 +1013,38 @@ pub(crate) async fn execute_tool(
             let mut out = hits.join("\n");
             if capped { out.push_str(&format!("\n… capped at 200 matches across {} file(s).", files_with_hits)); }
             Ok(out)
+        }
+        "project_git_log" => {
+            let Some(safe) = resolve_project_dir(args, ctx)? else {
+                return Ok("No registered project folder to read history from.".into());
+            };
+            // Groq LLaMA sometimes sends a stringified number; accept either.
+            let max = args["max"].as_u64()
+                .or_else(|| args["max"].as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                .unwrap_or(15)
+                .clamp(1, 100);
+            let out = std::process::Command::new("git")
+                .arg("-C").arg(&safe).arg("log").arg("--oneline").arg("-n").arg(max.to_string())
+                .output();
+            match out {
+                Err(_) => Ok("git is not available on this system.".into()),
+                Ok(o) if !o.status.success() => {
+                    let err = String::from_utf8_lossy(&o.stderr);
+                    if err.contains("not a git repository") {
+                        Ok(format!("Not a git repository: {}", safe.display()))
+                    } else {
+                        Ok(format!("git log failed: {}", err.trim()))
+                    }
+                }
+                Ok(o) => {
+                    let text = String::from_utf8_lossy(&o.stdout);
+                    if text.trim().is_empty() {
+                        Ok("No commits found.".into())
+                    } else {
+                        Ok(crate::text_util::truncate_chars(&text, 6000))
+                    }
+                }
+            }
         }
         "suggest_next" => {
             let targets = crate::read_models::get_growth_recommendations_inner(ctx.pool, None)
@@ -1194,8 +1323,10 @@ mod tests {
         assert!(with_fs.contains(&"list_project_files".to_string()));
         assert!(with_fs.contains(&"graph_semantic_search".to_string()));
         assert!(with_fs.contains(&"search_in_project".to_string()));
+        assert!(with_fs.contains(&"project_git_log".to_string()));
         assert!(!with_fs.contains(&"smart_search".to_string()));
         assert!(!base.contains(&"search_in_project".to_string()));
+        assert!(!base.contains(&"project_git_log".to_string()));
     }
 
     #[test]
@@ -1215,6 +1346,31 @@ mod tests {
         let re = Some(regex::Regex::new(r"fn\s+\w+").unwrap());
         assert!(line_matches("pub fn run_agent_turn(", "fn\\s+\\w+", &re));
         assert!(!line_matches("let y = 2;", "fn\\s+\\w+", &re));
+    }
+
+    #[test]
+    fn slice_lines_is_1_based_inclusive() {
+        let body = "a\nb\nc\nd\ne";
+        assert_eq!(slice_lines(body, 2, 4), "b\nc\nd");
+        assert_eq!(slice_lines(body, 1, 1), "a");
+        assert_eq!(slice_lines(body, 4, 100), "d\ne");   // end clamps
+        assert_eq!(slice_lines(body, 0, 2), "a\nb");      // start clamps to 1
+    }
+
+    #[test]
+    fn git_log_reads_a_temp_repo_or_skips() {
+        use std::process::Command;
+        if Command::new("git").arg("--version").output().is_err() { return; } // skip: no git
+        let dir = std::env::temp_dir().join(format!("ygg-git-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+        git(&["init"]); git(&["config","user.email","t@t"]); git(&["config","user.name","t"]);
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        git(&["add","."]); git(&["commit","-m","seed","--no-gpg-sign"]);
+        let out = git(&["log","--oneline","-n","5"]);
+        assert!(out.status.success());
+        assert!(String::from_utf8_lossy(&out.stdout).contains("seed"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
