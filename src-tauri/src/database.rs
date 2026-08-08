@@ -1,128 +1,105 @@
-// src-tauri/src/database.rs - Database operations for persistent storage
-
-use sqlx::{migrate::MigrateDatabase, Sqlite, SqlitePool, Row};
-use tauri::AppHandle;
-use std::fs;
+use sqlx::postgres::{PgPool, PgPoolOptions};
 use crate::commands::{Project, Discipline};
 
 pub struct Database {
-    pub pool: SqlitePool,
+    pub pool: PgPool,
 }
 
 impl Database {
-    pub async fn new(app_handle: &AppHandle) -> Result<Self, Box<dyn std::error::Error>> {
-        let app_dir = app_handle.path_resolver()
-            .app_data_dir()
-            .expect("Failed to get app data directory");
-        
-        // Create app data directory if it doesn't exist
-        fs::create_dir_all(&app_dir)?;
-        
-        let database_path = app_dir.join("yggdrasil.db");
-        let database_url = format!("sqlite:{}", database_path.to_string_lossy());
-        
-        // Create database if it doesn't exist
-        if !Sqlite::database_exists(&database_url).await.unwrap_or(false) {
-            Sqlite::create_database(&database_url).await?;
-        }
-        
-        let pool = SqlitePool::connect(&database_url).await?;
-        
-        // Run migrations
+    pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let database_url = std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL environment variable must be set");
+
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url)
+            .await?;
+
         sqlx::migrate!("./migrations").run(&pool).await?;
-        
+        println!("✅ Connected to Postgres and ran migrations");
+
         Ok(Database { pool })
     }
-    
-    // Project operations
+
     pub async fn create_project(&self, project: &Project) -> Result<(), sqlx::Error> {
+        let discipline_ids = serde_json::json!(&project.discipline_ids);
+        let skill_ids = serde_json::json!(&project.skill_ids);
+        let progress = project.progress as i32;
+
         sqlx::query!(
             r#"
             INSERT INTO projects (id, name, description, discipline_ids, skill_ids, status, created_at, progress)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7)
             "#,
             project.id,
             project.name,
             project.description,
-            serde_json::to_string(&project.discipline_ids).unwrap(),
-            serde_json::to_string(&project.skill_ids).unwrap(),
+            discipline_ids,
+            skill_ids,
             project.status,
-            project.created_at,
-            project.progress
+            progress
         ).execute(&self.pool).await?;
-        
+
         Ok(())
     }
-    
+
     pub async fn get_projects(&self) -> Result<Vec<Project>, sqlx::Error> {
-        let rows = sqlx::query!("SELECT * FROM projects")
+        let rows = sqlx::query!("SELECT * FROM projects ORDER BY created_at DESC")
             .fetch_all(&self.pool)
             .await?;
-        
-        let mut projects = Vec::new();
-        for row in rows {
-            let project = Project {
-                id: row.id,
-                name: row.name,
-                description: row.description,
-                discipline_ids: serde_json::from_str(&row.discipline_ids).unwrap_or_default(),
-                skill_ids: serde_json::from_str(&row.skill_ids).unwrap_or_default(),
-                status: row.status,
-                created_at: row.created_at,
-                progress: row.progress as u8,
-            };
-            projects.push(project);
-        }
-        
+
+        let projects = rows.into_iter().map(|row| Project {
+            id: row.id,
+            name: row.name,
+            description: row.description,
+            discipline_ids: serde_json::from_value(row.discipline_ids).unwrap_or_default(),
+            skill_ids: serde_json::from_value(row.skill_ids).unwrap_or_default(),
+            status: row.status,
+            created_at: row.created_at.to_rfc3339(),
+            progress: row.progress as u8,
+        }).collect();
+
         Ok(projects)
     }
-    
-    // Discipline operations
+
     pub async fn create_discipline(&self, discipline: &Discipline) -> Result<(), sqlx::Error> {
         sqlx::query!(
-            "INSERT INTO disciplines (id, name, description, color) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO disciplines (id, name, description, color) VALUES ($1, $2, $3, $4)",
             discipline.id,
             discipline.name,
             discipline.description,
             discipline.color
         ).execute(&self.pool).await?;
-        
+
         Ok(())
     }
-    
+
     pub async fn get_disciplines(&self) -> Result<Vec<Discipline>, sqlx::Error> {
-        let rows = sqlx::query!("SELECT * FROM disciplines")
+        let rows = sqlx::query!("SELECT * FROM disciplines ORDER BY name ASC")
             .fetch_all(&self.pool)
             .await?;
-        
-        let mut disciplines = Vec::new();
-        for row in rows {
-            let discipline = Discipline {
-                id: row.id,
-                name: row.name,
-                description: row.description,
-                color: row.color,
-            };
-            disciplines.push(discipline);
-        }
-        
+
+        let disciplines = rows.into_iter().map(|row| Discipline {
+            id: row.id,
+            name: row.name,
+            description: row.description,
+            color: row.color,
+        }).collect();
+
         Ok(disciplines)
     }
-    
+
     pub async fn get_discipline_by_name(&self, name: &str) -> Result<Option<Discipline>, sqlx::Error> {
-        let row = sqlx::query!("SELECT * FROM disciplines WHERE LOWER(name) = LOWER(?1)", name)
-            .fetch_optional(&self.pool)
-            .await?;
-        
-        if let Some(row) = row {
-            Ok(Some(Discipline {
-                id: row.id,
-                name: row.name,
-                description: row.description,
-                color: row.color,
-            }))
-        } else {
-            Ok(None)
-        }
+        let row = sqlx::query!(
+            "SELECT * FROM disciplines WHERE LOWER(name) = LOWER($1)",
+            name
+        ).fetch_optional(&self.pool).await?;
+
+        Ok(row.map(|row| Discipline {
+            id: row.id,
+            name: row.name,
+            description: row.description,
+            color: row.color,
+        }))
     }
 }

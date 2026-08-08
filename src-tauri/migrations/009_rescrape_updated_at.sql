@@ -1,0 +1,1 @@
+ALTER TABLE mimir_resources ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;

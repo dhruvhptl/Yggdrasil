@@ -1,65 +1,379 @@
-// src/types.ts - Data models for our skill tree app
-
-export interface Discipline {
+export interface Tree {
   id: string;
+  project_id: string;
   name: string;
-  description: string;
-  color?: string;
-}
-
-export interface Skill {
-  id: string;
-  name: string;
-  description: string;
-  disciplineId: string;
-  proficiencyLevel: 'beginner' | 'intermediate' | 'advanced';
-  progress: number; // 0-100
-  isUnlocked: boolean;
-  prerequisites: string[]; // Array of skill IDs that must be completed first
-  projectIds: string[]; // Array of project IDs this skill belongs to
+  created_at: string;
+  version: number;
 }
 
 export interface Project {
   id: string;
   name: string;
   description: string;
-  disciplineIds: string[]; // Can span multiple disciplines
-  skillIds: string[]; // Required skills for this project
-  status: 'active' | 'completed' | 'paused';
-  createdAt: Date;
-  progress: number; // 0-100, calculated from skill progress
-}
-
-export interface Quest {
-  id: string;
-  title: string;
-  description: string;
-  skillId: string;
-  projectId: string;
-  isCompleted: boolean;
-  createdAt: Date;
-  dueDate?: Date;
-  priority: 'low' | 'medium' | 'high';
-}
-
-export interface Resource {
-  id: string;
-  title: string;
-  description: string;
-  url: string;
-  type: 'article' | 'video' | 'course' | 'book' | 'other';
+  disciplineIds: string[];
   skillIds: string[];
-  projectIds: string[];
-  source?: 'notion' | 'manual';
-  notionId?: string;
+  status: string;
+  createdAt: string;
+  progress: number;
 }
 
-// For Beautiful Skill Tree component
-export interface SkillTreeNode {
+// Checkpoint tracking types
+
+export interface CheckpointData {
+  mastery_criteria: string;
+  exercises: string[];
+  notes: string;
+  completed: boolean;
+}
+
+export interface QuestNode {
+  id: string;
+  treeId: string;
+  projectId: string;
+  projectName: string;
+  treeName: string;
+  title: string;
+  description: string;
+  progress: number;
+  tasks: CheckpointData;
+  orderIndex: number;
+}
+
+// Add to src/types.ts at the bottom
+
+// Brain-generated tree structure (Phases → Skills → Quests)
+export interface GeneratedTree {
+  project_id: string;
+  phases: Phase[];
+}
+
+export interface Phase {
+  id: string;
+  name: string;
+  description: string;
+  order: number;
+  skills: BrainSkill[];
+}
+
+export interface BrainSkill {
+  id: string;
+  name: string;
+  description: string;
+  order: number;
+  quests: BrainQuest[];
+}
+
+export interface BrainQuest {
   id: string;
   title: string;
-  tooltip: {
-    content: string;
-  };
-  children: SkillTreeNode[];
+  mastery_criteria: string;
+  exercises: string[];
+  order: number;
+}
+
+// Mimir library resource (from Rust mimir.rs / sidecar)
+export interface MimirResource {
+  id: string;
+  title: string;
+  url: string | null;
+  resourceType: string;  // Rust renames `type` → `resource_type` → camelCase `resourceType`
+  status: string;
+  userNotes: string | null;
+  createdAt: string;
+  relevanceScore?: number | null;
+  parentId?: string | null;
+  tags: string[];
+  nodeCount: number;
+  isCompleted: boolean;
+  matchedSectionTitle?: string | null;
+  matchedPageStart?: number | null;
+  matchedPageEnd?: number | null;
+  transcriptSource?: 'youtube_transcript_api' | 'youtubetranscript_dev' | 'metadata_only' | null;
+}
+
+// Universal Skill Tree types
+
+export interface SkillEvidence {
+  type: 'resume' | 'tree_quest' | 'work_resource' | 'job_demand';
+  detail?: string;
+  projectName?: string;
+  treeName?: string;
+  nodeTitle?: string;
+  nodeId?: string;
+  progress?: number;
+  company?: string;
+  resourceTitle?: string;
+  resourceId?: string;
+  count?: number;
+  frequency?: number;
+  demandScore?: number;
+}
+
+export interface UniversalSkill {
+  id: string;
+  name: string;
+  domain: string | null;
+  level: number;
+  evidence: SkillEvidence[];
+  lastUpdated: string;
+  reviewNeeded: boolean;
+  status: string;
+  origin: string;
+  state: string;
+}
+
+export interface PathNode {
+  skillId: string;
+  skillName: string;
+  state: string;
+  origin: string;
+  level: number;
+  hasResources: boolean;
+}
+
+export interface PrereqPath {
+  targetSkill: string;
+  targetSkillId: string;
+  path: PathNode[];
+  totalHops: number;
+  nearestSeed: string | null;
+  isReachable: boolean;
+}
+
+export interface GrowthTarget {
+  skillId: string;
+  skillName: string;
+  rationale: string;
+  jobRelevanceScore: number;
+  prereqDistance: number;
+  nearestSeed: string;
+  prereqPath: PathNode[];
+  hasResources: boolean;
+  jobCount: number;
+  finalScore: number;
+  isReachable: boolean;
+}
+
+export interface SkillGap {
+  skillName: string;
+  demandCount: number;
+  frequency: number;
+  demandScore: number;
+  currentLevel: number;
+}
+
+export interface SkillDependency {
+  id: string;
+  sourceSkillId: string;
+  targetSkillId: string;
+  relationship: string;
+}
+
+export interface SkillAlias {
+  id: string;
+  canonicalSkillId: string;
+  canonicalSkillName: string;
+  alias: string;
+}
+
+// Read-model helpers
+
+export interface TreeSummary {
+  treeId: string;
+  treeName: string;
+  projectId: string;
+  totalNodes: number;
+  completedNodes: number;
+  overallProgress: number;
+  phaseCount: number;
+  createdAt: string;
+}
+
+export interface MatchedResource {
+  resourceId: string;
+  title: string;
+  url: string | null;
+  resourceType: string;
+  matchedSectionTitle: string | null;
+  matchedPageStart: number | null;
+  matchedPageEnd: number | null;
+  relevanceScore: number | null;
+}
+
+export interface NeighborNode {
+  nodeId: string;
+  title: string;
+  progress: number;
+  isLocked: boolean;
+  conceptSlug: string | null;
+  skillLevel: number | null;
+  resources: MatchedResource[];
+}
+
+export interface NodeNeighborhood {
+  nodeId: string;
+  prerequisites: NeighborNode[];
+  dependents: NeighborNode[];
+  siblings: NeighborNode[];
+  prereqPath: PrereqPath | null;
+}
+
+export interface NodeChatContext {
+  nodeId: string;
+  title: string;
+  description: string;
+  masteryCriteria: string;
+  exercises: string[];
+  progress: number;
+  isLocked: boolean;
+  phaseName: string | null;
+  skillName: string | null;
+  siblings: string[];
+  matchedResources: MatchedResource[];
+}
+
+export interface PhaseBreakdown {
+  phaseName: string;
+  skillCount: number;
+  completedSkills: number;
+  checkpointsTotal: number;
+  checkpointsCompleted: number;
+}
+
+export interface ProjectTreeSummary {
+  projectId: string;
+  projectName: string;
+  treeId: string | null;
+  treeName: string | null;
+  overallProgress: number;
+  phases: PhaseBreakdown[];
+  totalMatchedResources: number;
+  lastActivity: string | null;
+}
+
+export interface SkillGraphSnapshot {
+  skills: UniversalSkill[];
+  dependencies: SkillDependency[];
+  aliases: SkillAlias[];
+  gaps: SkillGap[];
+  gapCount: number;
+  reviewCount: number;
+}
+
+// Mimir suggestion payloads
+
+export type SuggestionPayload =
+  | { action: 'mark_complete'; node_id: string }
+  | { action: 'next_quest'; node_id: string }
+  | { action: 'explain_prereq'; concept: string }
+  | { action: 'add_resource'; url: string }
+  | { action: 'find_gaps' };
+
+export interface Suggestion {
+  action: string;
+  label: string;
+  payload: SuggestionPayload | null;
+}
+
+// Daily Eisenhower Matrix types
+
+// Learning Path types
+
+export interface LearningStep {
+  step: number;
+  skillId: string;
+  skillName: string;
+  skillState: string;
+  weightedDemand: number;
+  prereqPath: PathNode[];
+  jobsNeedingThis: string[];
+  rationale: string;
+  hasResources: boolean;
+  estimatedPrereqsComplete: number;
+}
+
+export interface LearningPath {
+  steps: LearningStep[];
+  totalGapSkills: number;
+  seededSkillsCount: number;
+  targetJobsCount: number;
+  season: string | null;
+}
+
+export interface DailyQuestLink {
+  id: string;
+  date: string;
+  nodeId: string | null;
+  freeText: string | null;
+  quadrant: 'do' | 'schedule' | 'delegate' | 'eliminate';
+  sortOrder: number;
+  addedAt: string;
+  nodeTitle: string | null;
+  nodeProgress: number | null;
+  nodeIsLocked: boolean | null;
+  completed: boolean;
+}
+
+export interface DailyLog {
+  date: string;
+  notes: string | null;
+  links: DailyQuestLink[];
+}
+
+export interface TranscriptJobStats {
+  pending: number;
+  processing: number;
+  done: number;
+  failed: number;
+  skipped: number;
+}
+
+// Study Map types
+
+export interface StudyMapNode {
+  nodeId: string;
+  title: string;
+}
+
+export interface StudyMapSection {
+  sectionTitle: string;
+  pageStart: number | null;
+  pageEnd: number | null;
+  nodeCount: number;
+  nodes: StudyMapNode[];
+}
+
+export interface StudyMapTreeBreakdown {
+  projectId: string;
+  projectName: string;
+  nodeCount: number;
+}
+
+export interface StudyMapEntry {
+  resourceId: string;
+  title: string;
+  resourceType: string;
+  url: string | null;
+  coverageCount: number;
+  avgRelevance: number;
+  relevanceTier: 'green' | 'amber' | 'grey';
+  treeBreakdown: StudyMapTreeBreakdown[];
+  sections: StudyMapSection[];
+}
+
+export interface ResourceStudyMap {
+  entries: StudyMapEntry[];
+  totalResourcesWithLinks: number;
+  totalUnlockedNodes: number;
+  totalFrontierNodes: number;
+}
+
+export interface Proposal {
+  id: string;
+  type: 'merge_skills' | 'delete_skill' | 'rename_skill';
+  payload: Record<string, string>;
+  llmReasoning: string;
+  status: 'pending' | 'approved' | 'rejected';
+  createdAt: string;
+  reviewedAt: string | null;
 }

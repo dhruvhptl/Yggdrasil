@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Leaf Visual States Playground</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #080c10;
+    --surface: #0d1117;
+    --surface2: #141b24;
+    --border: #1e2a38;
+    --text: #c9d1d9;
+    --text-dim: #58677a;
+    --accent: #10b981;
+    --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    --mono: 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 13px;
+    height: 100vh;
+    display: grid;
+    grid-template-columns: 300px 1fr;
+    grid-template-rows: 1fr auto;
+    overflow: hidden;
+  }
+
+  /* ── Controls panel ── */
+  #controls {
+    grid-row: 1 / 3;
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    overflow-y: auto;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  .panel-title {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .section { display: flex; flex-direction: column; gap: 10px; }
+
+  .ctrl-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .ctrl-label {
+    flex: 1;
+    color: var(--text);
+    font-size: 12px;
+    white-space: nowrap;
+  }
+
+  .ctrl-val {
+    min-width: 38px;
+    text-align: right;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--accent);
+  }
+
+  input[type="range"] {
+    -webkit-appearance: none;
+    width: 110px;
+    height: 3px;
+    background: var(--border);
+    border-radius: 2px;
+    outline: none;
+    cursor: pointer;
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 12px; height: 12px;
+    border-radius: 50%;
+    background: var(--accent);
+    cursor: pointer;
+  }
+
+  input[type="color"] {
+    -webkit-appearance: none;
+    width: 32px; height: 20px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: none;
+    cursor: pointer;
+    padding: 0;
+  }
+  input[type="color"]::-webkit-color-swatch-wrapper { padding: 2px; }
+  input[type="color"]::-webkit-color-swatch { border: none; border-radius: 2px; }
+
+  .toggle-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .toggle-label { flex: 1; font-size: 12px; color: var(--text); }
+  .toggle {
+    position: relative;
+    width: 32px; height: 17px;
+  }
+  .toggle input { opacity: 0; width: 0; height: 0; }
+  .toggle-track {
+    position: absolute; inset: 0;
+    background: var(--border);
+    border-radius: 10px;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+  .toggle input:checked + .toggle-track { background: var(--accent); }
+  .toggle-track::after {
+    content: '';
+    position: absolute;
+    top: 2px; left: 2px;
+    width: 13px; height: 13px;
+    border-radius: 50%;
+    background: white;
+    transition: transform 0.2s;
+  }
+  .toggle input:checked + .toggle-track::after { transform: translateX(15px); }
+
+  .presets { display: flex; flex-wrap: wrap; gap: 6px; }
+  .preset-btn {
+    padding: 4px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface2);
+    color: var(--text-dim);
+    font-size: 11px;
+    cursor: pointer;
+    transition: border-color 0.15s, color 0.15s;
+  }
+  .preset-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* ── Canvas preview ── */
+  #preview-wrap {
+    position: relative;
+    overflow: hidden;
+  }
+
+  #canvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+
+  /* State badges overlay */
+  #state-labels {
+    position: absolute;
+    top: 12px; left: 12px;
+    display: flex; gap: 6px;
+    pointer-events: none;
+  }
+  .state-badge {
+    padding: 3px 8px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    border: 1px solid;
+  }
+  .badge-dormant   { background: #0d0d0d; border-color: #333; color: #555; }
+  .badge-budding   { background: rgba(16,185,129,0.08); border-color: rgba(16,185,129,0.3); color: #34d399; }
+  .badge-growing   { background: rgba(74,158,255,0.08); border-color: rgba(74,158,255,0.3); color: #60a5fa; }
+  .badge-bloomed   { background: rgba(200,169,74,0.08); border-color: rgba(200,169,74,0.4); color: #c8a94a; }
+
+  /* ── Prompt output ── */
+  #prompt-wrap {
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    padding: 12px 16px;
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    min-height: 64px;
+    max-height: 120px;
+  }
+
+  #prompt-text {
+    flex: 1;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: #7ec8a4;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    overflow-y: auto;
+  }
+
+  #copy-btn {
+    padding: 6px 14px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface2);
+    color: var(--text-dim);
+    font-size: 11px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: border-color 0.15s, color 0.15s;
+    flex-shrink: 0;
+  }
+  #copy-btn:hover { border-color: var(--accent); color: var(--accent); }
+  #copy-btn.copied { border-color: var(--accent); color: var(--accent); }
+</style>
+</head>
+<body>
+
+<!-- ── Controls ── -->
+<div id="controls">
+  <div class="panel-title">Leaf Visual States</div>
+
+  <!-- Presets -->
+  <div class="section">
+    <div class="panel-title" style="border:none;padding:0;margin-bottom:2px">Presets</div>
+    <div class="presets">
+      <button class="preset-btn" onclick="applyPreset('current')">Current</button>
+      <button class="preset-btn" onclick="applyPreset('rpg')">RPG Glow</button>
+      <button class="preset-btn" onclick="applyPreset('subtle')">Subtle</button>
+      <button class="preset-btn" onclick="applyPreset('high-contrast')">High Contrast</button>
+    </div>
+  </div>
+
+  <!-- Phase color -->
+  <div class="section">
+    <div class="panel-title" style="border:none;padding:0;">Phase Color</div>
+    <div class="ctrl-row">
+      <span class="ctrl-label">Leaf color</span>
+      <input type="color" id="phaseColor" value="#c8a94a" onchange="update()">
+    </div>
+  </div>
+
+  <!-- Leaf shape -->
+  <div class="section">
+    <div class="panel-title" style="border:none;padding:0;">Leaf Shape</div>
+    <div class="ctrl-row">
+      <span class="ctrl-label">Size</span>
+      <input type="range" id="leafSize" min="8" max="24" value="14" oninput="update()">
+      <span class="ctrl-val" id="leafSizeVal">14</span>
+    </div>
+    <div class="ctrl-row">
+      <span class="ctrl-label">Width</span>
+      <input type="range" id="leafWidth" min="20" max="70" value="45" oninput="update()">
+      <span class="ctrl-val" id="leafWidthVal">0.45</span>
+    </div>
+  </div>
+
+  <!-- Dormant -->
+  <div class="section">
+    <div class="panel-title" style="border:none;padding:0;color:#555">Dormant (Locked)</div>
+    <div class="ctrl-row">
+      <span class="ctrl-label">Opacity</span>
+      <input type="range" id="dormantOpacity" min="5" max="60" value="35" oninput="update()">
+      <span class="ctrl-val" id="dormantOpacityVal">0.35</span>
+    </div>
+    <div class="ctrl-row">
+      <span class="ctrl-label">Fill gray</span>
+      <input type="range" id="dormantGray" min="10" max="60" value="30" oninput="update()">
+      <span class="ctrl-val" id="dormantGrayVal">30</span>
+    </div>
+  </div>
+
+  <!-- Budding -->
+  <div class="section">
+    <div class="panel-title" style="border:none;padding:0;color:#34d399">Budding (Unlocked, 0%)</div>
+    <div class="ctrl-row">
+      <span class="ctrl-label">Pulse min α</span>
+      <input type="range" id="pulseMin" min="30" max="70" value="55" oninput="update()">
+      <span class="ctrl-val" id="pulseMinVal">0.55</span>
+    </div>
+    <div class="ctrl-row">
+      <span class="ctrl-label">Pulse max α</span>
+      <input type="range" id="pulseMax" min="55" max="100" value="85" oninput="update()">
+      <span class="ctrl-val" id="pulseMaxVal">0.85</span>
+    </div>
+    <div class="ctrl-row">
+      <span class="ctrl-label">Pulse speed</span>
+      <input type="range" id="pulseSpeed" min="5" max="50" value="22" oninput="update()">
+      <span class="ctrl-val" id="pulseSpeedVal">2.2</span>
+    </div>
+    <div class="toggle-row">
+      <span class="toggle-label">Show ring glow</span>
+      <label class="toggle">
+        <input type="checkbox" id="buddingRing" checked onchange="update()">
+        <div class="toggle-track"></div>
+      </label>
+    </div>
+  </div>
+
+  <!-- Growing -->
+  <div class="section">
+    <div class="panel-title" style="border:none;padding:0;color:#60a5fa">Growing (In Progress)</div>
+    <div class="ctrl-row">
+      <span class="ctrl-label">Progress %</span>
+      <input type="range" id="growingProgress" min="5" max="95" value="45" oninput="update()">
+      <span class="ctrl-val" id="growingProgressVal">45%</span>
+    </div>
+    <div class="ctrl-row">
+      <span class="ctrl-label">Ring radius</span>
+      <input type="range" id="ringRadius" min="14" max="28" value="18" oninput="update()">
+      <span class="ctrl-val" id="ringRadiusVal">18</span>
+    </div>
+    <div class="ctrl-row">
+      <span class="ctrl-label">Ring width</span>
+      <input type="range" id="ringWidth" min="8" max="30" value="18" oninput="update()">
+      <span class="ctrl-val" id="ringWidthVal">1.8</span>
+    </div>
+  </div>
+
+  <!-- Bloomed -->
+  <div class="section">
+    <div class="panel-title" style="border:none;padding:0;color:#c8a94a">Bloomed (100%)</div>
+    <div class="ctrl-row">
+      <span class="ctrl-label">Glow radius</span>
+      <input type="range" id="glowRadius" min="4" max="32" value="12" oninput="update()">
+      <span class="ctrl-val" id="glowRadiusVal">12</span>
+    </div>
+    <div class="toggle-row">
+      <span class="toggle-label">Show sparkles</span>
+      <label class="toggle">
+        <input type="checkbox" id="showSparkles" checked onchange="update()">
+        <div class="toggle-track"></div>
+      </label>
+    </div>
+    <div class="ctrl-row">
+      <span class="ctrl-label">Sparkle count</span>
+      <input type="range" id="sparkleCount" min="2" max="10" value="5" oninput="update()">
+      <span class="ctrl-val" id="sparkleCountVal">5</span>
+    </div>
+    <div class="ctrl-row">
+      <span class="ctrl-label">Sparkle radius</span>
+      <input type="range" id="sparkleRadius" min="14" max="36" value="20" oninput="update()">
+      <span class="ctrl-val" id="sparkleRadiusVal">20</span>
+    </div>
+  </div>
+</div>
+
+<!-- ── Canvas preview ── -->
+<div id="preview-wrap">
+  <canvas id="canvas"></canvas>
+  <div id="state-labels">
+    <span class="state-badge badge-dormant">Dormant</span>
+    <span class="state-badge badge-budding">Budding</span>
+    <span class="state-badge badge-growing">Growing</span>
+    <span class="state-badge badge-bloomed">Bloomed</span>
+  </div>
+</div>
+
+<!-- ── Prompt output ── -->
+<div id="prompt-wrap">
+  <div id="prompt-text"></div>
+  <button id="copy-btn" onclick="copyPrompt()">Copy</button>
+</div>
+
+<script>
+// ── State ────────────────────────────────────────────────────────────────────
+const DEFAULTS = {
+  phaseColor: '#c8a94a',
+  leafSize: 14, leafWidth: 0.45,
+  dormantOpacity: 0.35, dormantGray: 30,
+  pulseMin: 0.55, pulseMax: 0.85, pulseSpeed: 2.2, buddingRing: true,
+  growingProgress: 45, ringRadius: 18, ringWidth: 1.8,
+  glowRadius: 12, showSparkles: true, sparkleCount: 5, sparkleRadius: 20,
+};
+
+const state = { ...DEFAULTS };
+
+function readControls() {
+  state.phaseColor       = document.getElementById('phaseColor').value;
+  state.leafSize         = +document.getElementById('leafSize').value;
+  state.leafWidth        = +document.getElementById('leafWidth').value / 100;
+  state.dormantOpacity   = +document.getElementById('dormantOpacity').value / 100;
+  state.dormantGray      = +document.getElementById('dormantGray').value;
+  state.pulseMin         = +document.getElementById('pulseMin').value / 100;
+  state.pulseMax         = +document.getElementById('pulseMax').value / 100;
+  state.pulseSpeed       = +document.getElementById('pulseSpeed').value / 10;
+  state.buddingRing      = document.getElementById('buddingRing').checked;
+  state.growingProgress  = +document.getElementById('growingProgress').value;
+  state.ringRadius       = +document.getElementById('ringRadius').value;
+  state.ringWidth        = +document.getElementById('ringWidth').value / 10;
+  state.glowRadius       = +document.getElementById('glowRadius').value;
+  state.showSparkles     = document.getElementById('showSparkles').checked;
+  state.sparkleCount     = +document.getElementById('sparkleCount').value;
+  state.sparkleRadius    = +document.getElementById('sparkleRadius').value;
+}
+
+function syncLabels() {
+  document.getElementById('leafSizeVal').textContent     = state.leafSize;
+  document.getElementById('leafWidthVal').textContent    = state.leafWidth.toFixed(2);
+  document.getElementById('dormantOpacityVal').textContent = state.dormantOpacity.toFixed(2);
+  document.getElementById('dormantGrayVal').textContent  = state.dormantGray;
+  document.getElementById('pulseMinVal').textContent     = state.pulseMin.toFixed(2);
+  document.getElementById('pulseMaxVal').textContent     = state.pulseMax.toFixed(2);
+  document.getElementById('pulseSpeedVal').textContent   = state.pulseSpeed.toFixed(1);
+  document.getElementById('growingProgressVal').textContent = state.growingProgress + '%';
+  document.getElementById('ringRadiusVal').textContent   = state.ringRadius;
+  document.getElementById('ringWidthVal').textContent    = state.ringWidth.toFixed(1);
+  document.getElementById('glowRadiusVal').textContent   = state.glowRadius;
+  document.getElementById('sparkleCountVal').textContent = state.sparkleCount;
+  document.getElementById('sparkleRadiusVal').textContent= state.sparkleRadius;
+}
+
+function update() {
+  readControls();
+  syncLabels();
+  updatePrompt();
+  // no need to trigger render — RAF loop does it continuously
+}
+
+// ── Canvas ───────────────────────────────────────────────────────────────────
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+
+function resizeCanvas() {
+  const wrap = document.getElementById('preview-wrap');
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = wrap.clientWidth * dpr;
+  canvas.height = wrap.clientHeight * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+// ── Leaf drawing ─────────────────────────────────────────────────────────────
+function drawLeaf(cx, cy, size, color, leafState, animTime, progress) {
+  const w = size * state.leafWidth;
+  const len = size;
+  const pointOff = len * 0.3;
+  const curve = 0.15 * size;
+
+  // State-based colors
+  let fillColor, strokeColor, alpha;
+  const t = animTime;
+
+  if (leafState === 'bloomed') {
+    fillColor = color; strokeColor = '#ffffffcc'; alpha = 1;
+  } else if (leafState === 'dormant') {
+    const g = state.dormantGray;
+    fillColor = `rgb(${g},${g},${g})`;
+    strokeColor = `rgb(${g+20},${g+20},${g+20})`;
+    alpha = state.dormantOpacity;
+  } else if (leafState === 'growing') {
+    fillColor = color; strokeColor = color + 'ff'; alpha = 1;
+  } else {
+    // budding — pulse
+    const pulse = state.pulseMin + (state.pulseMax - state.pulseMin) * (0.5 + 0.5 * Math.sin(t * state.pulseSpeed));
+    fillColor = color + 'bb'; strokeColor = color + 'ff'; alpha = pulse;
+  }
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  // angle: point right for display clarity
+  const angle = 0;
+  ctx.rotate(angle);
+  ctx.globalAlpha = alpha;
+
+  // Bloomed glow
+  if (leafState === 'bloomed' && state.glowRadius > 0) {
+    const halo = ctx.createRadialGradient(len*0.4, 0, 4, len*0.4, 0, state.glowRadius + size*1.4);
+    halo.addColorStop(0, color + '55');
+    halo.addColorStop(0.5, color + '22');
+    halo.addColorStop(1, color + '00');
+    ctx.beginPath();
+    ctx.arc(len*0.4, 0, state.glowRadius + size*1.4, 0, Math.PI*2);
+    ctx.fillStyle = halo;
+    ctx.fill();
+
+    const core = ctx.createRadialGradient(len*0.4, 0, 1, len*0.4, 0, size*0.9);
+    core.addColorStop(0, color + 'aa');
+    core.addColorStop(1, color + '00');
+    ctx.beginPath();
+    ctx.arc(len*0.4, 0, size*0.9, 0, Math.PI*2);
+    ctx.fillStyle = core;
+    ctx.fill();
+  }
+
+  // Budding ring glow
+  if (leafState === 'budding' && state.buddingRing) {
+    const ringA = Math.round((0.2 + 0.3*(0.5+0.5*Math.sin(t*state.pulseSpeed+Math.PI)))*255).toString(16).padStart(2,'0');
+    const bg = ctx.createRadialGradient(len*0.4, 0, size*0.8, len*0.4, 0, size*1.8);
+    bg.addColorStop(0, color+'00');
+    bg.addColorStop(0.5, color+ringA);
+    bg.addColorStop(1, color+'00');
+    ctx.beginPath();
+    ctx.arc(len*0.4, 0, size*1.8, 0, Math.PI*2);
+    ctx.fillStyle = bg;
+    ctx.fill();
+  }
+
+  // Leaf shape
+  ctx.beginPath();
+  ctx.moveTo(0,0);
+  ctx.bezierCurveTo(pointOff*0.3, -(w*0.5+curve), pointOff, -(w+curve*0.5), len, 0);
+  ctx.bezierCurveTo(pointOff, (w+curve*0.5), pointOff*0.3, (w*0.5+curve), 0, 0);
+  ctx.closePath();
+  ctx.fillStyle = fillColor;
+  ctx.fill();
+  ctx.strokeStyle = strokeColor;
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // Growing progress ring
+  if (leafState === 'growing' && progress > 0) {
+    const rcx = len*0.4;
+    const r = state.ringRadius;
+    const startA = -Math.PI/2;
+    const endA = startA + (progress/100)*Math.PI*2;
+    ctx.beginPath();
+    ctx.arc(rcx, 0, r, 0, Math.PI*2);
+    ctx.strokeStyle = color+'33';
+    ctx.lineWidth = state.ringWidth;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(rcx, 0, r, startA, endA);
+    ctx.strokeStyle = color+'ee';
+    ctx.lineWidth = state.ringWidth;
+    ctx.lineCap = 'round';
+    ctx.stroke();
+    ctx.lineCap = 'butt';
+  }
+
+  // Midvein
+  ctx.beginPath();
+  ctx.moveTo(1,0);
+  ctx.lineTo(len*0.85, 0);
+  ctx.strokeStyle = leafState==='dormant' ? '#2e2e2e' : (leafState==='bloomed' ? '#ffffff44' : color+'55');
+  ctx.lineWidth = 0.6;
+  ctx.stroke();
+
+  // Lateral veins
+  const veinCount = Math.max(2, Math.floor(size/5));
+  for (let v=1; v<=veinCount; v++) {
+    const vt = v/(veinCount+1);
+    const vx = len*vt*0.85;
+    const vw = w*(1-vt*0.6)*0.6;
+    const vs = leafState==='dormant' ? '#262626' : (leafState==='bloomed' ? '#ffffff22' : color+'33');
+    ctx.beginPath(); ctx.moveTo(vx,0);
+    ctx.quadraticCurveTo(vx+len*0.06, -vw*0.6, vx+len*0.12, -vw);
+    ctx.strokeStyle = vs; ctx.lineWidth = 0.4; ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(vx,0);
+    ctx.quadraticCurveTo(vx+len*0.06, vw*0.6, vx+len*0.12, vw);
+    ctx.stroke();
+  }
+
+  // Bloomed sparkles
+  if (leafState === 'bloomed' && state.showSparkles) {
+    const scx = len*0.4;
+    const baseAngle = t*0.6;
+    const savedA = ctx.globalAlpha;
+    for (let i=0; i<state.sparkleCount; i++) {
+      const theta = baseAngle + (i/state.sparkleCount)*Math.PI*2;
+      const dist = state.sparkleRadius*(0.7+0.3*(Math.sin(t*1.3+i*2.1)*0.5+0.5));
+      const sx = scx + Math.cos(theta)*dist;
+      const sy = Math.sin(theta)*dist*0.6;
+      const sa = 0.4+0.4*(Math.sin(t*2.7+i*1.8)*0.5+0.5);
+      ctx.beginPath();
+      ctx.arc(sx, sy, 1.2, 0, Math.PI*2);
+      ctx.fillStyle = '#ffffff';
+      ctx.globalAlpha = sa;
+      ctx.fill();
+    }
+    ctx.globalAlpha = savedA;
+  }
+
+  // Stem
+  ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(-size*0.4, 0);
+  ctx.strokeStyle='#1a1008'; ctx.lineWidth=1.2; ctx.stroke();
+
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}
+
+// ── Render frame ─────────────────────────────────────────────────────────────
+function renderFrame(ts) {
+  const W = canvas.width  / (window.devicePixelRatio||1);
+  const H = canvas.height / (window.devicePixelRatio||1);
+  const t = ts / 1000;
+
+  // Background
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, '#010208');
+  bg.addColorStop(0.6, '#020406');
+  bg.addColorStop(1, '#04080a');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+
+  // Subtle grid for reference
+  ctx.strokeStyle = 'rgba(255,255,255,0.02)';
+  ctx.lineWidth = 1;
+  for (let x=0; x<W; x+=40) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
+  for (let y=0; y<H; y+=40) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+
+  const color = state.phaseColor;
+  const size = state.leafSize;
+
+  // Four leaf states, spread horizontally
+  const pad = 80;
+  const spacing = (W - pad*2) / 3;
+  const cy = H / 2;
+
+  const leaves = [
+    { x: pad,             state: 'dormant',  progress: 0  },
+    { x: pad + spacing,   state: 'budding',  progress: 0  },
+    { x: pad + spacing*2, state: 'growing',  progress: state.growingProgress },
+    { x: pad + spacing*3, state: 'bloomed',  progress: 100 },
+  ];
+
+  for (const leaf of leaves) {
+    drawLeaf(leaf.x, cy, size, color, leaf.state, t, leaf.progress);
+  }
+
+  // State labels below each leaf
+  ctx.font = '500 11px -apple-system, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+
+  const labelConfigs = [
+    { x: pad,             label: 'DORMANT',  color: '#444',     sub: 'Locked'             },
+    { x: pad + spacing,   label: 'BUDDING',  color: '#34d399',  sub: 'Unlocked · 0%'      },
+    { x: pad + spacing*2, label: 'GROWING',  color: '#60a5fa',  sub: `In Progress · ${state.growingProgress}%` },
+    { x: pad + spacing*3, label: 'BLOOMED',  color: '#c8a94a',  sub: 'Complete · 100%'    },
+  ];
+
+  for (const lc of labelConfigs) {
+    ctx.fillStyle = lc.color;
+    ctx.font = '600 10px -apple-system, sans-serif';
+    ctx.fillText(lc.label, lc.x, cy + size + 24);
+    ctx.fillStyle = '#3a4a5a';
+    ctx.font = '400 10px -apple-system, sans-serif';
+    ctx.fillText(lc.sub, lc.x, cy + size + 38);
+  }
+
+  requestAnimationFrame(renderFrame);
+}
+
+requestAnimationFrame(renderFrame);
+
+// ── Prompt generation ─────────────────────────────────────────────────────────
+function updatePrompt() {
+  const D = DEFAULTS;
+  const s = state;
+  const parts = [];
+
+  // Dormant
+  const dormantChanges = [];
+  if (Math.abs(s.dormantOpacity - D.dormantOpacity) > 0.01)
+    dormantChanges.push(`opacity ${s.dormantOpacity.toFixed(2)} (was ${D.dormantOpacity})`);
+  if (Math.abs(s.dormantGray - D.dormantGray) > 1)
+    dormantChanges.push(`fill rgb(${s.dormantGray},${s.dormantGray},${s.dormantGray})`);
+  if (dormantChanges.length) parts.push(`dormant leaves: ${dormantChanges.join(', ')}`);
+
+  // Budding
+  const buddingChanges = [];
+  if (Math.abs(s.pulseMin - D.pulseMin) > 0.01 || Math.abs(s.pulseMax - D.pulseMax) > 0.01)
+    buddingChanges.push(`pulse α ${s.pulseMin.toFixed(2)}–${s.pulseMax.toFixed(2)}`);
+  if (Math.abs(s.pulseSpeed - D.pulseSpeed) > 0.1)
+    buddingChanges.push(`pulse speed ${s.pulseSpeed.toFixed(1)} rad/s`);
+  if (!s.buddingRing) buddingChanges.push('no ring glow');
+  if (buddingChanges.length) parts.push(`budding leaves: ${buddingChanges.join(', ')}`);
+
+  // Growing
+  const growingChanges = [];
+  if (Math.abs(s.ringRadius - D.ringRadius) > 0.5)
+    growingChanges.push(`progress ring radius ${s.ringRadius}px`);
+  if (Math.abs(s.ringWidth - D.ringWidth) > 0.1)
+    growingChanges.push(`ring width ${s.ringWidth.toFixed(1)}px`);
+  if (growingChanges.length) parts.push(`growing leaves: ${growingChanges.join(', ')}`);
+
+  // Bloomed
+  const bloomedChanges = [];
+  if (Math.abs(s.glowRadius - D.glowRadius) > 0.5)
+    bloomedChanges.push(`glow radius ${s.glowRadius}px`);
+  if (!s.showSparkles) bloomedChanges.push('no sparkles');
+  else {
+    if (s.sparkleCount !== D.sparkleCount) bloomedChanges.push(`${s.sparkleCount} sparkles`);
+    if (Math.abs(s.sparkleRadius - D.sparkleRadius) > 0.5)
+      bloomedChanges.push(`sparkle orbit radius ${s.sparkleRadius}px`);
+  }
+  if (bloomedChanges.length) parts.push(`bloomed leaves: ${bloomedChanges.join(', ')}`);
+
+  // Leaf shape
+  if (Math.abs(s.leafSize - D.leafSize) > 0.5) parts.push(`leaf size ${s.leafSize}px`);
+  if (Math.abs(s.leafWidth - D.leafWidth) > 0.02) parts.push(`leaf width factor ${s.leafWidth.toFixed(2)}`);
+
+  // Color
+  if (s.phaseColor !== D.phaseColor) parts.push(`phase color ${s.phaseColor}`);
+
+  let prompt;
+  if (parts.length === 0) {
+    prompt = '// All values at defaults — adjust controls to generate implementation notes.';
+  } else {
+    prompt = `Update LEAF_SHAPE constants and drawLeaf() in YggdrasilTree.tsx:\n${parts.map(p => `  • ${p}`).join('\n')}`;
+  }
+
+  document.getElementById('prompt-text').textContent = prompt;
+}
+
+function copyPrompt() {
+  navigator.clipboard.writeText(document.getElementById('prompt-text').textContent);
+  const btn = document.getElementById('copy-btn');
+  btn.textContent = 'Copied!';
+  btn.classList.add('copied');
+  setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1500);
+}
+
+// ── Presets ──────────────────────────────────────────────────────────────────
+const PRESETS = {
+  current: {
+    phaseColor: '#c8a94a', leafSize: 14, leafWidth: 45,
+    dormantOpacity: 20, dormantGray: 17,
+    pulseMin: 55, pulseMax: 70, pulseSpeed: 22, buddingRing: false,
+    growingProgress: 45, ringRadius: 18, ringWidth: 18,
+    glowRadius: 12, showSparkles: false, sparkleCount: 5, sparkleRadius: 20,
+  },
+  rpg: {
+    phaseColor: '#10b981', leafSize: 16, leafWidth: 45,
+    dormantOpacity: 30, dormantGray: 25,
+    pulseMin: 50, pulseMax: 90, pulseSpeed: 18, buddingRing: true,
+    growingProgress: 55, ringRadius: 20, ringWidth: 22,
+    glowRadius: 18, showSparkles: true, sparkleCount: 6, sparkleRadius: 22,
+  },
+  subtle: {
+    phaseColor: '#4a9eff', leafSize: 14, leafWidth: 45,
+    dormantOpacity: 25, dormantGray: 22,
+    pulseMin: 60, pulseMax: 80, pulseSpeed: 15, buddingRing: false,
+    growingProgress: 40, ringRadius: 17, ringWidth: 14,
+    glowRadius: 8, showSparkles: false, sparkleCount: 4, sparkleRadius: 18,
+  },
+  'high-contrast': {
+    phaseColor: '#ef4444', leafSize: 18, leafWidth: 50,
+    dormantOpacity: 15, dormantGray: 15,
+    pulseMin: 45, pulseMax: 95, pulseSpeed: 28, buddingRing: true,
+    growingProgress: 65, ringRadius: 22, ringWidth: 25,
+    glowRadius: 20, showSparkles: true, sparkleCount: 8, sparkleRadius: 26,
+  },
+};
+
+function applyPreset(name) {
+  const p = PRESETS[name];
+  document.getElementById('phaseColor').value           = p.phaseColor;
+  document.getElementById('leafSize').value             = p.leafSize;
+  document.getElementById('leafWidth').value            = p.leafWidth;
+  document.getElementById('dormantOpacity').value       = p.dormantOpacity;
+  document.getElementById('dormantGray').value          = p.dormantGray;
+  document.getElementById('pulseMin').value             = p.pulseMin;
+  document.getElementById('pulseMax').value             = p.pulseMax;
+  document.getElementById('pulseSpeed').value           = p.pulseSpeed;
+  document.getElementById('buddingRing').checked        = p.buddingRing;
+  document.getElementById('growingProgress').value      = p.growingProgress;
+  document.getElementById('ringRadius').value           = p.ringRadius;
+  document.getElementById('ringWidth').value            = p.ringWidth;
+  document.getElementById('glowRadius').value           = p.glowRadius;
+  document.getElementById('showSparkles').checked       = p.showSparkles;
+  document.getElementById('sparkleCount').value         = p.sparkleCount;
+  document.getElementById('sparkleRadius').value        = p.sparkleRadius;
+  update();
+}
+
+// Init
+update();
+</script>
+</body>
+</html>

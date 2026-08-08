@@ -1,19 +1,46 @@
 [package]
-name = "univerisal-skill-tree"
+name = "universal-skill-tree"
 version = "0.1.0"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["opener"] }
+tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1.0", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid"] }
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json"] }
+reqwest = { version = "0.12", features = ["json"] }
+base64 = "0.21"
+
+# Mimir — embeddings via Perplexity API + RAG (replaces Node.js sidecar)
+sha2 = "0.10"
+hex = "0.4"
+scraper = "0.22"
+ego-tree = "0.10"
+pdf-extract = "0.7"
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
+
+# Scanner — tree-sitter project scanner
+tree-sitter = "0.24"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-rust = "0.23"
+tree-sitter-go = "0.23"
+ignore = "0.4"
+streaming-iterator = "0.1"
+regex = "1"
+
+# Reduce debuginfo on dev builds to avoid MSVC linker OOM (STATUS_STACK_BUFFER_OVERRUN).
+# Line-tables-only is enough for backtraces and covers 95% of dev debugging needs.
+# Full debuginfo is kept for release (default).
+[profile.dev]
+debug = "line-tables-only"

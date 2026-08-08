@@ -1,0 +1,764 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Yggdrasil</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      width: 380px;
+      min-height: 480px;
+      background: #171614;
+      color: #cdccca;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      font-size: 13px;
+      padding: 16px;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 14px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid #2a2825;
+    }
+
+    h1 {
+      font-size: 15px;
+      font-weight: 600;
+      color: #e8e6e3;
+      flex: 1;
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .dot-green  { background: #4caf7d; }
+    .dot-red    { background: #e05252; }
+    .dot-gray   { background: #444; }
+
+    .field { margin-bottom: 11px; }
+
+    label {
+      display: block;
+      font-size: 10px;
+      font-weight: 600;
+      color: #666;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 4px;
+    }
+
+    input, select, textarea {
+      width: 100%;
+      background: #211f1d;
+      border: 1px solid #2e2c2a;
+      border-radius: 5px;
+      color: #cdccca;
+      font-size: 13px;
+      padding: 7px 10px;
+      outline: none;
+      transition: border-color 0.12s;
+      font-family: inherit;
+    }
+
+    input:focus, select:focus, textarea:focus {
+      border-color: #4f98a3;
+    }
+
+    select {
+      font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    textarea {
+      resize: vertical;
+      min-height: 100px;
+      line-height: 1.5;
+    }
+
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+
+    .btn {
+      width: 100%;
+      padding: 9px;
+      border: none;
+      border-radius: 5px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.12s;
+      font-family: inherit;
+    }
+    .btn:hover { opacity: 0.82; }
+    .btn-primary   { background: #4f98a3; color: #fff; }
+    .btn-secondary { background: #252320; color: #aaa; border: 1px solid #2e2c2a; }
+
+    .queue-notice {
+      display: none;
+      font-size: 11px;
+      color: #4f98a3;
+      text-align: center;
+      margin-top: 8px;
+    }
+
+    /* ── Tag inputs ── */
+    .tag-field {
+      background: #211f1d;
+      border: 1px solid #2e2c2a;
+      border-radius: 5px;
+      padding: 6px 8px 5px;
+      min-height: 34px;
+      transition: border-color 0.12s;
+      cursor: text;
+    }
+    .tag-field:focus-within { border-color: #4f98a3; }
+
+    .chips-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      margin-bottom: 5px;
+    }
+    .chips-row:empty { margin-bottom: 0; }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      background: #1a3438;
+      color: #4f98a3;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 500;
+      padding: 3px 6px 3px 8px;
+    }
+    .chip-remove {
+      background: none;
+      border: none;
+      color: #4f98a3;
+      cursor: pointer;
+      font-size: 15px;
+      line-height: 1;
+      padding: 0 1px;
+      opacity: 0.6;
+      transition: opacity 0.1s;
+    }
+    .chip-remove:hover { opacity: 1; }
+
+    .presets-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+    }
+
+    .preset-pill {
+      display: inline-flex;
+      align-items: center;
+      background: transparent;
+      border: 1px solid #2e2c2a;
+      border-radius: 12px;
+      color: #666;
+      cursor: pointer;
+      font-size: 11px;
+      font-family: inherit;
+      padding: 2px 9px;
+      transition: border-color 0.1s, color 0.1s, background 0.1s;
+      white-space: nowrap;
+    }
+    .preset-pill:hover { border-color: #4f98a3; color: #cdccca; }
+
+    .preset-other { border-style: dashed; }
+    .preset-other:hover { background: transparent; }
+
+    .other-row {
+      display: none;
+      align-items: center;
+      gap: 6px;
+      margin-top: 6px;
+    }
+    .other-input {
+      flex: 1;
+      background: #171614;
+      border: 1px solid #2e2c2a;
+      border-radius: 4px;
+      color: #cdccca;
+      font-size: 12px;
+      font-family: inherit;
+      padding: 4px 8px;
+      outline: none;
+    }
+    .other-input:focus { border-color: #4f98a3; }
+    .other-add-btn {
+      background: #252320;
+      border: 1px solid #2e2c2a;
+      border-radius: 4px;
+      color: #888;
+      cursor: pointer;
+      font-size: 11px;
+      font-family: inherit;
+      padding: 4px 10px;
+      white-space: nowrap;
+      transition: color 0.1s, border-color 0.1s;
+    }
+    .other-add-btn:hover { color: #cdccca; border-color: #4f98a3; }
+
+    /* ── Submitting ── */
+    #view-submitting {
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 220px;
+      gap: 14px;
+      color: #666;
+      font-size: 12px;
+    }
+
+    .spinner {
+      width: 26px;
+      height: 26px;
+      border: 2px solid #2e2c2a;
+      border-top-color: #4f98a3;
+      border-radius: 50%;
+      animation: spin 0.75s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Success ── */
+    #view-success { display: none; }
+
+    .success-badge {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      color: #4caf7d;
+      font-weight: 600;
+      font-size: 14px;
+      margin-bottom: 16px;
+    }
+
+    h2 {
+      font-size: 10px;
+      font-weight: 600;
+      color: #666;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 10px;
+    }
+
+    .project-item {
+      background: #1c1a18;
+      border: 1px solid #2e2c2a;
+      border-radius: 5px;
+      padding: 10px 12px;
+      margin-bottom: 8px;
+    }
+
+    .project-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .project-name {
+      font-weight: 600;
+      color: #e8e6e3;
+      font-size: 13px;
+      text-decoration: none;
+    }
+    a.project-name:hover { color: #4f98a3; }
+
+    .score-pill {
+      font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+      font-size: 11px;
+      background: #1a3438;
+      color: #4f98a3;
+      padding: 2px 8px;
+      border-radius: 12px;
+      flex-shrink: 0;
+    }
+
+    .project-desc {
+      font-size: 11px;
+      color: #666;
+      margin-top: 5px;
+      line-height: 1.45;
+    }
+
+    /* ── Status / ratings ── */
+    #status-buttons { display: flex; gap: 8px; margin-top: 14px; }
+    #status-buttons .btn { flex: 1; font-size: 12px; padding: 8px 6px; }
+
+    #status-result {
+      display: none;
+      margin-top: 12px;
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(-4px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    #ratings-section {
+      display: none;
+      margin-top: 12px;
+      animation: fadeIn 0.15s ease;
+    }
+
+    .rating-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 9px;
+    }
+    .rating-label {
+      font-size: 11px;
+      color: #777;
+      width: 68px;
+      flex-shrink: 0;
+    }
+    .dots { display: flex; gap: 8px; align-items: center; }
+
+    .dot-btn {
+      width: 13px;
+      height: 13px;
+      border-radius: 50%;
+      border: none;
+      background: #2e2c2a;
+      cursor: pointer;
+      padding: 0;
+      transition: background 0.1s, transform 0.08s;
+      /* Enlarge hit target without changing visual size */
+      box-shadow: 0 0 0 4px transparent;
+    }
+    .dot-btn:hover:not(.active) { background: #4a4845; }
+    .dot-btn:active { transform: scale(1.2); }
+    .dot-btn.active { background: #4f98a3; }
+
+    #ratings-error {
+      display: none;
+      color: #e05252;
+      font-size: 11px;
+      margin-top: 6px;
+      margin-bottom: 2px;
+    }
+
+    .success-footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 16px;
+      padding-top: 11px;
+      border-top: 1px solid #222;
+    }
+    .text-link {
+      color: #555;
+      font-size: 11px;
+      text-decoration: none;
+      cursor: pointer;
+      transition: color 0.1s;
+    }
+    .text-link:hover { color: #cdccca; }
+
+    /* ── Error ── */
+    #view-error { display: none; }
+
+    .error-box {
+      background: #2d1a1a;
+      border: 1px solid #5a2020;
+      border-radius: 5px;
+      padding: 12px;
+      color: #e05252;
+      font-size: 12px;
+      margin-bottom: 12px;
+      line-height: 1.5;
+    }
+
+    /* ── Offline ── */
+    #view-offline { display: none; }
+
+    .offline-box {
+      background: #172428;
+      border: 1px solid #274448;
+      border-radius: 5px;
+      padding: 12px;
+      color: #4f98a3;
+      font-size: 12px;
+      margin-bottom: 12px;
+      line-height: 1.5;
+    }
+
+    /* ── Tab bar ── */
+    #tab-bar {
+      display: flex;
+      gap: 2px;
+      margin-bottom: 14px;
+      border-bottom: 1px solid #2a2825;
+      padding-bottom: 0;
+    }
+    .tab-btn {
+      background: transparent;
+      border: none;
+      border-bottom: 2px solid transparent;
+      color: #666;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 600;
+      padding: 4px 12px 8px;
+      transition: color 0.12s, border-color 0.12s;
+      margin-bottom: -1px;
+    }
+    .tab-btn:hover { color: #cdccca; }
+    .tab-active { color: #4f98a3; border-bottom-color: #4f98a3; }
+
+    /* ── Library tab ── */
+    .lib-search-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .lib-search-wrap { flex: 1; position: relative; }
+    .lib-search-input {
+      width: 100%;
+      background: #211f1d;
+      border: 1px solid #2e2c2a;
+      border-radius: 5px;
+      color: #cdccca;
+      font-size: 13px;
+      padding: 7px 28px 7px 10px;
+      outline: none;
+      font-family: inherit;
+      transition: border-color 0.12s;
+    }
+    .lib-search-input:focus { border-color: #4f98a3; }
+    .lib-search-clear {
+      position: absolute;
+      right: 8px;
+      top: 50%;
+      transform: translateY(-50%);
+      background: none;
+      border: none;
+      color: #555;
+      cursor: pointer;
+      font-size: 13px;
+      padding: 0;
+      display: none;
+    }
+    .lib-search-clear:hover { color: #cdccca; }
+    .lib-save-btn { flex-shrink: 0; width: auto; padding: 7px 12px; }
+    .lib-row {
+      border-bottom: 1px solid #2a2825;
+      padding: 10px 0;
+      min-height: 52px;
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+    }
+    .lib-row-main { flex: 1; cursor: pointer; min-width: 0; }
+    .lib-row-title {
+      font-weight: 600;
+      color: #e8e6e3;
+      font-size: 13px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .lib-row-main:hover .lib-row-title { color: #4f98a3; }
+    .lib-row-domain { font-size: 11px; color: #555; margin-top: 2px; }
+    .lib-row-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+    .lib-tag {
+      background: #1a3438;
+      color: #4f98a3;
+      border-radius: 4px;
+      font-size: 10px;
+      padding: 1px 6px;
+    }
+    .lib-tag-more { color: #555; font-size: 10px; padding: 1px 4px; }
+    .lib-note-btn {
+      background: none;
+      border: none;
+      color: #444;
+      cursor: pointer;
+      font-size: 15px;
+      padding: 2px 4px;
+      opacity: 0;
+      transition: opacity 0.1s, color 0.1s;
+      flex-shrink: 0;
+      line-height: 1;
+    }
+    .lib-row:hover .lib-note-btn { opacity: 1; }
+    .lib-note-btn:hover { color: #4f98a3; }
+    .lib-note-editor { padding: 6px 0 2px; width: 100%; }
+    .lib-note-textarea {
+      width: 100%;
+      background: #211f1d;
+      border: 1px solid #2e2c2a;
+      border-radius: 5px;
+      color: #cdccca;
+      font-size: 12px;
+      font-family: inherit;
+      padding: 6px 8px;
+      outline: none;
+      resize: vertical;
+      min-height: 48px;
+    }
+    .lib-note-textarea:focus { border-color: #4f98a3; }
+    .lib-offline-banner {
+      background: #172428;
+      border: 1px solid #274448;
+      border-radius: 5px;
+      padding: 8px 10px;
+      color: #4f98a3;
+      font-size: 11px;
+      margin-bottom: 8px;
+      line-height: 1.4;
+      display: none;
+    }
+    .lib-status {
+      font-size: 12px;
+      font-weight: 600;
+      margin-top: 6px;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <!-- Tree icon -->
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#4f98a3" stroke-width="1.6"
+         stroke-linecap="round" stroke-linejoin="round">
+      <line x1="12" y1="22" x2="12" y2="2"/>
+      <path d="M12 6 C12 6 7 4 4 6"/>
+      <path d="M12 6 C12 6 17 4 20 6"/>
+      <path d="M12 11 C12 11 7 9 4 11"/>
+      <path d="M12 11 C12 11 17 9 20 11"/>
+      <path d="M12 16 C12 16 7 14 4 16"/>
+      <path d="M12 16 C12 16 17 14 20 16"/>
+    </svg>
+    <h1>Yggdrasil</h1>
+    <div id="health-dot" class="dot dot-gray" title="Checking connection..."></div>
+  </header>
+
+  <!-- ── TAB BAR ── -->
+  <div id="tab-bar">
+    <button id="tab-job" class="tab-btn tab-active">Add Job</button>
+    <button id="tab-library" class="tab-btn">Library</button>
+  </div>
+
+  <!-- ── JOB TAB ── -->
+  <div id="view-job">
+
+    <!-- ── IDLE ── -->
+    <div id="view-idle">
+      <form id="job-form">
+        <div class="row">
+          <div class="field">
+            <label for="company">Company</label>
+            <input id="company" type="text" placeholder="Acme Corp" autocomplete="off" required>
+          </div>
+          <div class="field">
+            <label for="position">Position</label>
+            <input id="position" type="text" placeholder="Software Engineer" autocomplete="off" required>
+          </div>
+        </div>
+
+        <div class="field">
+          <label>Location</label>
+          <div class="tag-field" id="tag-location">
+            <div class="chips-row" id="chips-location"></div>
+            <div class="presets-row" id="presets-location"></div>
+            <div class="other-row" id="other-location">
+              <input type="text" class="other-input" id="other-input-location" placeholder="Type location…">
+              <button type="button" class="other-add-btn" id="other-add-location">Add</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="field">
+          <label>Source</label>
+          <div class="tag-field" id="tag-source">
+            <div class="chips-row" id="chips-source"></div>
+            <div class="presets-row" id="presets-source"></div>
+            <div class="other-row" id="other-source">
+              <input type="text" class="other-input" id="other-input-source" placeholder="Type source…">
+              <button type="button" class="other-add-btn" id="other-add-source">Add</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="field">
+            <label for="season">Season</label>
+            <select id="season"></select>
+          </div>
+          <div class="field">
+            <label for="link">Link</label>
+            <input id="link" type="url" placeholder="https://...">
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="job-description">Job Description</label>
+          <textarea id="job-description" placeholder="Paste the JD here for skill extraction and project matching..."></textarea>
+        </div>
+
+        <button type="submit" class="btn btn-primary">Save to Yggdrasil</button>
+      </form>
+      <div id="queue-count" class="queue-notice"></div>
+    </div>
+
+    <!-- ── SUBMITTING ── -->
+    <div id="view-submitting">
+      <div class="spinner"></div>
+      <span>Saving &amp; extracting skills…</span>
+    </div>
+
+    <!-- ── SUCCESS ── -->
+    <div id="view-success" style="display:none">
+      <div class="success-badge">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="20,6 9,17 4,12"/>
+        </svg>
+        Saved to Yggdrasil
+      </div>
+
+      <h2>Tailored Projects</h2>
+      <div id="projects-list"></div>
+
+      <!-- Status action buttons -->
+      <div id="status-buttons">
+        <button id="btn-mark-saved" class="btn btn-secondary">Mark Saved</button>
+        <button id="btn-mark-applied" class="btn btn-primary">Mark Applied</button>
+      </div>
+
+      <!-- Inline result after marking -->
+      <div id="status-result"></div>
+
+      <!-- Ratings section (appears after "Mark Applied") -->
+      <div id="ratings-section">
+        <div class="rating-row">
+          <span class="rating-label">Location</span>
+          <div class="dots">
+            <button class="dot-btn" data-field="location" data-value="1"></button>
+            <button class="dot-btn" data-field="location" data-value="2"></button>
+            <button class="dot-btn" data-field="location" data-value="3"></button>
+            <button class="dot-btn" data-field="location" data-value="4"></button>
+            <button class="dot-btn" data-field="location" data-value="5"></button>
+          </div>
+        </div>
+        <div class="rating-row">
+          <span class="rating-label">Alignment</span>
+          <div class="dots">
+            <button class="dot-btn" data-field="alignment" data-value="1"></button>
+            <button class="dot-btn" data-field="alignment" data-value="2"></button>
+            <button class="dot-btn" data-field="alignment" data-value="3"></button>
+            <button class="dot-btn" data-field="alignment" data-value="4"></button>
+            <button class="dot-btn" data-field="alignment" data-value="5"></button>
+          </div>
+        </div>
+        <div class="rating-row">
+          <span class="rating-label">Salary</span>
+          <div class="dots">
+            <button class="dot-btn" data-field="salary" data-value="1"></button>
+            <button class="dot-btn" data-field="salary" data-value="2"></button>
+            <button class="dot-btn" data-field="salary" data-value="3"></button>
+            <button class="dot-btn" data-field="salary" data-value="4"></button>
+            <button class="dot-btn" data-field="salary" data-value="5"></button>
+          </div>
+        </div>
+        <div class="rating-row">
+          <span class="rating-label">Role</span>
+          <div class="dots">
+            <button class="dot-btn" data-field="role" data-value="1"></button>
+            <button class="dot-btn" data-field="role" data-value="2"></button>
+            <button class="dot-btn" data-field="role" data-value="3"></button>
+            <button class="dot-btn" data-field="role" data-value="4"></button>
+            <button class="dot-btn" data-field="role" data-value="5"></button>
+          </div>
+        </div>
+        <div id="ratings-error"></div>
+        <button id="save-ratings-btn" class="btn btn-primary" style="margin-top:10px">Save Ratings</button>
+      </div>
+
+      <!-- Footer links -->
+      <div class="success-footer">
+        <a href="#" id="open-in-app" class="text-link">Open in Yggdrasil</a>
+        <a href="#" id="add-another" class="text-link">Add Another</a>
+      </div>
+    </div>
+
+    <!-- ── ERROR ── -->
+    <div id="view-error">
+      <div class="error-box" id="error-message"></div>
+      <button id="error-retry" class="btn btn-secondary">Try Again</button>
+    </div>
+
+    <!-- ── OFFLINE ── -->
+    <div id="view-offline">
+      <div class="offline-box">
+        Yggdrasil is not running. Job saved to queue — it will sync automatically next time the desktop app starts.
+      </div>
+      <button id="offline-another" class="btn btn-secondary">Add Another</button>
+    </div>
+
+  </div><!-- /#view-job -->
+
+  <!-- ── LIBRARY TAB ── -->
+  <div id="view-library" style="display:none">
+
+    <!-- Search + Save row -->
+    <div class="lib-search-row">
+      <div class="lib-search-wrap">
+        <input id="lib-search" type="text" class="lib-search-input" placeholder="Search library...">
+        <button id="lib-search-clear" class="lib-search-clear">✕</button>
+      </div>
+      <button id="lib-save-page" class="btn btn-primary lib-save-btn">Save Page</button>
+    </div>
+
+    <!-- Inline save form (hidden by default) -->
+    <div id="lib-save-form" style="display:none">
+      <div class="field">
+        <label for="lib-save-title">Title</label>
+        <input id="lib-save-title" type="text" placeholder="Page title" autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="lib-save-note">Note (optional)</label>
+        <textarea id="lib-save-note" style="min-height:56px" placeholder="Add a note..."></textarea>
+      </div>
+      <div style="display:flex; gap:8px; align-items:center; margin-top:8px">
+        <button id="lib-save-submit" class="btn btn-primary" style="flex:1">Save</button>
+        <a href="#" id="lib-save-cancel" class="text-link">Cancel</a>
+      </div>
+      <div id="lib-save-status" class="lib-status"></div>
+    </div>
+
+    <!-- Offline banner -->
+    <div id="lib-offline-banner" class="lib-offline-banner">
+      Yggdrasil is not running. Saved pages will sync when the app opens.
+    </div>
+
+    <!-- Resource list -->
+    <div id="lib-list"></div>
+    <div id="lib-empty" style="display:none; color:#555; font-size:12px; text-align:center; padding:24px 0">
+      No saved resources yet. Browse the web and click Save Page.
+    </div>
+
+  </div><!-- /#view-library -->
+
+  <script type="module" src="dist/popup.js"></script>
+</body>
+</html>

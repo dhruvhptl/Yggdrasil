@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COALESCE(AVG(n.progress), 0)::INTEGER AS avg_progress\n        FROM tree_nodes n\n        JOIN trees t ON n.tree_id = t.id\n        WHERE t.project_id = $1 AND n.type = 'leaf'\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "avg_progress",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "f723047479c1f66c0f6e0414638b45a8caa0e94a0b6ca6f26a0e4c36c64ae021"
+}

@@ -1,24 +1,115 @@
+// Prevents the console window from appearing on Windows in production builds.
+// The `cfg_attr` ensures it only applies in release mode so you keep the console during dev.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod commands;
+mod constants;
 mod database;
 mod tree_commands;
+mod llm_client;
+mod github;
+mod prompt_builders;
+mod tree_persistence;
+mod brain;
+mod mimir;
+mod mimir_ingest;
+mod mimir_retrieval;
+mod mimir_tags;
+mod mimir_manage;
+mod work_commands;
+mod job_commands;
+mod idea_commands;
+mod resume_commands;
+mod skill_commands;
+mod export_commands;
+mod daily_commands;
+mod read_models;
+mod orchestrator;
+#[allow(dead_code)]
+mod graph_audit;
+mod ext_server;
+mod concept_graph;
+mod hound_client;
+mod hitl;
+mod project_scanner;
+mod mimir_memory;
+mod mimir_agent;
+mod text_util;
+mod project_roots;
+mod auto_librarian;
+mod settings;
+mod project_coverage;
 
 use database::Database;
+use tauri::Manager;
 
-#[tokio::main]
-async fn main() {
-    let app = tauri::Builder::default()
+fn load_env_file() {
+    // In production, env vars aren't inherited from a shell.
+    // Read them from %APPDATA%/com.universal.skilltree/.env written by build.sh.
+    #[cfg(not(debug_assertions))]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let env_path = std::path::Path::new(&appdata)
+                .join("com.universal.skilltree")
+                .join(".env");
+            if let Ok(contents) = std::fs::read_to_string(&env_path) {
+                for line in contents.lines() {
+                    if let Some((key, value)) = line.split_once('=') {
+                        let key = key.trim();
+                        let value = value.trim();
+                        if !key.is_empty() && !key.starts_with('#') {
+                            std::env::set_var(key, value);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn main() {
+    load_env_file();
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let app_handle = app.handle();
-            tauri::async_runtime::spawn(async move {
-                let database = Database::new(&app_handle).await.expect("Failed to initialize database");
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::block_on(async move {
+                let database = Database::new()
+                    .await
+                    .expect("Failed to initialize database");
+                let pool = database.pool.clone();
+                let backfill_pool = pool.clone();
                 app_handle.manage(database);
+                let http_client = reqwest::Client::new();
+                let queue = orchestrator::start_worker(pool.clone(), app_handle.clone(), http_client.clone());
+                crate::auto_librarian::start_auto_librarian(pool.clone(), app_handle.clone(), http_client.clone(), queue.clone());
+                app_handle.manage(http_client.clone());
+                let hound_status = hound_client::check_health(&http_client).await;
+                app_handle.manage(hound_status);
+
+                let ext_key = std::env::var("YGG_EXT_KEY")
+                    .unwrap_or_else(|_| "ygg-local-dev".to_string());
+                let ext_queue = queue.clone();
+                let ext_app = app_handle.clone();
+                tokio::spawn(ext_server::start(pool, http_client, ext_key, ext_app, ext_queue));
+
+                app_handle.manage(queue);
+
+                // Phase 1: backfill concept graphs from legacy JSONB blobs off the
+                // startup path (best-effort; never blocks app launch).
+                tokio::spawn(async move {
+                    let _ = crate::concept_graph::backfill_concept_graphs(&backfill_pool).await;
+                });
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            brain::generate_skill_tree,
+            brain::analyze_repo,
             commands::create_project,
             commands::get_projects,
             commands::get_disciplines,
+            commands::update_project,
             commands::update_project_progress,
             commands::delete_project,
             tree_commands::create_tree,
@@ -26,12 +117,156 @@ async fn main() {
             tree_commands::create_tree_node,
             tree_commands::update_tree_node,
             tree_commands::create_tree_edge,
-            tree_commands::get_tree_with_contents
+            tree_commands::delete_tree_node,
+            tree_commands::get_tree_with_contents,
+            tree_commands::get_all_quests,
+            tree_commands::recalculate_tree_progress,
+            tree_commands::recalculate_unlocks,
+            tree_commands::get_tree_node_data,
+            mimir_manage::get_mimir_resources,
+            mimir_manage::get_node_resources,
+            mimir_ingest::ingest_mimir_url,
+            mimir_ingest::ingest_mimir_text,
+            mimir_ingest::ingest_mimir_pdf,
+            mimir_manage::delete_mimir_resource,
+            mimir_retrieval::match_node_to_resources,
+            mimir_manage::link_resource_to_node,
+            mimir_ingest::extract_pdf_text,
+            mimir_retrieval::mimir_chat,
+            mimir_memory::get_memory_context_cmd,
+            mimir_memory::set_memory_fact_cmd,
+            mimir_memory::delete_memory_fact_cmd,
+            mimir_memory::consolidate_session_cmd,
+            concept_graph::query_graph_cmd,
+            concept_graph::path_between_cmd,
+            concept_graph::explain_node_cmd,
+            mimir_manage::discover_links,
+            mimir_manage::fetch_playlist,
+            mimir_ingest::rescrape_resource,
+            mimir_ingest::rescrape_all,
+            mimir_manage::get_chunk_counts,
+            mimir_tags::get_distinct_tags,
+            mimir_tags::update_resource_tags,
+            mimir_tags::auto_tag_existing_resources,
+            mimir_retrieval::rematch_all_nodes,
+            mimir_manage::toggle_resource_completion,
+            mimir_manage::on_resource_completed,
+            mimir_manage::get_linked_node_titles,
+            mimir_manage::mark_section_read,
+            mimir_manage::mark_sections_read_up_to,
+            mimir_manage::get_reading_progress,
+            mimir_ingest::reembed_pdfs,
+            mimir_retrieval::get_chat_session,
+            mimir_retrieval::clear_chat_session,
+            mimir_retrieval::get_retrieval_stats,
+            work_commands::create_coop,
+            work_commands::get_coops,
+            work_commands::create_topic,
+            work_commands::add_resource,
+            work_commands::toggle_resource_completed,
+            work_commands::extract_skills,
+            work_commands::get_full_work_graph,
+            job_commands::create_job,
+            job_commands::get_jobs,
+            job_commands::update_job,
+            job_commands::delete_job,
+            job_commands::save_job_description,
+            job_commands::extract_job_skills,
+            job_commands::get_job_skills,
+            job_commands::get_skill_demand,
+            job_commands::mark_followed_up,
+            job_commands::reextract_all_skills,
+            job_commands::save_tailored_projects,
+            idea_commands::create_idea,
+            idea_commands::get_ideas,
+            idea_commands::update_idea,
+            idea_commands::delete_idea,
+            idea_commands::idea_to_project,
+            resume_commands::parse_resume,
+            resume_commands::get_resume,
+            resume_commands::link_resume_project,
+            resume_commands::unlink_resume_project,
+            resume_commands::delete_resume,
+            resume_commands::list_resumes,
+            resume_commands::set_active_resume_cmd,
+            resume_commands::update_resume_label_cmd,
+            skill_commands::sync_skills_from_resume,
+            skill_commands::sync_skills_from_trees,
+            skill_commands::sync_skills_from_work,
+            skill_commands::sync_skills_from_jobs,
+            skill_commands::sync_all_skills,
+            skill_commands::recalculate_skill_levels,
+            skill_commands::get_universal_skills,
+            skill_commands::get_skill_dependencies,
+            skill_commands::get_skill_gaps,
+            skill_commands::infer_skill_dependencies,
+            skill_commands::get_skill_aliases,
+            skill_commands::merge_skills,
+            skill_commands::suggest_skill_merges,
+            skill_commands::auto_merge_suggested,
+            skill_commands::mark_skill_reviewed,
+            skill_commands::update_skill_status,
+            skill_commands::update_skill_notes,
+            skill_commands::refresh_skill_statuses_cmd,
+            skill_commands::backfill_skill_embeddings_cmd,
+            skill_commands::get_similar_skills,
+            skill_commands::match_skill_to_resources,
+            skill_commands::run_skill_resource_backfill,
+            skill_commands::classify_skill_domains,
+            skill_commands::reset_skill_domains,
+            skill_commands::expand_skill_graph,
+            skill_commands::backfill_concept_slugs,
+            skill_commands::backfill_concept_slugs_by_embedding,
+            read_models::get_active_tree_for_project,
+            read_models::get_node_chat_context,
+            read_models::get_project_tree_summary,
+            read_models::get_skill_graph_snapshot,
+            read_models::get_tree_resource_gaps,
+            read_models::get_node_neighborhood,
+            read_models::get_growth_recommendations,
+            read_models::get_prereq_path,
+            read_models::compute_learning_path,
+            read_models::get_resource_study_map,
+            read_models::get_tailored_projects,
+            read_models::get_gap_path,
+            read_models::get_skill_inline_context,
+            read_models::get_skill_detail,
+            read_models::get_skill_graph_context,
+            read_models::get_tree_for_skill,
+            read_models::get_project_id_for_tree,
+            orchestrator::enqueue_rematch,
+            orchestrator::enqueue_reembed,
+            orchestrator::enqueue_autotag,
+            orchestrator::enqueue_infer_deps,
+            orchestrator::get_transcript_job_status,
+            orchestrator::extract_skills_backfill,
+            graph_audit::run_graph_audit,
+            graph_audit::get_pending_proposals,
+            graph_audit::approve_proposal,
+            graph_audit::reject_proposal,
+            graph_audit::clear_all_proposals,
+            brain::get_prompt_stats,
+            brain::get_tree_concept_graph,
+            brain::regenerate_tree,
+            brain::get_tree_regenerations,
+            tree_persistence::backfill_node_embeddings,
+            export_commands::export_tree,
+            daily_commands::get_daily_log,
+            daily_commands::upsert_daily_notes,
+            daily_commands::add_quest_to_day,
+            daily_commands::add_free_task_to_day,
+            daily_commands::move_to_quadrant,
+            daily_commands::remove_from_day,
+            daily_commands::toggle_task_complete,
+            hitl::execute_destructive_action_cmd,
+            project_roots::get_project_roots_cmd,
+            project_roots::add_project_root_cmd,
+            project_roots::remove_project_root_cmd,
+            project_scanner::backfill_scan_embeddings_cmd,
+            settings::get_agent_config_cmd,
+            settings::set_agent_config_cmd,
+            project_coverage::run_project_coverage_cmd,
         ])
-        .build(tauri::generate_context!())
+        .run(tauri::generate_context!())
         .expect("error while running tauri application");
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-    app.run(|_, _| {});
 }
